@@ -44,9 +44,16 @@ jobs:
             fi
             echo "dockerhub=$dockerhub_image" >> "$GITHUB_OUTPUT"
             echo "dockerhub_enabled=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "all<<EOF"
+              echo "$dockerhub_image"
+              echo "$ghcr_image"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "::warning::Docker Hub publishing is disabled. Configure DOCKERHUB_IMAGE, DOCKERHUB_USERNAME, and DOCKERHUB_TOKEN to enable it."
             echo "dockerhub_enabled=false" >> "$GITHUB_OUTPUT"
+            echo "all=$ghcr_image" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Generate image tags and labels
@@ -54,8 +61,7 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: |
-            name=${{ steps.images.outputs.dockerhub }},enable=${{ steps.images.outputs.dockerhub_enabled }}
-            ${{ steps.images.outputs.ghcr }}
+            ${{ steps.images.outputs.all }}
           flavor: |
             latest=false
           tags: |
