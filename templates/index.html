@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Subtitle Translator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <a class="brand" href="/" aria-label="Subtitle Translator">
+        <span class="brand-mark">文</span>
+        <span>Subtitle Translator<small>Context-aware translations, timing intact</small></span>
+      </a>
+      <button class="ghost" id="settingsButton" type="button">Settings</button>
+    </header>
+
+    <main>
+      <section class="hero">
+        <span class="eyebrow">SRT · WEBVTT · ASS · SSA</span>
+        <h1>Translate subtitles<br><em>without losing the performance.</em></h1>
+        <p>Upload one file or a whole season. Dialogue, timing, positioning, styles, and inline tags stay where they belong.</p>
+      </section>
+
+      <section class="panel translator-panel">
+        <form id="translateForm">
+          <label class="dropzone" id="dropzone" for="fileInput">
+            <input id="fileInput" name="files" type="file" multiple accept=".srt,.vtt,.ass,.ssa">
+            <span class="drop-icon">↑</span>
+            <strong>Drop subtitle files here</strong>
+            <span>or click to browse · up to {{ max_upload_mb }} MB per request</span>
+            <div class="file-list" id="fileList"></div>
+          </label>
+
+          <div class="form-grid">
+            <label>Source language
+              <input name="source_language" id="sourceLanguage" value="English" placeholder="Auto or English">
+            </label>
+            <label>Provider
+              <select name="provider" id="provider"></select>
+            </label>
+            <label class="wide">Target languages
+              <div class="language-picker" id="languagePicker">
+                {% for code, language in languages.items() %}
+                <label class="chip"><input type="checkbox" value="{{ code }}"><span>{{ language.name }}</span></label>
+                {% endfor %}
+              </div>
+            </label>
+            <label class="wide optional-model" id="modelField">Model override <span>(optional)</span>
+              <input name="model" placeholder="Use the model configured in Settings">
+            </label>
+          </div>
+          <div class="submit-row">
+            <p id="providerState"></p>
+            <button class="primary" type="submit" id="submitButton">Start translating <span>→</span></button>
+          </div>
+        </form>
+      </section>
+
+      <section class="jobs-section">
+        <div class="section-heading">
+          <div><span class="eyebrow">Workspace</span><h2>Recent jobs</h2></div>
+          <button class="ghost small" id="refreshButton" type="button">Refresh</button>
+        </div>
+        <div id="jobs" class="jobs"><div class="empty">No translations yet.</div></div>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="settingsDialog">
+    <form id="settingsForm" method="dialog">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">Configuration</span><h2>Settings</h2></div>
+        <button class="icon-button" id="closeSettings" type="button" aria-label="Close">×</button>
+      </div>
+      <p class="settings-intro">Keys are write-only in the browser and persist in the Docker data volume. Set <code>APP_PASSWORD</code> before exposing this service to a network.</p>
+
+      <div class="settings-group">
+        <h3>Providers</h3>
+        <label>Default provider<select name="default_provider" id="defaultProvider"></select></label>
+        <label>Anthropic API key<div class="key-row"><input type="password" name="anthropic_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="anthropic"></span></div></label>
+        <label>Anthropic model<input name="anthropic_model" placeholder="claude-sonnet-4-6"></label>
+        <label>OpenAI-compatible API key<div class="key-row"><input type="password" name="openai_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="openai"></span></div></label>
+        <label>OpenAI-compatible model<input name="openai_model" placeholder="gpt-5-mini"></label>
+        <label>OpenAI-compatible base URL<input name="openai_base_url" placeholder="https://api.openai.com/v1"></label>
+        <label>DeepL API key<div class="key-row"><input type="password" name="deepl_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="deepl"></span></div></label>
+      </div>
+
+      <details>
+        <summary>Translation defaults</summary>
+        <div class="settings-group compact-grid">
+          <label>Batch size<input type="number" name="batch_size" min="1" max="100"></label>
+          <label>Parallel requests<input type="number" name="workers" min="1" max="16"></label>
+          <label>Requests / minute<input type="number" name="rpm" min="0" max="10000"><small>0 means provider-managed</small></label>
+          <label>Line width<input type="number" name="width" min="4" max="80"></label>
+          <label>Maximum lines<input type="number" name="max_lines" min="1" max="5"></label>
+        </div>
+      </details>
+      <div class="dialog-actions"><span id="settingsMessage"></span><button class="primary" type="submit">Save settings</button></div>
+    </form>
+  </dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

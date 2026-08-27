@@ -1,0 +1,20 @@
+services:
+  subtitle-translator:
+    build: .
+    container_name: subtitle-translator
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      APP_PASSWORD: "${APP_PASSWORD:-}"
+      JOB_WORKERS: "${JOB_WORKERS:-2}"
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-200}"
+      # Keys may be bootstrapped here, but the Settings screen is preferred.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      DEEPL_API_KEY: "${DEEPL_API_KEY:-}"
+    volumes:
+      - subtitle_data:/app/data
+
+volumes:
+  subtitle_data:
