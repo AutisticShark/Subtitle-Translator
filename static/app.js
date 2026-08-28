@@ -66,6 +66,7 @@ function escapeHtml(value) {
 
 async function submitTranslation(event) {
   event.preventDefault();
+  const form = event.currentTarget;
   const files = selectedFiles();
   const targets = $$('#languagePicker input:checked').map(el => el.value);
   if (!files.length) return toast('Choose at least one subtitle file');
@@ -75,12 +76,12 @@ async function submitTranslation(event) {
   const button = $('#submitButton');
   button.disabled = true;
   try {
-    const data = new FormData(event.currentTarget);
+    const data = new FormData(form);
     data.delete('files');
     files.forEach(file => data.append('files', file));
     data.set('target_languages', targets.join(','));
     await api('/api/jobs', { method: 'POST', body: data });
-    event.currentTarget.querySelector('[name="model"]').value = '';
+    form.querySelector('[name="model"]').value = '';
     $('#fileInput').value = '';
     renderFiles();
     toast(files.length === 1 ? 'Translation queued' : `${files.length} translations queued`);
@@ -123,13 +124,13 @@ async function loadJobs() {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const form = new FormData(event.currentTarget);
-  const payload = Object.fromEntries(form.entries());
+  const form = event.currentTarget;
+  const payload = Object.fromEntries(new FormData(form).entries());
   try {
     state.settings = await api('/api/settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
     });
-    event.currentTarget.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
+    form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
     $('#settingsMessage').textContent = 'Saved';
     await loadSettings();
     setTimeout(() => { $('#settingsMessage').textContent = ''; $('#settingsDialog').close(); }, 600);
