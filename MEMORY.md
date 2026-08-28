@@ -46,11 +46,19 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 
 - The application is a self-hosted Flask web UI plus a Python CLI for translating subtitles.
 - Supported web formats are SRT, VTT, ASS, and SSA. The CLI currently writes SRT only.
-- Providers are Anthropic, OpenAI-compatible APIs, DeepL, and offline Echo.
+- Providers are Anthropic, OpenAI-compatible APIs, DeepL, Google Cloud Translation - Basic v2, and offline Echo.
 - Runtime settings, job records, uploads, outputs, and resumable caches live below `DATA_DIR` (the Docker volume maps it to `/app/data`).
 - The settings API treats secrets as write-only. Preserve that security property.
 - Echo is the safe, deterministic provider for offline tests.
 - Docker publishing always targets GHCR. Docker Hub is optional and requires `DOCKERHUB_IMAGE`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` together.
+
+## Google Cloud Translation adapter
+
+- The Google provider uses the API-key-compatible Cloud Translation - Basic v2 endpoint and the standard NMT model; it does not require a service-account file.
+- Google accepts at most 128 `q` strings in one request. The web batch-size maximum remains 100, while the provider also rejects oversized batches explicitly for CLI callers.
+- A recognized source language name or BCP-47 code is sent as `source`; other source labels are omitted so Google can auto-detect them.
+- Google returns HTML-escaped `translatedText` values. Unescape every value and require the returned translation count to equal the input count before rebuilding subtitle cues.
+- `google_api_key` is write-only through the settings API and may be bootstrapped with `GOOGLE_API_KEY`, matching the existing provider-secret precedence rules.
 
 ## Progress and job-lifecycle lessons
 

@@ -17,7 +17,7 @@ async function api(url, options = {}) {
 }
 
 function configureProviderSelect(select, selected) {
-  const labels = { anthropic: 'Anthropic', openai: 'OpenAI-compatible', deepl: 'DeepL', echo: 'Echo (offline test)' };
+  const labels = { anthropic: 'Anthropic', openai: 'OpenAI-compatible', deepl: 'DeepL', google: 'Google Cloud Translation', echo: 'Echo (offline test)' };
   select.innerHTML = Object.entries(labels).map(([value, label]) =>
     `<option value="${value}" ${value === selected ? 'selected' : ''}>${label}</option>`).join('');
 }

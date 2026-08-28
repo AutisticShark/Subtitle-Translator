@@ -21,11 +21,27 @@ class WebApplicationTests(unittest.TestCase):
 
     def test_health_and_secret_masking(self):
         self.assertEqual(self.client.get("/healthz").status_code, 200)
-        response = self.client.put("/api/settings", json={"anthropic_api_key": "secret"})
+        response = self.client.put("/api/settings", json={
+            "anthropic_api_key": "anthropic-secret",
+            "google_api_key": "google-secret",
+        })
         self.assertEqual(response.status_code, 200)
         settings = self.client.get("/api/settings").get_json()
         self.assertTrue(settings["configured"]["anthropic"])
+        self.assertTrue(settings["configured"]["google"])
         self.assertNotIn("anthropic_api_key", settings)
+        self.assertNotIn("google_api_key", settings)
+
+    def test_google_provider_uses_the_saved_key(self):
+        throttle = webapp.Throttle()
+        expected_provider = object()
+        with patch.object(webapp, "make_google", return_value=expected_provider) as factory:
+            provider = webapp.provider_for(
+                "google", {"google_api_key": "google-secret"}, throttle, None
+            )
+
+        self.assertIs(provider, expected_provider)
+        factory.assert_called_once_with("google-secret", throttle)
 
     def test_active_job_cannot_be_deleted(self):
         job_id = "active-delete-test"

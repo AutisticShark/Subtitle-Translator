@@ -1,11 +1,11 @@
 # Subtitle Translator
 
-A self-hosted web app and command-line tool for translating subtitle files with LLM APIs or DeepL while preserving timings, dialogue structure, positioning, and inline styling.
+A self-hosted web app and command-line tool for translating subtitle files with LLM APIs, DeepL, or Google Cloud Translation while preserving timings, dialogue structure, positioning, and inline styling.
 
 ## Highlights
 
 - SRT, WebVTT (`.vtt`), Advanced SubStation Alpha (`.ass`), and SubStation Alpha (`.ssa`)
-- Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, plus an offline Echo test provider
+- Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, Google Cloud Translation, plus an offline Echo test provider
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Persistent, write-only API-key fields and translation defaults in the web UI
@@ -58,9 +58,12 @@ The app listens on `http://localhost:8000` and creates `data/` on first start.
 | Anthropic | API key, model | Uses the Messages API |
 | OpenAI-compatible | API key, model, base URL | Works with OpenAI and compatible `/v1/chat/completions` servers |
 | DeepL | API key | Automatically selects free or paid API by the `:fx` key suffix |
+| Google Cloud Translation | API key | Uses Cloud Translation - Basic (v2) with the standard NMT model |
 | Echo | None | Offline pipeline test; prefixes text with the target code |
 
-The language list is shared by the CLI and web app. DeepL must support the selected target; the LLM providers can use every target shown in the UI.
+The language list is shared by the CLI and web app. DeepL and Google Cloud Translation must support the selected target; the LLM providers can use every target shown in the UI. For Google, enter a supported source language code (such as `en`) or a known language name; otherwise the API automatically detects the source language.
+
+For Google Cloud Translation, enable the Cloud Translation API in a Google Cloud project and create an API key. Save it in the web Settings screen or set `GOOGLE_API_KEY`. The integration uses the API-key-compatible Basic v2 endpoint; it does not require a service-account credential file.
 
 ## CLI
 
@@ -69,6 +72,7 @@ Existing usage is preserved, with OpenAI-compatible support added:
 ```bash
 python srt_translate.py episode.srt --provider anthropic --langs zh-TW,ja
 python srt_translate.py episode.srt --provider deepl --langs de
+python srt_translate.py episode.srt --provider google --langs zh-TW --api-key @~/.google-key
 python srt_translate.py episode.srt --provider openai --model gpt-5-mini \
   --base-url https://api.openai.com/v1
 python srt_translate.py episode.srt --provider echo
@@ -80,7 +84,7 @@ The CLI currently writes SRT. Use the web app for VTT, ASS, and SSA.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q
+python -m pytest -q
 ```
 
 The `/healthz` endpoint is unauthenticated for container and reverse-proxy health checks. Uploaded filenames are sanitized, stored under random job IDs, and downloads are restricted to registered output files.

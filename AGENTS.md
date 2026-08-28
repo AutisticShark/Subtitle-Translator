@@ -4,7 +4,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 
 ## Project map
 
-- `srt_translate.py` contains the translation pipeline, provider clients, retry/throttling behavior, segmentation, tag masking, cue rebuilding, wrapping, and the SRT-only CLI.
+- `srt_translate.py` contains the translation pipeline, provider clients (including Google Cloud Translation - Basic v2), retry/throttling behavior, segmentation, tag masking, cue rebuilding, wrapping, and the SRT-only CLI.
 - `subtitle_formats.py` adapts SRT, VTT, ASS, and SSA files to and from the shared cue model. Preserve format-specific headers, timings, settings, dialogue fields, newline style, BOM state, and inline tags.
 - `webapp.py` is the Flask API, SQLite-backed settings/job store, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time.
 - `static/app.js` and `templates/index.html` implement the browser UI.
@@ -28,6 +28,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 3. `pytest` alone does not exercise browser event lifetime or GitHub Actions expression/action parsing. For frontend async-handler changes, inspect every post-`await` event access and perform a browser smoke test when available. For publishing changes, reason through both GHCR-only and GHCR-plus-Docker-Hub branches and validate the workflow when tooling is available.
 4. Translation progress must be reported from completed translation batches, not only from target-language boundaries. Map each target's batch fraction into its share of the overall job range so multi-language jobs remain monotonic.
 5. Job cancellation is cooperative and race-safe: request cancellation by moving an active job to `canceling`, signal its in-memory event, and let only the worker finalize it as `canceled`. Completion and failure updates must be conditional on the current status so they cannot overwrite a concurrent cancellation.
+6. Google Cloud Translation - Basic v2 accepts at most 128 strings per request and returns HTML-escaped `translatedText` values. Keep batches within that limit, unescape each value, and reject any response whose translation count differs from the input count so subtitle segments cannot be misaligned.
 
 ## Validation
 

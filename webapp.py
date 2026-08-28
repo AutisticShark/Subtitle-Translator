@@ -26,6 +26,7 @@ from srt_translate import (
     make_anthropic,
     make_deepl,
     make_echo,
+    make_google,
     make_openai,
     rebuild_cues,
     segment_cue,
@@ -58,10 +59,12 @@ DEFAULTS = {
     "width": "16",
     "max_lines": "2",
 }
-SECRET_KEYS = {"anthropic_api_key", "openai_api_key", "deepl_api_key"}
+SECRET_KEYS = {
+    "anthropic_api_key", "openai_api_key", "deepl_api_key", "google_api_key",
+}
 PUBLIC_KEYS = set(DEFAULTS)
 ALL_SETTING_KEYS = PUBLIC_KEYS | SECRET_KEYS
-PROVIDERS = {"anthropic", "openai", "deepl", "echo"}
+PROVIDERS = {"anthropic", "openai", "deepl", "google", "echo"}
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config.update(
@@ -150,6 +153,7 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
         "anthropic": bool(values.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
         "openai": bool(values.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")),
         "deepl": bool(values.get("deepl_api_key") or os.environ.get("DEEPL_API_KEY")),
+        "google": bool(values.get("google_api_key") or os.environ.get("GOOGLE_API_KEY")),
         "echo": True,
     }
     if include_secrets:
@@ -210,6 +214,11 @@ def provider_for(name: str, settings: dict[str, Any], throttle: Throttle, model:
         if not key:
             raise FatalTranslationError("DeepL API key is not configured")
         return make_deepl(key, throttle)
+    if name == "google":
+        key = settings.get("google_api_key")
+        if not key:
+            raise FatalTranslationError("Google Cloud Translation API key is not configured")
+        return make_google(key, throttle)
     raise FatalTranslationError(f"Unknown provider: {name}")
 
 

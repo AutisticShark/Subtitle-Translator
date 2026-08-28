@@ -25,6 +25,7 @@ Usage
     export ANTHROPIC_API_KEY=sk-...; python srt_translate.py input.srt
     python srt_translate.py *.srt --workers 8 --langs zh-TW
     python srt_translate.py input.srt --provider deepl --api-key @~/.deepl-key
+    python srt_translate.py input.srt --provider google --api-key @~/.google-key
     python srt_translate.py input.srt --provider echo      # offline dry run
 """
 
@@ -33,6 +34,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import hashlib
+import html
 import json
 import os
 import random
@@ -572,6 +574,63 @@ def make_deepl(api_key: str,
     return call
 
 
+def make_google(api_key: str,
+                throttle: Throttle) -> Callable[[list[str], str, str], list[str]]:
+    """Create a Google Cloud Translation - Basic (v2) provider."""
+    from urllib.parse import urlencode
+
+    endpoint = (
+        "https://translation.googleapis.com/language/translate/v2?"
+        + urlencode({"key": api_key})
+    )
+    source_codes = {meta["name"].casefold(): key for key, meta in LANGS.items()}
+    source_codes["english"] = "en"
+
+    def call(texts: list[str], src: str, tgt_key: str) -> list[str]:
+        if len(texts) > 128:
+            raise FatalTranslationError(
+                "Google Cloud Translation accepts at most 128 strings per request"
+            )
+
+        payload: dict[str, object] = {
+            "q": texts,
+            "target": tgt_key,
+            "format": "text",
+        }
+        source = src.strip()
+        source_code = source_codes.get(source.casefold())
+        if source_code is None and re.fullmatch(
+            r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", source
+        ):
+            source_code = source
+        if source_code:
+            payload["source"] = source_code
+
+        resp = _post_json(
+            endpoint,
+            {"content-type": "application/json; charset=utf-8"},
+            payload,
+            throttle=throttle,
+        )
+        try:
+            translations = resp["data"]["translations"]
+            if not isinstance(translations, list) or len(translations) != len(texts):
+                raise ValueError
+            result = []
+            for item in translations:
+                translated = item["translatedText"]
+                if not isinstance(translated, str):
+                    raise ValueError
+                result.append(html.unescape(translated))
+            return result
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TranslationError(
+                "Google Cloud Translation API returned an unexpected response"
+            ) from exc
+
+    return call
+
+
 def make_echo() -> Callable[[list[str], str, str], list[str]]:
     """Offline provider for testing the pipeline without an API key."""
     def call(texts: list[str], src: str, tgt_key: str) -> list[str]:
@@ -932,7 +991,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--langs", default="zh-TW,zh-CN",
                    help="comma-separated targets (default: zh-TW,zh-CN)")
     p.add_argument("--source-lang", default="English")
-    p.add_argument("--provider", choices=["anthropic", "openai", "deepl", "echo"],
+    p.add_argument("--provider",
+                   choices=["anthropic", "openai", "deepl", "google", "echo"],
                    default="anthropic")
     p.add_argument("--model", default="claude-sonnet-4-6",
                    help="model id for LLM providers")
@@ -964,7 +1024,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                    help="API key for the chosen provider. Accepts a literal "
                         "value, @/path/to/keyfile, or - to read from stdin. "
                         "Falls back to $ANTHROPIC_API_KEY / $OPENAI_API_KEY / "
-                        "$DEEPL_API_KEY.")
+                        "$DEEPL_API_KEY / $GOOGLE_API_KEY.")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args(argv)
 
@@ -992,6 +1052,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         provider = make_deepl(
             resolve_key(args.api_key, "DEEPL_API_KEY", "DeepL"), throttle
         )
+    elif args.provider == "google":
+        provider = make_google(
+            resolve_key(args.api_key, "GOOGLE_API_KEY", "Google Cloud Translation"),
+            throttle,
+        )
     else:
         provider = make_echo()
 
@@ -1007,7 +1072,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 130
         except FatalTranslationError as e:
             print(f"\n!! aborting: {e}", file=sys.stderr)
-            print("   check --api-key and --model, then re-run "
+            print("   check the provider settings, then re-run "
                   "(finished work is cached).", file=sys.stderr)
             return 2
         except Exception as e:
