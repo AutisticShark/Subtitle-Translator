@@ -42,6 +42,14 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Mistake: `webapp` was imported without first pointing `DATA_DIR` at a temporary writable directory. Module import calls `init_storage()` and therefore is not side-effect free.
 - Prevention: set `DATA_DIR` before importing `webapp` in tests or diagnostics. Prefer the existing test harness, which does this correctly, instead of importing against the repository's real `data/` directory.
 
+### Explicit CRLF text was translated twice on Windows
+
+- Evidence: the expanded SRT writer tests on 2026-08-29 found that `write_srt(..., crlf=True)` emitted `\r\r\n` in this Windows workspace.
+- Mistake: `write_srt` assembled `\r\n` separators, then used `Path.write_text` with its default platform newline handling, which translated the embedded `\n` a second time.
+- User-visible result: the SRT-only CLI could write malformed line endings when preserving a CRLF source on Windows.
+- Fix: pass `newline=""` when writing the already-normalized SRT text.
+- Prevention: when code chooses the output newline sequence itself, disable platform newline translation and verify the raw output bytes in a focused test.
+
 ## Durable project context
 
 - The application is a self-hosted Flask web UI plus a Python CLI for translating subtitles.

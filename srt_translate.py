@@ -196,7 +196,7 @@ def write_srt(cues: Sequence[Cue], path: Path, *, bom: bool = False,
     text = eol.join(out)
     if not text.endswith(eol):
         text += eol
-    path.write_text(("\ufeff" if bom else "") + text, encoding="utf-8")
+    path.write_text(("\ufeff" if bom else "") + text, encoding="utf-8", newline="")
 
 
 # --------------------------------------------------------------------------- #
@@ -331,7 +331,27 @@ def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
             cur = f"{cur} {w}".strip()
     if cur:
         lines.append(cur)
-    return lines or [""]
+    if not lines:
+        return [""]
+
+    max_lines = max(1, max_lines)
+    if len(lines) <= max_lines:
+        return lines
+
+    # The width is a preference, while max_lines is a hard subtitle-layout
+    # constraint. Rebalance all words when the greedy pass needs too many lines.
+    remaining = list(words)
+    balanced: list[str] = []
+    while len(balanced) < max_lines - 1:
+        slots = max_lines - len(balanced)
+        remaining_width = sum(len(word) for word in remaining) + len(remaining) - 1
+        target = (remaining_width + slots - 1) // slots
+        current = remaining.pop(0)
+        while remaining and len(current) + 1 + len(remaining[0]) <= target:
+            current += " " + remaining.pop(0)
+        balanced.append(current)
+    balanced.append(" ".join(remaining))
+    return balanced
 
 
 # --------------------------------------------------------------------------- #

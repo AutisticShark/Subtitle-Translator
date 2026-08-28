@@ -29,6 +29,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 4. Translation progress must be reported from completed translation batches, not only from target-language boundaries. Map each target's batch fraction into its share of the overall job range so multi-language jobs remain monotonic.
 5. Job cancellation is cooperative and race-safe: request cancellation by moving an active job to `canceling`, signal its in-memory event, and let only the worker finalize it as `canceled`. Completion and failure updates must be conditional on the current status so they cannot overwrite a concurrent cancellation.
 6. Google Cloud Translation - Basic v2 accepts at most 128 strings per request and returns HTML-escaped `translatedText` values. Keep batches within that limit, unescape each value, and reject any response whose translation count differs from the input count so subtitle segments cannot be misaligned.
+7. When writing explicitly assembled CRLF subtitle text, disable Python's platform newline translation (`newline=""`). Otherwise Windows converts each `\n` inside `\r\n` again and emits malformed `\r\r\n` line endings.
 
 ## Validation
 
