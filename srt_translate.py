@@ -609,6 +609,7 @@ def translate_segments(
     cache: dict,
     workers: int,
     quiet: bool,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> list[str]:
     results: list[str | None] = [None] * len(segs)
 
@@ -627,6 +628,9 @@ def translate_segments(
 
     batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
     done = 0
+    cached = len(segs) - len(todo)
+    if progress_callback:
+        progress_callback(cached, len(segs))
 
     def call_with_retry(texts: list[str], label: str) -> list[str]:
         """Two independent budgets. Rate limits are not failures — they're the
@@ -692,7 +696,9 @@ def translate_segments(
             return batch, out
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        for batch, out in ex.map(run, batches):
+        futures = [ex.submit(run, batch) for batch in batches]
+        for future in concurrent.futures.as_completed(futures):
+            batch, out = future.result()
             for i, translated in zip(batch, out):
                 results[i] = translated
                 key = hashlib.sha256(
@@ -700,6 +706,8 @@ def translate_segments(
                 ).hexdigest()[:24]
                 cache[key] = translated
             done += len(batch)
+            if progress_callback:
+                progress_callback(cached + done, len(segs))
             if not quiet:
                 pct = 100 * done / max(len(todo), 1)
                 print(f"\r  {tgt_key}: {done}/{len(todo)} ({pct:.0f}%)",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -219,10 +220,22 @@ def run_job(job_id: str) -> None:
             start_pct = 5 + round(index / len(targets) * 90)
             update_job(job_id, progress=start_pct,
                        stage=f"Translating to {LANGS[language]['name']}")
+
+            def report_progress(done: int, total: int, *, target_index: int = index,
+                                target_language: str = language) -> None:
+                fraction = done / total if total else 1
+                progress = 5 + round((target_index + fraction) / len(targets) * 90)
+                update_job(
+                    job_id,
+                    progress=progress,
+                    stage=(f"Translating to {LANGS[target_language]['name']} "
+                           f"({done}/{total} segments)"),
+                )
+
             translated = translate_segments(
                 segments, provider, language, options["source_language"],
                 int(options["batch_size"]), 4, 10, throttle, cache,
-                int(options["workers"]), True,
+                int(options["workers"]), True, report_progress,
             )
             cues = rebuild_cues(
                 document.cues, segments, translated, language,
@@ -363,6 +376,28 @@ def get_job(job_id: str):
     if row is None:
         return jsonify(error="Job not found"), 404
     return jsonify(job_dict(row))
+
+
+@app.delete("/api/jobs/<job_id>")
+def delete_job(job_id: str):
+    with db_lock, connect_db() as db:
+        row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return jsonify(error="Job not found"), 404
+        if row["status"] not in {"completed", "failed"}:
+            return jsonify(error="Wait for the job to finish before deleting it"), 409
+
+        jobs_root = JOBS_DIR.resolve()
+        folder = (jobs_root / job_id).resolve()
+        if folder.parent != jobs_root:
+            return jsonify(error="Invalid job path"), 400
+        try:
+            if folder.exists():
+                shutil.rmtree(folder)
+        except OSError:
+            return jsonify(error="Could not delete the job files"), 500
+        db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+    return jsonify(deleted=job_id)
 
 
 @app.get("/api/jobs/<job_id>/download/<path:name>")

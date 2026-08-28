@@ -97,12 +97,16 @@ function renderJobs() {
     return;
   }
   container.innerHTML = state.jobs.map(job => {
+    const jobId = encodeURIComponent(job.id);
     const targetNames = job.options.target_languages.join(', ');
     const outputLinks = job.outputs.map(output =>
-      `<a href="/api/jobs/${job.id}/download/${encodeURIComponent(output.name)}">${escapeHtml(output.language)}</a>`).join('');
-    const action = job.status === 'completed' ?
-      `<div class="download-actions"><a class="download" href="/api/jobs/${job.id}/download">Download${job.outputs.length > 1 ? ' ZIP' : ''}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
+      `<a href="/api/jobs/${jobId}/download/${encodeURIComponent(output.name)}">${escapeHtml(output.language)}</a>`).join('');
+    const primaryAction = job.status === 'completed' ?
+      `<div class="download-actions"><a class="download" href="/api/jobs/${jobId}/download">Download${job.outputs.length > 1 ? ' ZIP' : ''}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
       `<span class="status ${job.status}">${job.status}</span>`;
+    const deleteAction = ['completed', 'failed'].includes(job.status) ?
+      `<button class="delete-job" type="button" data-job-id="${jobId}">Delete</button>` : '';
+    const action = `<div class="job-actions">${primaryAction}${deleteAction}</div>`;
     return `<article class="job">
       <div><div class="job-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
       <div class="job-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(targetNames)}</div></div>
@@ -110,6 +114,24 @@ function renderJobs() {
       <div class="job-meta">${escapeHtml(job.stage || job.status)} · ${job.progress}%</div>
       ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}</div>${action}</article>`;
   }).join('');
+}
+
+async function deleteJob(event) {
+  const button = event.target.closest('.delete-job');
+  if (!button) return;
+  const jobId = decodeURIComponent(button.dataset.jobId);
+  const job = state.jobs.find(item => item.id === jobId);
+  if (!job || !window.confirm(`Delete ${job.filename} and its translated files?`)) return;
+  button.disabled = true;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
+    state.jobs = state.jobs.filter(job => job.id !== jobId);
+    renderJobs();
+    toast('Translation deleted');
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message);
+  }
 }
 
 async function loadJobs() {
@@ -144,6 +166,7 @@ $('#settingsForm').addEventListener('submit', saveSettings);
 $('#settingsButton').addEventListener('click', () => $('#settingsDialog').showModal());
 $('#closeSettings').addEventListener('click', () => $('#settingsDialog').close());
 $('#refreshButton').addEventListener('click', loadJobs);
+$('#jobs').addEventListener('click', deleteJob);
 const dropzone = $('#dropzone');
 ['dragenter', 'dragover'].forEach(name => dropzone.addEventListener(name, event => { event.preventDefault(); dropzone.classList.add('dragging'); }));
 ['dragleave', 'drop'].forEach(name => dropzone.addEventListener(name, event => { event.preventDefault(); dropzone.classList.remove('dragging'); }));

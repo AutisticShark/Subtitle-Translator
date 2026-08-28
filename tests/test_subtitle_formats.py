@@ -1,6 +1,6 @@
 import unittest
 
-from srt_translate import Throttle, make_echo, rebuild_cues, segment_cue, translate_segments
+from srt_translate import Segment, Throttle, make_echo, rebuild_cues, segment_cue, translate_segments
 from subtitle_formats import SubtitleFormatError, parse_subtitle, translated_filename
 
 
@@ -17,6 +17,18 @@ def translate_echo(document, language="zh-TW"):
 
 
 class SubtitleFormatTests(unittest.TestCase):
+    def test_translation_reports_each_completed_batch(self):
+        segments = [Segment(index, f"Line {index}", [], False) for index in range(4)]
+        updates = []
+
+        output = translate_segments(
+            segments, make_echo(), "zh-TW", "English", 1, 1, 1,
+            Throttle(), {}, 2, True, lambda done, total: updates.append((done, total)),
+        )
+
+        self.assertEqual(updates, [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)])
+        self.assertEqual(output, [f"[zh-TW] Line {index}" for index in range(4)])
+
     def test_srt_round_trip_and_translation(self):
         source = b"1\r\n00:00:01,000 --> 00:00:03,000\r\n<i>Hello</i> world\r\n\r\n"
         doc = parse_subtitle(source, ".srt")

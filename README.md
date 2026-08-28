@@ -7,7 +7,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - SRT, WebVTT (`.vtt`), Advanced SubStation Alpha (`.ass`), and SubStation Alpha (`.ssa`)
 - Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, plus an offline Echo test provider
 - Multi-file uploads and multiple target languages per job
-- Background job queue, progress display, per-language downloads, and ZIP bundles
+- Background job queue, batch-level progress, per-language downloads, ZIP bundles, and job deletion
 - Persistent, write-only API-key fields and translation defaults in the web UI
 - Context-aware batching, shared rate-limit backoff, retries, resumable per-job cache, tag masking, and subtitle-aware line wrapping
 - Docker health check, persistent named volume, and optional HTTP Basic protection
@@ -22,6 +22,8 @@ docker compose up --build -d
 ```
 
 Open <http://localhost:8000>, choose **Settings**, add a provider key and model, then upload subtitles. Application settings, job records, sources, outputs, and resumable caches live in the `subtitle_data` Docker volume.
+
+Finished and failed jobs can be deleted from **Recent jobs**. Deleting a job removes its database record, uploaded source, translated outputs, ZIP bundle, and resumable cache.
 
 Useful commands:
 
