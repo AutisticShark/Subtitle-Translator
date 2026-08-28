@@ -27,6 +27,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 2. Do not pass a blank optional image name to `docker/metadata-action`, even with an `enable=false` fragment. Build the image list so it contains only complete, non-empty names. This previously broke GHCR-only publishing when Docker Hub variables were absent (commit `3237715`).
 3. `pytest` alone does not exercise browser event lifetime or GitHub Actions expression/action parsing. For frontend async-handler changes, inspect every post-`await` event access and perform a browser smoke test when available. For publishing changes, reason through both GHCR-only and GHCR-plus-Docker-Hub branches and validate the workflow when tooling is available.
 4. Translation progress must be reported from completed translation batches, not only from target-language boundaries. Map each target's batch fraction into its share of the overall job range so multi-language jobs remain monotonic.
+5. Job cancellation is cooperative and race-safe: request cancellation by moving an active job to `canceling`, signal its in-memory event, and let only the worker finalize it as `canceled`. Completion and failure updates must be conditional on the current status so they cannot overwrite a concurrent cancellation.
 
 ## Validation
 

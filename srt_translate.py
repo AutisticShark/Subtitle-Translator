@@ -352,6 +352,10 @@ class RateLimitError(TranslationError):
         self.retry_after = retry_after
 
 
+class TranslationCanceled(RuntimeError):
+    """The caller requested that an in-progress translation stop."""
+
+
 class Throttle:
     """Shared pacing gate.
 
@@ -361,14 +365,18 @@ class Throttle:
     can stay under a known RPM without discovering the ceiling by hitting it.
     """
 
-    def __init__(self, rpm: float = 0.0):
+    def __init__(self, rpm: float = 0.0,
+                 cancel_callback: Callable[[], bool] | None = None):
         self._lock = threading.Lock()
         self._blocked_until = 0.0
         self._next_slot = 0.0
         self._interval = 60.0 / rpm if rpm > 0 else 0.0
+        self._cancel_callback = cancel_callback
 
     def wait(self) -> None:
         while True:
+            if self._cancel_callback and self._cancel_callback():
+                raise TranslationCanceled("Translation canceled")
             with self._lock:
                 now = time.monotonic()
                 target = max(self._blocked_until, self._next_slot)
@@ -376,7 +384,7 @@ class Throttle:
                     self._next_slot = max(now, self._next_slot) + self._interval
                     return
                 delay = target - now
-            time.sleep(min(delay, 5.0))
+            time.sleep(min(delay, 0.25 if self._cancel_callback else 5.0))
 
     def penalise(self, seconds: float) -> float:
         """Park every worker for `seconds`. Returns the effective wait."""
@@ -610,10 +618,25 @@ def translate_segments(
     workers: int,
     quiet: bool,
     progress_callback: Callable[[int, int], None] | None = None,
+    cancel_callback: Callable[[], bool] | None = None,
 ) -> list[str]:
     results: list[str | None] = [None] * len(segs)
 
+    def check_canceled() -> None:
+        if cancel_callback and cancel_callback():
+            raise TranslationCanceled("Translation canceled")
+
+    def interruptible_sleep(seconds: float) -> None:
+        deadline = time.monotonic() + seconds
+        while True:
+            check_canceled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(remaining, 0.25))
+
     # Cache hits first
+    check_canceled()
     todo: list[int] = []
     for i, s in enumerate(segs):
         key = hashlib.sha256(f"{tgt_key}\u0000{s.text}".encode()).hexdigest()[:24]
@@ -639,8 +662,11 @@ def translate_segments(
         soft = 0   # 5xx / network
         limited = 0
         while True:
+            check_canceled()
             try:
-                return provider(texts, src, tgt_key)
+                output = provider(texts, src, tgt_key)
+                check_canceled()
+                return output
             except FatalTranslationError:
                 raise
             except RateLimitError as e:
@@ -660,12 +686,14 @@ def translate_segments(
                     print(f"\r  rate limited, all workers pausing "
                           f"{waited:.0f}s (attempt {limited}/{rate_retries})"
                           f"{' ' * 12}", file=sys.stderr, flush=True)
-                time.sleep(min(waited, 120.0))
+                interruptible_sleep(min(waited, 120.0))
             except TranslationError as e:
                 soft += 1
                 if soft >= retries:
                     raise
-                time.sleep(min(2.0 ** soft, 30.0) + random.uniform(0, 1))
+                interruptible_sleep(
+                    min(2.0 ** soft, 30.0) + random.uniform(0, 1)
+                )
 
     def run(batch: list[int]) -> tuple[list[int], list[str]]:
         texts = [segs[i].text for i in batch]
@@ -695,23 +723,35 @@ def translate_segments(
                       file=sys.stderr)
             return batch, out
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(run, batch) for batch in batches]
-        for future in concurrent.futures.as_completed(futures):
-            batch, out = future.result()
-            for i, translated in zip(batch, out):
-                results[i] = translated
-                key = hashlib.sha256(
-                    f"{tgt_key}\u0000{segs[i].text}".encode()
-                ).hexdigest()[:24]
-                cache[key] = translated
-            done += len(batch)
-            if progress_callback:
-                progress_callback(cached + done, len(segs))
-            if not quiet:
-                pct = 100 * done / max(len(todo), 1)
-                print(f"\r  {tgt_key}: {done}/{len(todo)} ({pct:.0f}%)",
-                      end="", file=sys.stderr, flush=True)
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    completed_normally = False
+    try:
+        pending = {ex.submit(run, batch) for batch in batches}
+        while pending:
+            check_canceled()
+            finished, pending = concurrent.futures.wait(
+                pending, timeout=0.25,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in finished:
+                batch, out = future.result()
+                for i, translated in zip(batch, out):
+                    results[i] = translated
+                    key = hashlib.sha256(
+                        f"{tgt_key}\u0000{segs[i].text}".encode()
+                    ).hexdigest()[:24]
+                    cache[key] = translated
+                done += len(batch)
+                if progress_callback:
+                    progress_callback(cached + done, len(segs))
+                if not quiet:
+                    pct = 100 * done / max(len(todo), 1)
+                    print(f"\r  {tgt_key}: {done}/{len(todo)} ({pct:.0f}%)",
+                          end="", file=sys.stderr, flush=True)
+        check_canceled()
+        completed_normally = True
+    finally:
+        ex.shutdown(wait=completed_normally, cancel_futures=not completed_normally)
 
     if not quiet and todo:
         print(file=sys.stderr)

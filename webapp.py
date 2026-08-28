@@ -22,6 +22,7 @@ from srt_translate import (
     LANGS,
     FatalTranslationError,
     Throttle,
+    TranslationCanceled,
     make_anthropic,
     make_deepl,
     make_echo,
@@ -69,6 +70,8 @@ app.config.update(
 )
 executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JOB_WORKERS", "2"))))
 db_lock = threading.RLock()
+cancel_events_lock = threading.Lock()
+cancel_events: dict[str, threading.Event] = {}
 
 
 def now() -> str:
@@ -116,6 +119,10 @@ def init_storage() -> None:
         db.execute(
             "UPDATE jobs SET status='failed', error='The server restarted before this job finished', "
             "updated_at=? WHERE status IN ('queued', 'processing')", (now(),)
+        )
+        db.execute(
+            "UPDATE jobs SET status='canceled', stage='Canceled', error=NULL, updated_at=? "
+            "WHERE status='canceling'", (now(),)
         )
 
 
@@ -166,6 +173,24 @@ def update_job(job_id: str, **fields: Any) -> None:
         db.execute(f"UPDATE jobs SET {columns} WHERE id=?", (*fields.values(), job_id))
 
 
+def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool:
+    fields["updated_at"] = now()
+    columns = ", ".join(f"{key}=?" for key in fields)
+    allowed = tuple(statuses)
+    placeholders = ", ".join("?" for _ in allowed)
+    with db_lock, connect_db() as db:
+        cursor = db.execute(
+            f"UPDATE jobs SET {columns} WHERE id=? AND status IN ({placeholders})",
+            (*fields.values(), job_id, *allowed),
+        )
+        return cursor.rowcount == 1
+
+
+def cancel_event_for(job_id: str) -> threading.Event:
+    with cancel_events_lock:
+        return cancel_events.setdefault(job_id, threading.Event())
+
+
 def provider_for(name: str, settings: dict[str, Any], throttle: Throttle, model: str | None):
     if name == "echo":
         return make_echo()
@@ -189,24 +214,39 @@ def provider_for(name: str, settings: dict[str, Any], throttle: Throttle, model:
 
 
 def run_job(job_id: str) -> None:
+    cancel_event = cancel_event_for(job_id)
+
+    def check_canceled() -> None:
+        if cancel_event.is_set():
+            raise TranslationCanceled("Translation canceled")
+
     try:
         with connect_db() as db:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return
+        if row["status"] == "canceling":
+            cancel_event.set()
+        check_canceled()
         options = json.loads(row["options"])
         folder = JOBS_DIR / job_id
         source = folder / row["stored_name"]
-        update_job(job_id, status="processing", progress=2, stage="Reading subtitle")
+        if not update_job_if_status(
+            job_id, {"queued"}, status="processing", progress=2,
+            stage="Reading subtitle",
+        ):
+            check_canceled()
+            return
 
         document = load_subtitle(source, options.get("encoding", "utf-8"))
         segments = []
         for cue_i, cue in enumerate(document.cues):
             segments.extend(segment_cue(cue, cue_i))
+        check_canceled()
         update_job(job_id, progress=5, stage=f"Parsed {len(document.cues)} cues")
 
         settings = read_settings(include_secrets=True)
-        throttle = Throttle(float(options["rpm"]))
+        throttle = Throttle(float(options["rpm"]), cancel_event.is_set)
         provider = provider_for(options["provider"], settings, throttle, options.get("model"))
         targets = options["target_languages"]
         cache_path = folder / "translation-cache.json"
@@ -236,7 +276,9 @@ def run_job(job_id: str) -> None:
                 segments, provider, language, options["source_language"],
                 int(options["batch_size"]), 4, 10, throttle, cache,
                 int(options["workers"]), True, report_progress,
+                cancel_event.is_set,
             )
+            check_canceled()
             cues = rebuild_cues(
                 document.cues, segments, translated, language,
                 float(options["width"]), int(options["max_lines"]),
@@ -249,11 +291,31 @@ def run_job(job_id: str) -> None:
             update_job(job_id, outputs=json.dumps(outputs),
                        progress=5 + round((index + 1) / len(targets) * 90))
 
-        update_job(job_id, status="completed", progress=100, stage="Ready to download",
-                   outputs=json.dumps(outputs), error=None)
+        if not update_job_if_status(
+            job_id, {"processing"}, status="completed", progress=100,
+            stage="Ready to download", outputs=json.dumps(outputs), error=None,
+        ):
+            raise TranslationCanceled("Translation canceled")
+    except TranslationCanceled:
+        update_job_if_status(
+            job_id, {"queued", "processing", "canceling"}, status="canceled",
+            stage="Canceled", error=None,
+        )
     except Exception as exc:
-        update_job(job_id, status="failed", stage="Translation failed",
-                   error=f"{type(exc).__name__}: {exc}")
+        if cancel_event.is_set():
+            update_job_if_status(
+                job_id, {"queued", "processing", "canceling"}, status="canceled",
+                stage="Canceled", error=None,
+            )
+        else:
+            update_job_if_status(
+                job_id, {"queued", "processing"}, status="failed",
+                stage="Translation failed", error=f"{type(exc).__name__}: {exc}",
+            )
+    finally:
+        with cancel_events_lock:
+            if cancel_events.get(job_id) is cancel_event:
+                cancel_events.pop(job_id, None)
 
 
 @app.get("/")
@@ -378,13 +440,43 @@ def get_job(job_id: str):
     return jsonify(job_dict(row))
 
 
+@app.post("/api/jobs/<job_id>/cancel")
+def cancel_job(job_id: str):
+    with db_lock, connect_db() as db:
+        row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return jsonify(error="Job not found"), 404
+        if row["status"] == "canceling":
+            cancel_event_for(job_id).set()
+            return jsonify(job_dict(row)), 202
+        if row["status"] == "queued":
+            cancel_event_for(job_id).set()
+            db.execute(
+                "UPDATE jobs SET status='canceled', stage='Canceled', error=NULL, "
+                "updated_at=? WHERE id=?",
+                (now(), job_id),
+            )
+            row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+            return jsonify(job_dict(row))
+        if row["status"] != "processing":
+            return jsonify(error="Only an active job can be canceled"), 409
+
+        db.execute(
+            "UPDATE jobs SET status='canceling', stage='Canceling', updated_at=? WHERE id=?",
+            (now(), job_id),
+        )
+        cancel_event_for(job_id).set()
+        row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    return jsonify(job_dict(row)), 202
+
+
 @app.delete("/api/jobs/<job_id>")
 def delete_job(job_id: str):
     with db_lock, connect_db() as db:
         row = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return jsonify(error="Job not found"), 404
-        if row["status"] not in {"completed", "failed"}:
+        if row["status"] not in {"completed", "failed", "canceled"}:
             return jsonify(error="Wait for the job to finish before deleting it"), 409
 
         jobs_root = JOBS_DIR.resolve()
@@ -397,6 +489,8 @@ def delete_job(job_id: str):
         except OSError:
             return jsonify(error="Could not delete the job files"), 500
         db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        with cancel_events_lock:
+            cancel_events.pop(job_id, None)
     return jsonify(deleted=job_id)
 
 

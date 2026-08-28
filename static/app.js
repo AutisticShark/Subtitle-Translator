@@ -104,9 +104,12 @@ function renderJobs() {
     const primaryAction = job.status === 'completed' ?
       `<div class="download-actions"><a class="download" href="/api/jobs/${jobId}/download">Download${job.outputs.length > 1 ? ' ZIP' : ''}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
       `<span class="status ${job.status}">${job.status}</span>`;
-    const deleteAction = ['completed', 'failed'].includes(job.status) ?
+    const cancelAction = ['queued', 'processing'].includes(job.status) ?
+      `<button class="cancel-job" type="button" data-job-id="${jobId}">Cancel</button>` :
+      job.status === 'canceling' ? '<button class="cancel-job" type="button" disabled>Canceling…</button>' : '';
+    const deleteAction = ['completed', 'failed', 'canceled'].includes(job.status) ?
       `<button class="delete-job" type="button" data-job-id="${jobId}">Delete</button>` : '';
-    const action = `<div class="job-actions">${primaryAction}${deleteAction}</div>`;
+    const action = `<div class="job-actions">${primaryAction}${cancelAction}${deleteAction}</div>`;
     return `<article class="job">
       <div><div class="job-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
       <div class="job-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(targetNames)}</div></div>
@@ -114,6 +117,24 @@ function renderJobs() {
       <div class="job-meta">${escapeHtml(job.stage || job.status)} · ${job.progress}%</div>
       ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}</div>${action}</article>`;
   }).join('');
+}
+
+async function cancelJob(event) {
+  const button = event.target.closest('.cancel-job');
+  if (!button || button.disabled) return;
+  const jobId = decodeURIComponent(button.dataset.jobId);
+  const job = state.jobs.find(item => item.id === jobId);
+  if (!job || !window.confirm(`Cancel translation of ${job.filename}?`)) return;
+  button.disabled = true;
+  try {
+    const updated = await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+    state.jobs = state.jobs.map(item => item.id === jobId ? updated : item);
+    renderJobs();
+    toast('Cancellation requested');
+  } catch (error) {
+    button.disabled = false;
+    toast(error.message);
+  }
 }
 
 async function deleteJob(event) {
@@ -138,7 +159,7 @@ async function loadJobs() {
   try {
     state.jobs = (await api('/api/jobs')).jobs;
     renderJobs();
-    const active = state.jobs.some(job => ['queued', 'processing'].includes(job.status));
+    const active = state.jobs.some(job => ['queued', 'processing', 'canceling'].includes(job.status));
     clearTimeout(state.timer);
     state.timer = setTimeout(loadJobs, active ? 1500 : 8000);
   } catch (error) { toast(error.message); }
@@ -166,6 +187,7 @@ $('#settingsForm').addEventListener('submit', saveSettings);
 $('#settingsButton').addEventListener('click', () => $('#settingsDialog').showModal());
 $('#closeSettings').addEventListener('click', () => $('#settingsDialog').close());
 $('#refreshButton').addEventListener('click', loadJobs);
+$('#jobs').addEventListener('click', cancelJob);
 $('#jobs').addEventListener('click', deleteJob);
 const dropzone = $('#dropzone');
 ['dragenter', 'dragover'].forEach(name => dropzone.addEventListener(name, event => { event.preventDefault(); dropzone.classList.add('dragging'); }));

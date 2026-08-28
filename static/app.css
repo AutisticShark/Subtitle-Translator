@@ -66,12 +66,14 @@ h2 { font: 500 32px/1.1 Georgia, serif; margin: 7px 0 0; letter-spacing: -.03em;
 .status { text-transform: uppercase; letter-spacing: .1em; font-size: 10px; color: var(--muted); }
 .status.failed { color: var(--danger); }
 .status.completed { color: var(--accent); }
+.status.canceling { color: #ffc85e; }
 .download { color: var(--accent); text-decoration: none; border: 1px solid #4b6324; border-radius: 8px; padding: 7px 11px; white-space: nowrap; }
 .download-actions { text-align: center; }
 .job-actions { display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
-.delete-job { color: var(--muted); border: 0; background: transparent; padding: 7px 4px; cursor: pointer; font-size: 12px; }
+.cancel-job, .delete-job { color: var(--muted); border: 0; background: transparent; padding: 7px 4px; cursor: pointer; font-size: 12px; }
+.cancel-job:hover { color: #ffc85e; }
 .delete-job:hover { color: var(--danger); }
-.delete-job:disabled { opacity: .5; cursor: wait; }
+.cancel-job:disabled, .delete-job:disabled { opacity: .5; cursor: wait; }
 .language-downloads { display: flex; justify-content: center; gap: 8px; margin-top: 6px; font-size: 11px; }
 .language-downloads a { color: var(--muted); text-decoration: none; }
 .language-downloads a:hover { color: var(--accent); }

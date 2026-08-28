@@ -63,4 +63,11 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 ### Delete only terminal jobs
 
 - Job deletion removes the isolated job directory and its SQLite record.
-- Reject deletion for queued or processing jobs so file removal cannot race a background worker that is reading sources, writing caches, or producing outputs.
+- Reject deletion for queued, processing, or canceling jobs so file removal cannot race a background worker that is reading sources, writing caches, or producing outputs. Completed, failed, and canceled jobs are safe to delete.
+
+### Cancellation needs a state transition and a worker signal
+
+- A UI-only `canceled` status is unsafe because an active worker can later overwrite it with `completed` or `failed`, and immediate deletion can race file access.
+- Move active jobs atomically to `canceling`, signal a per-job in-memory event, and let the worker transition to terminal `canceled` after it stops coordinating work.
+- Translation batch waits and retry/throttle sleeps must check cancellation. The batch executor abandons pending work without waiting for an in-flight HTTP request, whose provider thread may finish later but no longer writes job files or state.
+- Final completion and failure updates must include a current-status condition so a concurrent cancellation wins the race.
