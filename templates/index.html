@@ -8,13 +8,38 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
 <body>
-  <div class="shell">
+  <main class="auth-view" id="authView" hidden>
+    <section class="panel auth-panel">
+      <a class="brand" href="/" aria-label="Subtitle Translator">
+        <span class="brand-mark">文</span>
+        <span>Subtitle Translator<small>Private workspace</small></span>
+      </a>
+      <div class="auth-copy">
+        <span class="eyebrow" id="authEyebrow">Authentication</span>
+        <h1 id="authTitle">Sign in</h1>
+        <p id="authDescription">Use your Subtitle Translator account.</p>
+      </div>
+      <form id="authForm">
+        <label>Username<input name="username" autocomplete="username" required minlength="3" maxlength="64"></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required minlength="12" maxlength="256"></label>
+        <div class="auth-error" id="authError" role="alert"></div>
+        <button class="primary" id="authSubmit" type="submit">Sign in</button>
+      </form>
+    </section>
+  </main>
+
+  <div class="shell" id="appShell" hidden>
     <header>
       <a class="brand" href="/" aria-label="Subtitle Translator">
         <span class="brand-mark">文</span>
         <span>Subtitle Translator<small>Context-aware translations, timing intact</small></span>
       </a>
-      <button class="ghost" id="settingsButton" type="button">Settings</button>
+      <div class="header-actions">
+        <span class="user-badge" id="userBadge"></span>
+        <button class="ghost" id="usersButton" type="button" hidden>Users</button>
+        <button class="ghost" id="settingsButton" type="button" hidden>Settings</button>
+        <button class="ghost" id="logoutButton" type="button">Sign out</button>
+      </div>
     </header>
 
     <main>
@@ -33,14 +58,9 @@
             <span>or click to browse · up to {{ max_upload_mb }} MB per request</span>
             <div class="file-list" id="fileList"></div>
           </label>
-
           <div class="form-grid">
-            <label>Source language
-              <input name="source_language" id="sourceLanguage" value="English" placeholder="Auto or English">
-            </label>
-            <label>Provider
-              <select name="provider" id="provider"></select>
-            </label>
+            <label>Source language<input name="source_language" id="sourceLanguage" value="English" placeholder="Auto or English"></label>
+            <label>Provider<select name="provider" id="provider"></select></label>
             <label class="wide">Target languages
               <div class="language-picker" id="languagePicker">
                 {% for code, language in languages.items() %}
@@ -49,7 +69,7 @@
               </div>
             </label>
             <label class="wide optional-model" id="modelField">Model override <span>(optional)</span>
-              <input name="model" placeholder="Use the model configured in Settings">
+              <input name="model" placeholder="Use the configured model">
             </label>
           </div>
           <div class="submit-row">
@@ -62,7 +82,10 @@
       <section class="jobs-section">
         <div class="section-heading">
           <div><span class="eyebrow">Workspace</span><h2>Recent jobs</h2></div>
-          <button class="ghost small" id="refreshButton" type="button">Refresh</button>
+          <div class="section-actions">
+            <label class="toggle-label" id="allJobsLabel" hidden><input id="allJobs" type="checkbox"> All users</label>
+            <button class="ghost small" id="refreshButton" type="button">Refresh</button>
+          </div>
         </div>
         <div id="jobs" class="jobs"><div class="empty">No translations yet.</div></div>
       </section>
@@ -70,25 +93,23 @@
   </div>
 
   <dialog id="settingsDialog">
-    <form id="settingsForm" method="dialog">
+    <form id="settingsForm">
       <div class="dialog-heading">
-        <div><span class="eyebrow">Configuration</span><h2>Settings</h2></div>
+        <div><span class="eyebrow">Administration</span><h2>Provider settings</h2></div>
         <button class="icon-button" id="closeSettings" type="button" aria-label="Close">×</button>
       </div>
-      <p class="settings-intro">Keys are write-only in the browser and persist in the Docker data volume. Set <code>APP_PASSWORD</code> before exposing this service to a network.</p>
-
+      <p class="settings-intro">Provider keys are write-only, encrypted before database storage, and available only to administrators.</p>
       <div class="settings-group">
         <h3>Providers</h3>
         <label>Default provider<select name="default_provider" id="defaultProvider"></select></label>
-        <label>Anthropic API key<div class="key-row"><input type="password" name="anthropic_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="anthropic"></span></div></label>
+        <label>Anthropic API key<div class="key-row"><input type="password" name="anthropic_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="anthropic"></span><button class="clear-key" data-provider="anthropic" type="button">Remove</button></div></label>
         <label>Anthropic model<input name="anthropic_model" placeholder="claude-sonnet-4-6"></label>
-        <label>OpenAI-compatible API key<div class="key-row"><input type="password" name="openai_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="openai"></span></div></label>
+        <label>OpenAI-compatible API key<div class="key-row"><input type="password" name="openai_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="openai"></span><button class="clear-key" data-provider="openai" type="button">Remove</button></div></label>
         <label>OpenAI-compatible model<input name="openai_model" placeholder="gpt-5-mini"></label>
         <label>OpenAI-compatible base URL<input name="openai_base_url" placeholder="https://api.openai.com/v1"></label>
-        <label>DeepL API key<div class="key-row"><input type="password" name="deepl_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="deepl"></span></div></label>
-        <label>Google Cloud Translation API key<div class="key-row"><input type="password" name="google_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="google"></span></div></label>
+        <label>DeepL API key<div class="key-row"><input type="password" name="deepl_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="deepl"></span><button class="clear-key" data-provider="deepl" type="button">Remove</button></div></label>
+        <label>Google Cloud Translation API key<div class="key-row"><input type="password" name="google_api_key" autocomplete="new-password" placeholder="Leave blank to keep current key"><span class="key-state" data-provider="google"></span><button class="clear-key" data-provider="google" type="button">Remove</button></div></label>
       </div>
-
       <details>
         <summary>Translation defaults</summary>
         <div class="settings-group compact-grid">
@@ -102,6 +123,23 @@
       <div class="dialog-actions"><span id="settingsMessage"></span><button class="primary" type="submit">Save settings</button></div>
     </form>
   </dialog>
+
+  <dialog id="usersDialog">
+    <div class="dialog-body">
+      <div class="dialog-heading">
+        <div><span class="eyebrow">Administration</span><h2>Users</h2></div>
+        <button class="icon-button" id="closeUsers" type="button" aria-label="Close">×</button>
+      </div>
+      <form id="createUserForm" class="create-user-form">
+        <label>Username<input name="username" required minlength="3" maxlength="64" autocomplete="off"></label>
+        <label>Temporary password<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label>
+        <label>Role<select name="role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
+        <button class="primary" type="submit">Create user</button>
+      </form>
+      <div class="user-list" id="userList"></div>
+    </div>
+  </dialog>
+
   <div class="toast" id="toast" role="status"></div>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>

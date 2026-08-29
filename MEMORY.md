@@ -87,3 +87,13 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Move active jobs atomically to `canceling`, signal a per-job in-memory event, and let the worker transition to terminal `canceled` after it stops coordinating work.
 - Translation batch waits and retry/throttle sleeps must check cancellation. The batch executor abandons pending work without waiting for an in-flight HTTP request, whose provider thread may finish later but no longer writes job files or state.
 - Final completion and failure updates must include a current-status condition so a concurrent cancellation wins the race.
+
+## Authentication and database portability
+
+- Browser authentication uses short-lived JWTs in HttpOnly `SameSite=Strict` cookies with double-submit CSRF protection. Header bearer JWTs remain available for API clients; browser code never stores an access JWT in local or session storage.
+- Users own jobs. Every regular-user list, lookup, cancellation, deletion, and download query must include `user_id`; administrators may explicitly inspect and operate across owners.
+- Administrators alone manage global translation settings and provider keys. Saved provider keys are write-only at the API boundary and Fernet-encrypted with the `enc:v1:` prefix in the database. A stable `JWT_SECRET_KEY` or separate `API_KEY_ENCRYPTION_KEY` is required before saving them.
+- Tokens carry a user token version and are rejected when the database user is missing, disabled, or has a different version. Password, role, and activation changes increment the version; logout also records the individual JWT ID as revoked.
+- The first administrator is created either by the one-time setup endpoint or `ADMIN_PASSWORD` bootstrap. The final active administrator cannot be deleted, disabled, or demoted, and setup uses a unique database marker to prevent concurrent first-admin creation.
+- `database.py` uses SQLAlchemy Core and URL normalization: SQLite is the default, PostgreSQL uses `pg8000`, and MariaDB/MySQL use `PyMySQL`. The legacy SQLite migration adds nullable ownership and the first administrator claims old jobs.
+- The local Python 3.15 RC has no compatible `psycopg-binary` wheel. Using the pure-Python `pg8000` driver avoids a platform-specific install failure and avoids adding `libpq` to the slim container.

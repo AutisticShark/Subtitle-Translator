@@ -8,20 +8,23 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, Google Cloud Translation, plus a debug-only offline Echo test provider
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
-- Persistent, write-only API-key fields and translation defaults in the web UI
+- Multi-user JWT login with administrator and user roles
+- Administrator-only user management and encrypted, write-only provider keys
+- Per-user job isolation, with administrator access to cross-user job cleanup
+- SQLite by default, plus PostgreSQL and MariaDB/MySQL through SQLAlchemy
 - Context-aware batching, shared rate-limit backoff, retries, resumable per-job cache, tag masking, and subtitle-aware line wrapping
-- Docker health check, persistent named volume, and optional HTTP Basic protection
+- Docker health check, persistent named volume, CSRF-protected HttpOnly auth cookies, and bearer-token API support
 - The original CLI remains available
 
 ## Start with Docker Compose
 
 ```bash
 cp .env.example .env
-# Set APP_PASSWORD in .env if the app is accessible beyond your own machine.
+# Generate and set JWT_SECRET_KEY in .env before starting.
 docker compose up --build -d
 ```
 
-Open <http://localhost:8000>, choose **Settings**, add a provider key and model, then upload subtitles. Application settings, job records, sources, outputs, and resumable caches live in the `subtitle_data` Docker volume.
+Open <http://localhost:8000>. If `ADMIN_PASSWORD` was left blank, the one-time setup screen creates the first administrator. Complete that setup before exposing the service to an untrusted network; for unattended deployment, set `ADMIN_PASSWORD` before the first start instead. Sign in, choose **Settings**, add a provider key and model, then upload subtitles. Application settings, users, job records, sources, outputs, and resumable caches live in the `subtitle_data` Docker volume.
 
 Queued or processing jobs can be canceled from **Recent jobs**. Finished, failed, and canceled jobs can then be deleted; deletion removes the database record, uploaded source, translated outputs, ZIP bundle, and resumable cache.
 
@@ -33,9 +36,29 @@ docker compose down
 docker compose down -v  # also permanently deletes saved settings and jobs
 ```
 
-`PORT`, `APP_PASSWORD`, `JOB_WORKERS`, and `MAX_UPLOAD_MB` can be changed in `.env`. API keys can optionally be bootstrapped with environment variables; values saved through the UI take precedence. When `APP_PASSWORD` is set, the browser prompts for any username and that password. Set `FLASK_DEBUG=1` only on a development instance to expose the offline Echo provider in the web UI and API.
+`PORT`, `JOB_WORKERS`, and `MAX_UPLOAD_MB` can be changed in `.env`. API keys can optionally be bootstrapped with environment variables; values saved through the UI take precedence. Set `FLASK_DEBUG=1` only on a development instance to expose the offline Echo provider in the web UI and API. `APP_PASSWORD` remains a deprecated compatibility input: on an empty database it bootstraps the `admin` account, but `ADMIN_PASSWORD` is preferred.
 
-> API keys saved through the UI are stored in the private Docker volume. The UI never reads them back, but the database itself is not encrypted. Use host permissions, `APP_PASSWORD`, TLS at your reverse proxy, and Docker secrets/environment variables as appropriate for your threat model.
+### Authentication and secrets
+
+Browser sessions use short-lived signed JWTs in HttpOnly, `SameSite=Strict` cookies. State-changing browser requests also require the JWT-bound double-submit CSRF token. Non-browser clients can post the normal login fields plus `"token_transport": "header"`; the response returns `access_token`, which protected APIs accept as `Authorization: Bearer <JWT>` without browser CSRF. Logout revokes the current token; disabling a user or changing a password/role invalidates all of that user's existing tokens.
+
+Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Provider keys saved through the administrator UI are encrypted with Fernet before database storage and are never returned by `GET /api/settings`. By default the encryption key is derived separately from `JWT_SECRET_KEY`. For independent JWT-key rotation, set a stable `API_KEY_ENCRYPTION_KEY` before saving provider keys. Losing or changing the encryption key makes saved provider keys unreadable.
+
+Set `JWT_COOKIE_SECURE=1` whenever the app is served over HTTPS. Plain `http://localhost` needs `0`. For any network deployment, terminate TLS at the app or a trusted reverse proxy; secure cookies and JWT authentication do not encrypt HTTP traffic.
+
+Administrators can manage provider settings, create/disable/promote/delete users, reset passwords, unlock accounts, and select **All users** when inspecting or deleting jobs. Regular users can operate only their own jobs. The final active administrator cannot be deleted, disabled, or demoted.
+
+### Database backends
+
+SQLite remains the zero-configuration default at `/app/data/app.db`. Set `DATABASE_URL` for another backend:
+
+```text
+postgresql://subtitle:password@postgres/subtitle
+mariadb://subtitle:password@mariadb/subtitle?charset=utf8mb4
+mysql://subtitle:password@mysql/subtitle?charset=utf8mb4
+```
+
+Ordinary PostgreSQL, MariaDB, and MySQL URLs are normalized to the bundled `pg8000` and `PyMySQL` drivers. URL-encode special characters in credentials. The job files still live below `DATA_DIR`; changing the relational database does not move uploads or translated outputs to object storage.
 
 ## Run without Docker
 
@@ -49,7 +72,7 @@ pip install -r requirements.txt
 python webapp.py
 ```
 
-The app listens on `http://localhost:8000` and creates `data/` on first start.
+The app listens on `http://localhost:8000` and creates `data/` on first start. Set `JWT_SECRET_KEY` in the environment before saving provider keys. The first browser visit offers one-time administrator setup unless `ADMIN_PASSWORD` bootstrapped the account.
 
 ## Providers
 
@@ -87,7 +110,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The `/healthz` endpoint is unauthenticated for container and reverse-proxy health checks. Uploaded filenames are sanitized, stored under random job IDs, and downloads are restricted to registered output files.
+The `/healthz` endpoint is unauthenticated for container and reverse-proxy health checks. All other API data is authenticated. Uploaded filenames are sanitized, stored under random job IDs, associated with an owning user, and downloads are restricted to both the owner/administrator and registered output files.
 
 ## Publishing Docker images
 

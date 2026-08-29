@@ -6,7 +6,8 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 
 - `srt_translate.py` contains the translation pipeline, provider clients (including Google Cloud Translation - Basic v2), retry/throttling behavior, segmentation, tag masking, cue rebuilding, wrapping, and the SRT-only CLI.
 - `subtitle_formats.py` adapts SRT, VTT, ASS, and SSA files to and from the shared cue model. Preserve format-specific headers, timings, settings, dialogue fields, newline style, BOM state, and inline tags.
-- `webapp.py` is the Flask API, SQLite-backed settings/job store, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time.
+- `webapp.py` is the Flask API, authentication/authorization layer, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time.
+- `database.py` defines the portable SQLAlchemy schema, SQLite legacy migration, and URL normalization for SQLite, PostgreSQL, MariaDB, and MySQL.
 - `static/app.js` and `templates/index.html` implement the browser UI.
 - `tests/` currently covers subtitle-format preservation and an Echo-provider web job. Echo is the preferred offline end-to-end provider.
 - `.github/workflows/docker-publish.yml` publishes to GHCR unconditionally and to Docker Hub only when all three Docker Hub settings are present.
@@ -14,6 +15,10 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 ## Required invariants
 
 - Never expose saved API-key values through `GET /api/settings`; the UI may receive only configured/not-configured state.
+- Keep provider settings and API-key mutation administrator-only. Saved API keys use `enc:v1:` Fernet encryption; never silently replace an unreadable key or log its value.
+- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, the login/setup endpoints, and the initial HTML page are the intentional public boundaries.
+- Scope every non-admin job read, mutation, and download by `user_id`. Use a not-found response for another user's job so its existence is not disclosed.
+- User deactivation, password changes, and role changes must invalidate existing tokens. Never allow deletion, deactivation, or demotion of the final active administrator.
 - Keep `/healthz` unauthenticated so Docker and reverse proxies can probe it.
 - Sanitize uploaded filenames, isolate files under random job IDs, and only serve outputs registered to the requested job.
 - Preserve subtitle structure and formatting while translating text. Add or change format behavior with focused round-trip tests.
@@ -31,6 +36,8 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 6. Google Cloud Translation - Basic v2 accepts at most 128 strings per request and returns HTML-escaped `translatedText` values. Keep batches within that limit, unescape each value, and reject any response whose translation count differs from the input count so subtitle segments cannot be misaligned.
 7. When writing explicitly assembled CRLF subtitle text, disable Python's platform newline translation (`newline=""`). Otherwise Windows converts each `\n` inside `\r\n` again and emits malformed `\r\r\n` line endings.
 8. Echo is a development provider: expose and accept it in the web app only when Flask debug mode is enabled. Enforce this on the server as well as filtering the UI; Echo remains available to the CLI and offline tests.
+9. JWT cookie authentication requires a CSRF header on `POST`, `PUT`, `PATCH`, and `DELETE`. Browser code reads `csrf_access_token` only for the double-submit header; it must never copy the HttpOnly access JWT into JavaScript storage.
+10. Database portability requires SQLAlchemy expressions, not backend-specific placeholders or upsert syntax. Ordinary `postgresql://`, `mariadb://`, and `mysql://` URLs are normalized to installed drivers; compile schema tests for all supported dialects when changing tables.
 
 ## Validation
 
