@@ -38,6 +38,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 8. Echo is a development provider: expose and accept it in the web app only when Flask debug mode is enabled. Enforce this on the server as well as filtering the UI; Echo remains available to the CLI and offline tests.
 9. JWT cookie authentication requires a CSRF header on `POST`, `PUT`, `PATCH`, and `DELETE`. Browser code reads `csrf_access_token` only for the double-submit header; it must never copy the HttpOnly access JWT into JavaScript storage.
 10. Database portability requires SQLAlchemy expressions, not backend-specific placeholders or upsert syntax. Ordinary `postgresql://`, `mariadb://`, and `mysql://` URLs are normalized to installed drivers; compile schema tests for all supported dialects when changing tables.
+11. Translation submission limits count jobs, not HTTP requests: every uploaded subtitle consumes one unit. Enforce the per-account role limit and the panel-wide limit in the same database transaction as all job inserts, serialize submissions through the shared settings row, and reject a multi-file upload atomically with HTTP 429 and `Retry-After`.
 
 ## Validation
 

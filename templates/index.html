@@ -95,7 +95,7 @@
   <dialog id="settingsDialog">
     <form id="settingsForm">
       <div class="dialog-heading">
-        <div><span class="eyebrow">Administration</span><h2>Provider settings</h2></div>
+        <div><span class="eyebrow">Administration</span><h2>Panel settings</h2></div>
         <button class="icon-button" id="closeSettings" type="button" aria-label="Close">×</button>
       </div>
       <p class="settings-intro">Provider keys are write-only, encrypted before database storage, and available only to administrators.</p>
@@ -118,6 +118,16 @@
           <label>Requests / minute<input type="number" name="rpm" min="0" max="10000"><small>0 means provider-managed</small></label>
           <label>Line width<input type="number" name="width" min="4" max="80"></label>
           <label>Maximum lines<input type="number" name="max_lines" min="1" max="5"></label>
+        </div>
+      </details>
+      <details>
+        <summary>Submission rate limits</summary>
+        <p class="settings-intro">Each uploaded subtitle consumes one job. Account limits apply separately to each account; the panel limit covers all accounts. Use 0 for unlimited.</p>
+        <div class="settings-group compact-grid">
+          <label>Window (minutes)<input type="number" name="rate_limit_window_minutes" min="1" max="10080" step="1"></label>
+          <label>Regular user jobs<input type="number" name="user_job_limit" min="0" max="100000" step="1"></label>
+          <label>Administrator jobs<input type="number" name="admin_job_limit" min="0" max="100000" step="1"></label>
+          <label>Panel-wide jobs<input type="number" name="panel_job_limit" min="0" max="1000000" step="1"></label>
         </div>
       </details>
       <div class="dialog-actions"><span id="settingsMessage"></span><button class="primary" type="submit">Save settings</button></div>

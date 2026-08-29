@@ -75,10 +75,16 @@ def test_legacy_sqlite_jobs_gain_ownership_without_losing_records():
                 columns = {
                     row[1] for row in verification_connection.execute("PRAGMA table_info(jobs)")
                 }
+                tables = {
+                    row[0] for row in verification_connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
                 row = verification_connection.execute(
                     "SELECT id, user_id, status FROM jobs WHERE id='legacy'"
                 ).fetchone()
             assert "user_id" in columns
+            assert "rate_limit_buckets" in tables
             assert row == ("legacy", None, "failed")
         finally:
             engine.dispose()

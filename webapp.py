@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -35,7 +36,7 @@ from werkzeug.utils import secure_filename
 
 from database import (
     connection, create_database_engine, initialize_database, jobs, revoked_tokens,
-    settings as settings_table, transaction, users,
+    rate_limit_buckets, settings as settings_table, transaction, users,
 )
 from srt_translate import (
     LANGS, FatalTranslationError, Throttle, TranslationCanceled, make_anthropic,
@@ -97,6 +98,14 @@ DEFAULTS = {
     "rpm": "0",
     "width": "16",
     "max_lines": "2",
+    "rate_limit_window_minutes": "60",
+    "user_job_limit": "0",
+    "admin_job_limit": "0",
+    "panel_job_limit": "0",
+}
+RATE_LIMIT_KEYS = {
+    "rate_limit_window_minutes", "user_job_limit", "admin_job_limit",
+    "panel_job_limit",
 }
 SECRET_KEYS = {
     "anthropic_api_key", "openai_api_key", "deepl_api_key", "google_api_key",
@@ -410,6 +419,78 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
             stored = values.get(key, "")
             result[key] = decrypt_secret(stored) if stored else os.environ.get(key.upper(), "")
     return result
+
+
+def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
+    """Atomically consume job quota or describe the exceeded limit."""
+    timestamp_datetime = now_datetime()
+    timestamp = timestamp_datetime.isoformat(timespec="seconds")
+
+    # Every job submission and rate-setting update takes this database row lock first.
+    # It serializes the panel counter across application workers and database backends.
+    db.execute(update(settings_table).where(
+        settings_table.c.name == "panel_job_limit"
+    ).values(updated_at=settings_table.c.updated_at))
+    stored = dict(db.execute(select(
+        settings_table.c.name, settings_table.c.value
+    ).where(settings_table.c.name.in_(RATE_LIMIT_KEYS))).all())
+    limits = {key: int(stored.get(key, DEFAULTS[key])) for key in RATE_LIMIT_KEYS}
+    window = timedelta(minutes=limits["rate_limit_window_minutes"])
+    account_scope = f"user:{user.id}"
+    rows = {
+        row.scope: row
+        for row in db.execute(select(rate_limit_buckets).where(
+            rate_limit_buckets.c.scope.in_(("panel", account_scope))
+        )).all()
+    }
+
+    def bucket(scope: str) -> tuple[datetime, int]:
+        row = rows.get(scope)
+        started = parse_timestamp(row.window_started_at) if row else None
+        if started is None or timestamp_datetime >= started + window:
+            return timestamp_datetime, 0
+        return started, int(row.used)
+
+    panel_started, panel_used = bucket("panel")
+    account_started, account_used = bucket(account_scope)
+    account_key = "admin_job_limit" if user.role == "admin" else "user_job_limit"
+    checks = (
+        (user.role, limits[account_key], account_started, account_used),
+        ("panel", limits["panel_job_limit"], panel_started, panel_used),
+    )
+    for scope, limit, started, used in checks:
+        if limit and used + amount > limit:
+            retry_after = max(1, math.ceil((started + window - timestamp_datetime).total_seconds()))
+            label = "Administrator" if scope == "admin" else (
+                "Regular-user" if scope == "user" else "Panel-wide"
+            )
+            return {
+                "error": (
+                    f"{label} rate limit of {limit} translation job"
+                    f"{'s' if limit != 1 else ''} per {limits['rate_limit_window_minutes']} "
+                    f"minute{'s' if limits['rate_limit_window_minutes'] != 1 else ''} exceeded"
+                ),
+                "scope": scope,
+                "limit": limit,
+                "retry_after": retry_after,
+            }
+
+    for scope, started, used in (
+        ("panel", panel_started, panel_used),
+        (account_scope, account_started, account_used),
+    ):
+        values = {
+            "window_started_at": started.isoformat(timespec="seconds"),
+            "used": used + amount,
+            "updated_at": timestamp,
+        }
+        if scope in rows:
+            db.execute(update(rate_limit_buckets).where(
+                rate_limit_buckets.c.scope == scope
+            ).values(**values))
+        else:
+            db.execute(insert(rate_limit_buckets).values(scope=scope, **values))
+    return None
 
 
 def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
@@ -824,6 +905,9 @@ def delete_user(user_id: str):
         )):
             return jsonify(error="Cancel or finish this user's active jobs first"), 409
         db.execute(update(jobs).where(jobs.c.user_id == user_id).values(user_id=None))
+        db.execute(delete(rate_limit_buckets).where(
+            rate_limit_buckets.c.scope == f"user:{user_id}"
+        ))
         db.execute(delete(users).where(users.c.id == user_id))
     return jsonify(deleted=user_id)
 
@@ -848,14 +932,35 @@ def save_settings():
             return jsonify(error="Configure JWT_SECRET_KEY before saving API keys"), 503
     numeric = {"batch_size": (1, 100), "workers": (1, 16), "rpm": (0, 10000),
                "width": (4, 80), "max_lines": (1, 5)}
+    integer_numeric = {
+        "rate_limit_window_minutes": (1, 10080),
+        "user_job_limit": (0, 100000),
+        "admin_job_limit": (0, 100000),
+        "panel_job_limit": (0, 1000000),
+    }
     try:
         for key, (minimum, maximum) in numeric.items():
             if key in payload and not minimum <= float(payload[key]) <= maximum:
                 raise ValueError(f"{key} must be between {minimum} and {maximum}")
+        for key, (minimum, maximum) in integer_numeric.items():
+            if key not in payload:
+                continue
+            try:
+                value = int(str(payload[key]).strip())
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{key} must be a whole number between {minimum} and {maximum}"
+                ) from exc
+            if str(value) != str(payload[key]).strip() or not minimum <= value <= maximum:
+                raise ValueError(f"{key} must be a whole number between {minimum} and {maximum}")
     except (TypeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
     timestamp = now()
     with db_lock, transaction(engine) as db:
+        if RATE_LIMIT_KEYS & payload.keys():
+            db.execute(update(settings_table).where(
+                settings_table.c.name == "panel_job_limit"
+            ).values(updated_at=settings_table.c.updated_at))
         for key, value in payload.items():
             clean_value = str(value).strip()
             if key in SECRET_KEYS and not clean_value:
@@ -871,6 +976,8 @@ def save_settings():
                 db.execute(insert(settings_table).values(
                     name=key, value=clean_value, updated_at=timestamp
                 ))
+        if RATE_LIMIT_KEYS & payload.keys():
+            db.execute(delete(rate_limit_buckets))
     return jsonify(read_settings())
 
 
@@ -918,25 +1025,38 @@ def create_jobs():
         "rpm": current_settings["rpm"], "width": current_settings["width"],
         "max_lines": current_settings["max_lines"],
     }
-    created = []
-    for upload, original in validated_files:
-        job_id = uuid.uuid4().hex
-        folder = JOBS_DIR / job_id
-        folder.mkdir(parents=True)
-        stored = "source" + Path(original).suffix.lower()
-        try:
+    pending = []
+    try:
+        for upload, original in validated_files:
+            job_id = uuid.uuid4().hex
+            folder = JOBS_DIR / job_id
+            folder.mkdir(parents=True)
+            stored = "source" + Path(original).suffix.lower()
             upload.save(folder / stored)
-            timestamp = now()
-            with db_lock, transaction(engine) as db:
-                db.execute(insert(jobs).values(
-                    id=job_id, user_id=user.id, filename=original, stored_name=stored,
-                    status="queued", progress=0, stage="", options=json.dumps(options),
-                    outputs="[]", error=None, created_at=timestamp, updated_at=timestamp,
-                ))
-        except Exception:
+            pending.append((job_id, folder, original, stored))
+        timestamp = now()
+        with db_lock, transaction(engine) as db:
+            exceeded = consume_job_quota(db, user, len(pending))
+            if exceeded is None:
+                for job_id, _folder, original, stored in pending:
+                    db.execute(insert(jobs).values(
+                        id=job_id, user_id=user.id, filename=original, stored_name=stored,
+                        status="queued", progress=0, stage="", options=json.dumps(options),
+                        outputs="[]", error=None, created_at=timestamp, updated_at=timestamp,
+                    ))
+    except Exception:
+        for _job_id, folder, _original, _stored in pending:
             shutil.rmtree(folder, ignore_errors=True)
-            raise
-        created.append(job_id)
+        raise
+    if exceeded is not None:
+        for _job_id, folder, _original, _stored in pending:
+            shutil.rmtree(folder, ignore_errors=True)
+        response = jsonify(exceeded)
+        response.status_code = 429
+        response.headers["Retry-After"] = str(exceeded["retry_after"])
+        return response
+    created = [job_id for job_id, _folder, _original, _stored in pending]
+    for job_id in created:
         executor.submit(run_job, job_id)
     return jsonify(jobs=created), 202
 

@@ -48,6 +48,8 @@ Set `JWT_COOKIE_SECURE=1` whenever the app is served over HTTPS. Plain `http://l
 
 Administrators can manage provider settings, create/disable/promote/delete users, reset passwords, unlock accounts, and select **All users** when inspecting or deleting jobs. Regular users can operate only their own jobs. The final active administrator cannot be deleted, disabled, or demoted.
 
+The Settings portal also controls translation-submission rate limits. Regular-user and administrator limits apply independently to each account, while the panel-wide limit covers all accounts. The shared window is configurable from 1 minute to 7 days; `0` disables an individual limit. Each uploaded subtitle counts as one job, and a multi-file request is accepted or rejected as a unit. Counters are stored in the application database so limits remain effective across restarts and multiple web workers.
+
 ### Database backends
 
 SQLite remains the zero-configuration default at `/app/data/app.db`. Set `DATABASE_URL` for another backend:

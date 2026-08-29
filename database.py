@@ -84,6 +84,15 @@ jobs = Table(
 )
 Index("ix_jobs_user_created", jobs.c.user_id, jobs.c.created_at)
 
+rate_limit_buckets = Table(
+    "rate_limit_buckets",
+    metadata,
+    Column("scope", String(64), primary_key=True),
+    Column("window_started_at", String(40), nullable=False),
+    Column("used", Integer, nullable=False, default=0, server_default=text("0")),
+    Column("updated_at", String(40), nullable=False),
+)
+
 revoked_tokens = Table(
     "revoked_tokens",
     metadata,

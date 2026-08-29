@@ -28,6 +28,13 @@ class WebApplicationTests(unittest.TestCase):
             "password": "correct-horse-battery-staple",
         })
         self.assertEqual(response.status_code, 200, response.get_json())
+        response = self.client.put("/api/settings", json={
+            "rate_limit_window_minutes": 60,
+            "user_job_limit": 0,
+            "admin_job_limit": 0,
+            "panel_job_limit": 0,
+        })
+        self.assertEqual(response.status_code, 200, response.get_json())
 
     def insert_job(self, job_id, *, status="completed", outputs=None, filename="sample.srt"):
         outputs = outputs or []
@@ -141,12 +148,35 @@ class WebApplicationTests(unittest.TestCase):
             ({"default_provider": "missing"}, "Invalid default provider"),
             ({"batch_size": 0}, "batch_size must be between 1 and 100"),
             ({"workers": "many"}, "could not convert string to float"),
+            ({"rate_limit_window_minutes": 0}, "must be a whole number between 1 and 10080"),
+            ({"user_job_limit": "1.5"}, "must be a whole number between 0 and 100000"),
         ]
         for payload, error in cases:
             with self.subTest(payload=payload):
                 response = self.client.put("/api/settings", json=payload)
                 self.assertEqual(response.status_code, 400)
                 self.assertIn(error, response.get_json()["error"])
+
+    def test_rate_limit_settings_are_available_in_the_admin_portal(self):
+        response = self.client.put("/api/settings", json={
+            "rate_limit_window_minutes": 15,
+            "user_job_limit": 3,
+            "admin_job_limit": 7,
+            "panel_job_limit": 20,
+        })
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        settings = response.get_json()
+        self.assertEqual(settings["rate_limit_window_minutes"], "15")
+        self.assertEqual(settings["user_job_limit"], "3")
+        self.assertEqual(settings["admin_job_limit"], "7")
+        self.assertEqual(settings["panel_job_limit"], "20")
+        page = self.client.get("/")
+        for field in (
+            b'rate_limit_window_minutes', b'user_job_limit',
+            b'admin_job_limit', b'panel_job_limit',
+        ):
+            self.assertIn(field, page.data)
 
     def test_blank_secret_preserves_saved_value_and_delete_key_removes_it(self):
         self.client.put("/api/settings", json={"openai_api_key": "saved-secret"})
@@ -236,6 +266,146 @@ class WebApplicationTests(unittest.TestCase):
                 "UPDATE settings SET value=?, updated_at=? WHERE name='default_provider'",
                 (provider, webapp.now()),
             )
+
+    @staticmethod
+    def _remove_rate_limit_test_data(job_ids, user_ids=()):
+        with webapp.connect_db() as db:
+            for job_id in job_ids:
+                db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            for user_id in user_ids:
+                db.execute("DELETE FROM rate_limit_buckets WHERE scope=?", (f"user:{user_id}",))
+                db.execute("DELETE FROM users WHERE id=?", (user_id,))
+        for job_id in job_ids:
+            shutil.rmtree(webapp.JOBS_DIR / job_id, ignore_errors=True)
+
+    @staticmethod
+    def _job_payload(*names):
+        source = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+        return {
+            "provider": "echo",
+            "target_languages": "es",
+            "files": [(io.BytesIO(source), name) for name in names],
+        }
+
+    def test_regular_users_and_administrators_have_separate_per_account_limits(self):
+        created_user = self.client.post("/api/users", json={
+            "username": "limited-user",
+            "password": "limited-user-password",
+            "role": "user",
+        }).get_json()["user"]
+        user_client = webapp.app.test_client()
+        self.assertEqual(user_client.post("/api/auth/login", json={
+            "username": "limited-user", "password": "limited-user-password",
+        }).status_code, 200)
+        configured = self.client.put("/api/settings", json={
+            "rate_limit_window_minutes": 60,
+            "user_job_limit": 1,
+            "admin_job_limit": 2,
+            "panel_job_limit": 0,
+        })
+        self.assertEqual(configured.status_code, 200, configured.get_json())
+        job_ids = []
+        self.addCleanup(self._remove_rate_limit_test_data, job_ids, (created_user["id"],))
+
+        with patch.object(webapp.executor, "submit") as submit:
+            first_user = user_client.post(
+                "/api/jobs", data=self._job_payload("user-one.srt"),
+                content_type="multipart/form-data",
+            )
+            second_user = user_client.post(
+                "/api/jobs", data=self._job_payload("user-two.srt"),
+                content_type="multipart/form-data",
+            )
+            first_admin = self.client.post(
+                "/api/jobs", data=self._job_payload("admin-one.srt"),
+                content_type="multipart/form-data",
+            )
+            second_admin = self.client.post(
+                "/api/jobs", data=self._job_payload("admin-two.srt"),
+                content_type="multipart/form-data",
+            )
+            third_admin = self.client.post(
+                "/api/jobs", data=self._job_payload("admin-three.srt"),
+                content_type="multipart/form-data",
+            )
+
+        for response in (first_user, first_admin, second_admin):
+            self.assertEqual(response.status_code, 202, response.get_json())
+            job_ids.extend(response.get_json()["jobs"])
+        self.assertEqual(second_user.status_code, 429, second_user.get_json())
+        self.assertEqual(second_user.get_json()["scope"], "user")
+        self.assertEqual(second_user.get_json()["limit"], 1)
+        self.assertGreater(int(second_user.headers["Retry-After"]), 0)
+        self.assertEqual(third_admin.status_code, 429, third_admin.get_json())
+        self.assertEqual(third_admin.get_json()["scope"], "admin")
+        self.assertEqual(third_admin.get_json()["limit"], 2)
+        self.assertEqual(submit.call_count, 3)
+
+    def test_panel_limit_counts_each_file_across_accounts_and_rejects_atomically(self):
+        created_user = self.client.post("/api/users", json={
+            "username": "panel-user",
+            "password": "panel-user-password",
+            "role": "user",
+        }).get_json()["user"]
+        user_client = webapp.app.test_client()
+        self.assertEqual(user_client.post("/api/auth/login", json={
+            "username": "panel-user", "password": "panel-user-password",
+        }).status_code, 200)
+        configured = self.client.put("/api/settings", json={
+            "rate_limit_window_minutes": 60,
+            "user_job_limit": 0,
+            "admin_job_limit": 0,
+            "panel_job_limit": 2,
+        })
+        self.assertEqual(configured.status_code, 200, configured.get_json())
+        job_ids = []
+        self.addCleanup(self._remove_rate_limit_test_data, job_ids, (created_user["id"],))
+
+        with patch.object(webapp.executor, "submit") as submit:
+            accepted = user_client.post(
+                "/api/jobs", data=self._job_payload("first.srt", "second.srt"),
+                content_type="multipart/form-data",
+            )
+            folders_before_rejection = set(webapp.JOBS_DIR.iterdir())
+            rejected = self.client.post(
+                "/api/jobs", data=self._job_payload("third.srt"),
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(accepted.status_code, 202, accepted.get_json())
+        job_ids.extend(accepted.get_json()["jobs"])
+        self.assertEqual(len(job_ids), 2)
+        self.assertEqual(rejected.status_code, 429, rejected.get_json())
+        self.assertEqual(rejected.get_json()["scope"], "panel")
+        self.assertEqual(rejected.get_json()["limit"], 2)
+        self.assertEqual(set(webapp.JOBS_DIR.iterdir()), folders_before_rejection)
+        self.assertEqual(submit.call_count, 2)
+
+    def test_rate_limit_bucket_reopens_after_the_configured_window(self):
+        configured = self.client.put("/api/settings", json={
+            "rate_limit_window_minutes": 1,
+            "user_job_limit": 0,
+            "admin_job_limit": 1,
+            "panel_job_limit": 0,
+        })
+        self.assertEqual(configured.status_code, 200, configured.get_json())
+        with webapp.connection(webapp.engine) as db:
+            admin = db.execute(webapp.select(webapp.users).where(
+                webapp.users.c.username == "admin"
+            )).first()
+        started = webapp.datetime(2026, 1, 1, tzinfo=webapp.timezone.utc)
+
+        with patch.object(webapp, "now_datetime", return_value=started):
+            with webapp.transaction(webapp.engine) as db:
+                self.assertIsNone(webapp.consume_job_quota(db, admin, 1))
+        with patch.object(webapp, "now_datetime", return_value=started + webapp.timedelta(seconds=30)):
+            with webapp.transaction(webapp.engine) as db:
+                exceeded = webapp.consume_job_quota(db, admin, 1)
+        self.assertEqual(exceeded["scope"], "admin")
+        self.assertEqual(exceeded["retry_after"], 30)
+        with patch.object(webapp, "now_datetime", return_value=started + webapp.timedelta(seconds=61)):
+            with webapp.transaction(webapp.engine) as db:
+                self.assertIsNone(webapp.consume_job_quota(db, admin, 1))
 
     def test_active_job_cannot_be_deleted(self):
         job_id = "active-delete-test"

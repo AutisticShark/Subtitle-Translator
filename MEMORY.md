@@ -97,3 +97,9 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - The first administrator is created either by the one-time setup endpoint or `ADMIN_PASSWORD` bootstrap. The final active administrator cannot be deleted, disabled, or demoted, and setup uses a unique database marker to prevent concurrent first-admin creation.
 - `database.py` uses SQLAlchemy Core and URL normalization: SQLite is the default, PostgreSQL uses `pg8000`, and MariaDB/MySQL use `PyMySQL`. The legacy SQLite migration adds nullable ownership and the first administrator claims old jobs.
 - The local Python 3.15 RC has no compatible `psycopg-binary` wheel. Using the pure-Python `pg8000` driver avoids a platform-specific install failure and avoids adding `libpq` to the slim container.
+
+## Translation submission rate limits
+
+- Regular-user and administrator limits apply independently per account; the panel-wide limit covers all accounts. All limits share a configurable fixed window, and `0` means unlimited.
+- Each uploaded subtitle consumes one job unit. A multi-file submission is admitted and inserted as one database transaction or rejected in full with HTTP 429 and a `Retry-After` header.
+- Rate counters live in `rate_limit_buckets`. Job submissions and rate-setting changes first lock the `panel_job_limit` settings row, keeping counters and configuration race-safe across web workers and supported database backends. Changing any rate-limit setting starts fresh windows.
