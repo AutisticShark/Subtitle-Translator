@@ -57,7 +57,7 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Providers are Anthropic, OpenAI-compatible APIs, DeepL, Google Cloud Translation - Basic v2, and offline Echo.
 - Runtime settings, job records, uploads, outputs, and resumable caches live below `DATA_DIR` (the Docker volume maps it to `/app/data`).
 - The settings API treats secrets as write-only. Preserve that security property.
-- Echo is the safe, deterministic provider for offline tests.
+- Echo is the safe, deterministic provider for the CLI and offline tests. The web UI and API expose and accept Echo only while Flask debug mode is enabled; normal instances must reject crafted Echo job requests server-side as well as hiding the option.
 - Docker publishing always targets GHCR. Docker Hub is optional and requires `DOCKERHUB_IMAGE`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` together.
 
 ## Google Cloud Translation adapter

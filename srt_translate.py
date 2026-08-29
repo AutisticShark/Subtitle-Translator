@@ -57,16 +57,16 @@ LANGS = {
         "name": "Traditional Chinese (Taiwan)",
         "deepl": "ZH-HANT",
         "style": (
-            "Use Taiwan Mandarin vocabulary and idiom, not Mainland vocabulary "
+            "Use Taiwan Mandarin vocabulary and idiom, not Chinese vocabulary "
             "mechanically converted to traditional glyphs. Use Taiwan full-width "
             "punctuation conventions."
         ),
     },
     "zh-CN": {
         "suffix": ".zh.cn",
-        "name": "Simplified Chinese (Mainland)",
+        "name": "Simplified Chinese (China)",
         "deepl": "ZH-HANS",
-        "style": "Use Mainland Mandarin vocabulary and standard simplified punctuation.",
+        "style": "Use Chinese Mandarin vocabulary and standard simplified punctuation.",
     },
     "ja": {"suffix": ".ja", "name": "Japanese", "deepl": "JA", "style": ""},
     "ko": {"suffix": ".ko", "name": "Korean", "deepl": "KO", "style": ""},

@@ -7,6 +7,7 @@ services:
       - "${PORT:-8000}:8000"
     environment:
       APP_PASSWORD: "${APP_PASSWORD:-}"
+      FLASK_DEBUG: "${FLASK_DEBUG:-0}"
       JOB_WORKERS: "${JOB_WORKERS:-2}"
       MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-200}"
       # Keys may be bootstrapped here, but the Settings screen is preferred.

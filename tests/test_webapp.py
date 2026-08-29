@@ -18,7 +18,7 @@ import webapp  # noqa: E402  (environment must be configured before import)
 
 class WebApplicationTests(unittest.TestCase):
     def setUp(self):
-        webapp.app.config.update(TESTING=True)
+        webapp.app.config.update(TESTING=True, DEBUG=True)
         self.client = webapp.app.test_client()
 
     def insert_job(self, job_id, *, status="completed", outputs=None, filename="sample.srt"):
@@ -67,6 +67,58 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(unauthorized.status_code, 401)
         self.assertIn("Basic", unauthorized.headers["WWW-Authenticate"])
         self.assertEqual(authorized.status_code, 200)
+
+    def test_echo_is_available_when_debug_is_enabled(self):
+        settings = self.client.get("/api/settings").get_json()
+
+        self.assertEqual(settings["providers"]["echo"], "Echo (offline test)")
+        self.assertTrue(settings["configured"]["echo"])
+        provider = webapp.provider_for("echo", {}, webapp.Throttle(), None)
+        self.assertEqual(provider(["Hello"], "English", "es"), ["[es] Hello"])
+
+    def test_echo_is_hidden_and_rejected_when_debug_is_disabled(self):
+        webapp.app.config["DEBUG"] = False
+        settings = self.client.get("/api/settings").get_json()
+
+        self.assertNotIn("echo", settings["providers"])
+        self.assertNotIn("echo", settings["configured"])
+        with self.assertRaisesRegex(webapp.FatalTranslationError, "only in debug mode"):
+            webapp.provider_for("echo", {}, webapp.Throttle(), None)
+
+        save_default = self.client.put("/api/settings", json={"default_provider": "echo"})
+        self.assertEqual(save_default.status_code, 400)
+
+        with patch.object(webapp.executor, "submit") as submit:
+            create = self.client.post("/api/jobs", data={
+                "provider": "echo",
+                "target_languages": "es",
+                "files": (io.BytesIO(
+                    b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+                ), "sample.srt"),
+            }, content_type="multipart/form-data")
+
+        self.assertEqual(create.status_code, 400)
+        self.assertEqual(create.get_json()["error"], "Invalid provider")
+        submit.assert_not_called()
+
+    def test_hidden_echo_default_falls_back_without_overwriting_saved_setting(self):
+        with webapp.connect_db() as db:
+            db.execute(
+                "UPDATE settings SET value='echo', updated_at=? WHERE name='default_provider'",
+                (webapp.now(),),
+            )
+        self.addCleanup(self._set_default_provider, "anthropic")
+
+        webapp.app.config["DEBUG"] = False
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["default_provider"],
+            "anthropic",
+        )
+        webapp.app.config["DEBUG"] = True
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["default_provider"],
+            "echo",
+        )
 
     def test_settings_reject_unknown_invalid_provider_and_out_of_range_values(self):
         cases = [
@@ -161,6 +213,14 @@ class WebApplicationTests(unittest.TestCase):
     def _delete_job_record(job_id):
         with webapp.connect_db() as db:
             db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    @staticmethod
+    def _set_default_provider(provider):
+        with webapp.connect_db() as db:
+            db.execute(
+                "UPDATE settings SET value=?, updated_at=? WHERE name='default_provider'",
+                (provider, webapp.now()),
+            )
 
     def test_active_job_cannot_be_deleted(self):
         job_id = "active-delete-test"

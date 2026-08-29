@@ -5,7 +5,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 ## Highlights
 
 - SRT, WebVTT (`.vtt`), Advanced SubStation Alpha (`.ass`), and SubStation Alpha (`.ssa`)
-- Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, Google Cloud Translation, plus an offline Echo test provider
+- Anthropic, OpenAI and OpenAI-compatible endpoints, DeepL, Google Cloud Translation, plus a debug-only offline Echo test provider
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Persistent, write-only API-key fields and translation defaults in the web UI
@@ -33,7 +33,7 @@ docker compose down
 docker compose down -v  # also permanently deletes saved settings and jobs
 ```
 
-`PORT`, `APP_PASSWORD`, `JOB_WORKERS`, and `MAX_UPLOAD_MB` can be changed in `.env`. API keys can optionally be bootstrapped with environment variables; values saved through the UI take precedence. When `APP_PASSWORD` is set, the browser prompts for any username and that password.
+`PORT`, `APP_PASSWORD`, `JOB_WORKERS`, and `MAX_UPLOAD_MB` can be changed in `.env`. API keys can optionally be bootstrapped with environment variables; values saved through the UI take precedence. When `APP_PASSWORD` is set, the browser prompts for any username and that password. Set `FLASK_DEBUG=1` only on a development instance to expose the offline Echo provider in the web UI and API.
 
 > API keys saved through the UI are stored in the private Docker volume. The UI never reads them back, but the database itself is not encrypted. Use host permissions, `APP_PASSWORD`, TLS at your reverse proxy, and Docker secrets/environment variables as appropriate for your threat model.
 
@@ -59,9 +59,9 @@ The app listens on `http://localhost:8000` and creates `data/` on first start.
 | OpenAI-compatible | API key, model, base URL | Works with OpenAI and compatible `/v1/chat/completions` servers |
 | DeepL | API key | Automatically selects free or paid API by the `:fx` key suffix |
 | Google Cloud Translation | API key | Uses Cloud Translation - Basic (v2) with the standard NMT model |
-| Echo | None | Offline pipeline test; prefixes text with the target code |
+| Echo | None | Offline pipeline test; available in the web app only with `FLASK_DEBUG=1` |
 
-The language list is shared by the CLI and web app. DeepL and Google Cloud Translation must support the selected target; the LLM providers can use every target shown in the UI. For Google, enter a supported source language code (such as `en`) or a known language name; otherwise the API automatically detects the source language.
+The language list is shared by the CLI and web app. DeepL and Google Cloud Translation must support the selected target; the LLM providers can use every target shown in the UI. For Google, enter a supported source language code (such as `en`) or a known language name; otherwise the API automatically detects the source language. Echo remains available to the CLI for offline pipeline checks without enabling web debug mode.
 
 For Google Cloud Translation, enable the Cloud Translation API in a Google Cloud project and create an API key. Save it in the web Settings screen or set `GOOGLE_API_KEY`. The integration uses the API-key-compatible Basic v2 endpoint; it does not require a service-account credential file.
 

@@ -46,6 +46,11 @@ JOBS_DIR = DATA_DIR / "jobs"
 DB_PATH = DATA_DIR / "app.db"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 
+
+def environment_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULTS = {
     "default_provider": "anthropic",
     "anthropic_model": "claude-sonnet-4-6",
@@ -64,10 +69,18 @@ SECRET_KEYS = {
 }
 PUBLIC_KEYS = set(DEFAULTS)
 ALL_SETTING_KEYS = PUBLIC_KEYS | SECRET_KEYS
-PROVIDERS = {"anthropic", "openai", "deepl", "google", "echo"}
+PROVIDER_LABELS = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI-compatible",
+    "deepl": "DeepL",
+    "google": "Google Cloud Translation",
+    "echo": "Echo (offline test)",
+}
+PUBLIC_PROVIDERS = ("anthropic", "openai", "deepl", "google")
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config.update(
+    DEBUG=environment_flag("FLASK_DEBUG"),
     MAX_CONTENT_LENGTH=MAX_UPLOAD_MB * 1024 * 1024,
     SEND_FILE_MAX_AGE_DEFAULT=0,
 )
@@ -75,6 +88,10 @@ executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JOB_WORKERS
 db_lock = threading.RLock()
 cancel_events_lock = threading.Lock()
 cancel_events: dict[str, threading.Event] = {}
+
+
+def available_providers() -> tuple[str, ...]:
+    return PUBLIC_PROVIDERS + (("echo",) if app.debug else ())
 
 
 def now() -> str:
@@ -149,13 +166,18 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
     with db_lock, connect_db() as db:
         values = {row["name"]: row["value"] for row in db.execute("SELECT name, value FROM settings")}
     result: dict[str, Any] = {key: values.get(key, default) for key, default in DEFAULTS.items()}
-    result["configured"] = {
+    providers = available_providers()
+    if result["default_provider"] not in providers:
+        result["default_provider"] = DEFAULTS["default_provider"]
+    configured = {
         "anthropic": bool(values.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY")),
         "openai": bool(values.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")),
         "deepl": bool(values.get("deepl_api_key") or os.environ.get("DEEPL_API_KEY")),
         "google": bool(values.get("google_api_key") or os.environ.get("GOOGLE_API_KEY")),
         "echo": True,
     }
+    result["providers"] = {name: PROVIDER_LABELS[name] for name in providers}
+    result["configured"] = {name: configured[name] for name in providers}
     if include_secrets:
         for key in SECRET_KEYS:
             result[key] = values.get(key, "") or os.environ.get(key.upper(), "")
@@ -197,6 +219,8 @@ def cancel_event_for(job_id: str) -> threading.Event:
 
 def provider_for(name: str, settings: dict[str, Any], throttle: Throttle, model: str | None):
     if name == "echo":
+        if not app.debug:
+            raise FatalTranslationError("Echo provider is available only in debug mode")
         return make_echo()
     if name == "anthropic":
         key = settings.get("anthropic_api_key")
@@ -348,7 +372,8 @@ def save_settings():
     unknown = set(payload) - ALL_SETTING_KEYS
     if unknown:
         return jsonify(error=f"Unknown settings: {', '.join(sorted(unknown))}"), 400
-    if payload.get("default_provider") and payload["default_provider"] not in PROVIDERS:
+    if (payload.get("default_provider")
+            and payload["default_provider"] not in available_providers()):
         return jsonify(error="Invalid default provider"), 400
     numeric = {"batch_size": (1, 100), "workers": (1, 16), "rpm": (0, 10000),
                "width": (4, 80), "max_lines": (1, 5)}
@@ -395,7 +420,7 @@ def create_jobs():
         validated_files.append((upload, original))
     settings = read_settings()
     provider = request.form.get("provider", settings["default_provider"])
-    if provider not in PROVIDERS:
+    if provider not in available_providers():
         return jsonify(error="Invalid provider"), 400
     targets = [value.strip() for value in request.form.get(
         "target_languages", settings["target_languages"]).split(",") if value.strip()]
@@ -542,4 +567,4 @@ def too_large(_error):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=app.debug)
