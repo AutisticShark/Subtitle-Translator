@@ -13,6 +13,9 @@ import secrets
 import shutil
 import sqlite3
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -61,6 +64,7 @@ PASSWORD_MIN_LENGTH = 12
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_LOCK_MINUTES = 15
 LOGIN_RATE_LIMIT = 30
+REGISTER_RATE_LIMIT = 10
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 ACTIVE_STATUSES = {"queued", "processing", "canceling"}
 
@@ -106,6 +110,15 @@ DEFAULTS = {
     "user_job_limit": "0",
     "admin_job_limit": "0",
     "panel_job_limit": "0",
+    "registration_enabled": os.environ.get("REGISTRATION_ENABLED", "1").strip(),
+    "captcha_provider": os.environ.get("CAPTCHA_PROVIDER", "none").strip().lower(),
+    "captcha_hostname": os.environ.get("CAPTCHA_HOSTNAME", "").strip().lower(),
+    "captcha_on_login": os.environ.get("CAPTCHA_ON_LOGIN", "1").strip(),
+    "captcha_on_register": os.environ.get("CAPTCHA_ON_REGISTER", "1").strip(),
+    "captcha_on_upload": os.environ.get("CAPTCHA_ON_UPLOAD", "1").strip(),
+    "turnstile_site_key": os.environ.get("TURNSTILE_SITE_KEY", "").strip(),
+    "recaptcha_site_key": os.environ.get("RECAPTCHA_SITE_KEY", "").strip(),
+    "hcaptcha_site_key": os.environ.get("HCAPTCHA_SITE_KEY", "").strip(),
 }
 RATE_LIMIT_KEYS = {
     "rate_limit_window_minutes", "user_job_limit", "admin_job_limit",
@@ -113,6 +126,7 @@ RATE_LIMIT_KEYS = {
 }
 SECRET_KEYS = {
     "anthropic_api_key", "openai_api_key", "deepl_api_key", "google_api_key",
+    "turnstile_secret_key", "recaptcha_secret_key", "hcaptcha_secret_key",
 }
 PUBLIC_KEYS = set(DEFAULTS)
 ALL_SETTING_KEYS = PUBLIC_KEYS | SECRET_KEYS
@@ -121,6 +135,24 @@ PROVIDER_LABELS = {
     "google": "Google Cloud Translation", "echo": "Echo (offline test)",
 }
 PUBLIC_PROVIDERS = ("anthropic", "openai", "deepl", "google")
+CAPTCHA_PROVIDERS = ("turnstile", "recaptcha", "hcaptcha")
+CAPTCHA_ACTION_SETTINGS = {
+    "login": "captcha_on_login",
+    "register": "captcha_on_register",
+    "upload": "captcha_on_upload",
+}
+CAPTCHA_VERIFY_URLS = {
+    "turnstile": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+    "recaptcha": "https://www.google.com/recaptcha/api/siteverify",
+    "hcaptcha": "https://api.hcaptcha.com/siteverify",
+}
+if DEFAULTS["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}:
+    raise RuntimeError("CAPTCHA_PROVIDER must be none, turnstile, recaptcha, or hcaptcha")
+for _boolean_setting in {
+    "registration_enabled", *CAPTCHA_ACTION_SETTINGS.values(),
+}:
+    if DEFAULTS[_boolean_setting] not in {"0", "1"}:
+        raise RuntimeError(f"{_boolean_setting.upper()} must be 0 or 1")
 
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -133,7 +165,7 @@ jwt_secret = configured_jwt_secret or secrets.token_urlsafe(64)
 if not configured_jwt_secret:
     LOGGER.warning(
         "JWT_SECRET_KEY is not configured; generated tokens will become invalid after restart "
-        "and API keys cannot be saved"
+        "and secrets cannot be saved"
     )
 
 
@@ -176,6 +208,8 @@ cancel_events_lock = threading.Lock()
 cancel_events: dict[str, threading.Event] = {}
 login_attempts_lock = threading.Lock()
 login_attempts: dict[str, list[datetime]] = {}
+registration_attempts_lock = threading.Lock()
+registration_attempts: dict[str, list[datetime]] = {}
 
 
 def available_providers() -> tuple[str, ...]:
@@ -205,6 +239,21 @@ def login_rate_limited(remote_address: str) -> bool:
 def record_login_failure(remote_address: str) -> None:
     with login_attempts_lock:
         login_attempts.setdefault(remote_address, []).append(now_datetime())
+
+
+def registration_rate_limited(remote_address: str) -> bool:
+    cutoff = now_datetime() - timedelta(minutes=LOGIN_LOCK_MINUTES)
+    with registration_attempts_lock:
+        recent = [
+            value for value in registration_attempts.get(remote_address, [])
+            if value > cutoff
+        ]
+        if len(recent) >= REGISTER_RATE_LIMIT:
+            registration_attempts[remote_address] = recent
+            return True
+        recent.append(now_datetime())
+        registration_attempts[remote_address] = recent
+        return False
 
 
 def validate_username(username: str) -> str | None:
@@ -299,12 +348,12 @@ def decrypt_secret(value: str) -> str:
         return secret_cipher.decrypt(value[7:].encode("ascii")).decode()
     except (InvalidToken, UnicodeDecodeError) as exc:
         raise RuntimeError(
-            "A saved API key cannot be decrypted; restore the configured JWT/encryption key"
+            "A saved secret cannot be decrypted; restore the configured JWT/encryption key"
         ) from exc
 
 
 def encrypt_existing_api_keys() -> None:
-    """Upgrade values written by versions that stored provider keys as plaintext."""
+    """Upgrade values written by versions that stored secrets as plaintext."""
     if not (configured_jwt_secret or os.environ.get("API_KEY_ENCRYPTION_KEY")):
         return
     with transaction(engine) as db:
@@ -379,8 +428,13 @@ def security_headers(response):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault(
         "Content-Security-Policy",
-        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        "default-src 'self'; script-src 'self' https://challenges.cloudflare.com "
+        "https://www.google.com https://www.gstatic.com https://js.hcaptcha.com; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; "
+        "connect-src 'self' https://challenges.cloudflare.com https://www.google.com "
+        "https://www.gstatic.com https://*.hcaptcha.com; frame-src "
+        "https://challenges.cloudflare.com https://www.google.com https://recaptcha.google.com "
+        "https://*.hcaptcha.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
     )
     response.headers.setdefault("Cache-Control", "no-store")
     response.headers.setdefault("Content-Language", current_locale())
@@ -421,11 +475,99 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
     }
     result["providers"] = {name: tr(PROVIDER_LABELS[name]) for name in providers}
     result["configured"] = {name: configured[name] for name in providers}
+    result["captcha_configured"] = {
+        provider: bool(
+            result.get(f"{provider}_site_key")
+            and (values.get(f"{provider}_secret_key")
+                 or os.environ.get(f"{provider}_secret_key".upper()))
+        )
+        for provider in CAPTCHA_PROVIDERS
+    }
     if include_secrets:
         for key in SECRET_KEYS:
             stored = values.get(key, "")
             result[key] = decrypt_secret(stored) if stored else os.environ.get(key.upper(), "")
     return result
+
+
+def public_auth_configuration() -> dict[str, Any]:
+    settings = read_settings()
+    provider = settings["captcha_provider"]
+    protected_actions = [
+        action for action, key in CAPTCHA_ACTION_SETTINGS.items()
+        if settings[key] == "1"
+    ]
+    return {
+        "registration_enabled": settings["registration_enabled"] == "1",
+        "captcha": {
+            "provider": provider,
+            "site_key": settings.get(f"{provider}_site_key", "")
+            if provider in CAPTCHA_PROVIDERS else "",
+            "protected_actions": protected_actions if provider != "none" else [],
+        },
+    }
+
+
+def captcha_required(action: str, settings: dict[str, Any]) -> bool:
+    provider = settings.get("captcha_provider", "none")
+    setting = CAPTCHA_ACTION_SETTINGS.get(action)
+    return provider in CAPTCHA_PROVIDERS and bool(setting) and settings.get(setting) == "1"
+
+
+def verify_captcha(action: str, token: Any):
+    """Return a Flask error response when a required CAPTCHA is not valid."""
+    settings = read_settings(include_secrets=True)
+    if not captcha_required(action, settings):
+        return None
+    provider = settings["captcha_provider"]
+    site_key = settings.get(f"{provider}_site_key", "").strip()
+    secret_key = settings.get(f"{provider}_secret_key", "").strip()
+    if not site_key or not secret_key:
+        LOGGER.error("CAPTCHA provider %s is active but is missing a site or secret key", provider)
+        return jsonify(error=tr("CAPTCHA is temporarily unavailable")), 503
+    if not isinstance(token, str) or not token.strip():
+        return jsonify(error=tr("Complete the CAPTCHA challenge")), 400
+    token = token.strip()
+    if len(token) > 8192:
+        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
+    form = {
+        "secret": secret_key,
+        "response": token,
+    }
+    if request.remote_addr:
+        form["remoteip"] = request.remote_addr
+    if provider == "hcaptcha":
+        form["sitekey"] = site_key
+    verification_request = urllib.request.Request(
+        CAPTCHA_VERIFY_URLS[provider],
+        data=urllib.parse.urlencode(form).encode("ascii"),
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Subtitle-Translator CAPTCHA verifier",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(verification_request, timeout=8) as response:
+            result = json.loads(response.read(65537))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
+        LOGGER.warning("%s CAPTCHA verification service error: %s", provider, type(exc).__name__)
+        return jsonify(error=tr("CAPTCHA is temporarily unavailable")), 503
+    if not isinstance(result, dict) or result.get("success") is not True:
+        error_codes = result.get("error-codes", []) if isinstance(result, dict) else []
+        LOGGER.info("%s CAPTCHA rejected a token: %s", provider, error_codes)
+        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
+    expected_hostname = settings.get("captcha_hostname", "").strip().lower().rstrip(".")
+    if not expected_hostname:
+        expected_hostname = (urllib.parse.urlsplit(request.url_root).hostname or "").lower().rstrip(".")
+    actual_hostname = str(result.get("hostname", "")).lower().rstrip(".")
+    if expected_hostname and actual_hostname != expected_hostname:
+        LOGGER.warning("%s CAPTCHA returned an unexpected hostname", provider)
+        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
+    if provider == "turnstile" and result.get("action") != action:
+        LOGGER.warning("Turnstile CAPTCHA returned an unexpected action")
+        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
+    return None
 
 
 def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
@@ -734,7 +876,7 @@ def health():
 def setup_status():
     with connection(engine) as db:
         configured = bool(db.scalar(select(func.count()).select_from(users)))
-    return jsonify(configured=configured)
+    return jsonify(configured=configured, **public_auth_configuration())
 
 
 @app.post("/api/auth/setup")
@@ -779,6 +921,9 @@ def login():
     if login_rate_limited(remote_address):
         return jsonify(error=tr("Too many login attempts; try again later")), 429
     payload = json_payload()
+    captcha_error = verify_captcha("login", payload.get("captcha_token"))
+    if captcha_error:
+        return captcha_error
     raw_username = payload.get("username")
     password = payload.get("password")
     valid_input = (
@@ -825,6 +970,48 @@ def login():
         response = jsonify(user=public_user(refreshed_user))
         set_access_cookies(response, access_token)
     return response
+
+
+@app.post("/api/auth/register")
+def register():
+    if request.content_length and request.content_length > 8192:
+        return jsonify(error=tr("Authentication request is too large")), 413
+    remote_address = request.remote_addr or "unknown"
+    if registration_rate_limited(remote_address):
+        return jsonify(error=tr("Too many registration attempts; try again later")), 429
+    payload = json_payload()
+    settings = read_settings()
+    if settings["registration_enabled"] != "1":
+        return jsonify(error=tr("New account registration is disabled")), 403
+    with connection(engine) as db:
+        if not db.scalar(select(func.count()).select_from(users)):
+            return jsonify(error=tr("Create the first administrator before registering users")), 409
+    captcha_error = verify_captcha("register", payload.get("captcha_token"))
+    if captcha_error:
+        return captcha_error
+    username = normalize_username(payload.get("username"))
+    password = payload.get("password")
+    error = validate_username(username) or validate_password(password)
+    if error:
+        return jsonify(error=error), 400
+    if payload.get("confirm_password") != password:
+        return jsonify(error=tr("Passwords do not match")), 400
+    user_id = uuid.uuid4().hex
+    timestamp = now()
+    try:
+        with transaction(engine) as db:
+            db.execute(insert(users).values(
+                id=user_id, username=username, password_hash=password_hasher.hash(password),
+                role="user", active=True, token_version=0, failed_login_count=0,
+                locked_until=None, created_at=timestamp, updated_at=timestamp,
+            ))
+    except IntegrityError:
+        return jsonify(error=tr("Username already exists")), 409
+    with connection(engine) as db:
+        user = db.execute(select(users).where(users.c.id == user_id)).first()
+    response = jsonify(user=public_user(user))
+    set_access_cookies(response, issue_token(user))
+    return response, 201
 
 
 @app.post("/api/auth/logout")
@@ -984,9 +1171,40 @@ def save_settings():
         return jsonify(error=tr("Unknown settings: {settings}", settings=', '.join(sorted(unknown)))), 400
     if payload.get("default_provider") and payload["default_provider"] not in available_providers():
         return jsonify(error=tr("Invalid default provider")), 400
+    if ("captcha_provider" in payload
+            and payload["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}):
+        return jsonify(error=tr("Invalid CAPTCHA provider")), 400
+    for key in {"registration_enabled", *CAPTCHA_ACTION_SETTINGS.values()}:
+        if key in payload and str(payload[key]).strip() not in {"0", "1"}:
+            return jsonify(error=tr("{key} must be enabled or disabled", key=key)), 400
+    if "captcha_hostname" in payload:
+        hostname = str(payload["captcha_hostname"]).strip().lower().rstrip(".")
+        if hostname and not re.fullmatch(
+            r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
+            hostname,
+        ):
+            return jsonify(error=tr("CAPTCHA hostname must be a hostname without a scheme or port")), 400
+        payload["captcha_hostname"] = hostname
     if any(key in payload and str(payload[key]).strip() for key in SECRET_KEYS):
         if not configured_jwt_secret and not os.environ.get("API_KEY_ENCRYPTION_KEY"):
-            return jsonify(error=tr("Configure JWT_SECRET_KEY before saving API keys")), 503
+            return jsonify(error=tr("Configure JWT_SECRET_KEY before saving secrets")), 503
+    combined = read_settings()
+    combined.update({key: str(value).strip() for key, value in payload.items()})
+    captcha_provider = combined["captcha_provider"]
+    if captcha_provider in CAPTCHA_PROVIDERS and any(
+        combined[key] == "1" for key in CAPTCHA_ACTION_SETTINGS.values()
+    ):
+        site_key = combined.get(f"{captcha_provider}_site_key", "")
+        secret_name = f"{captcha_provider}_secret_key"
+        secret_configured = bool(
+            str(payload.get(secret_name, "")).strip()
+            or combined["captcha_configured"].get(captcha_provider)
+        )
+        if not site_key or not secret_configured:
+            return jsonify(error=tr(
+                "Configure the selected CAPTCHA site key and secret key before enabling protection"
+            )), 400
     numeric = {"batch_size": (1, 100), "workers": (1, 16), "rpm": (0, 10000),
                "width": (4, 80), "max_lines": (1, 5)}
     integer_numeric = {
@@ -1050,9 +1268,16 @@ def save_settings():
 @app.delete("/api/settings/keys/<provider>")
 @admin_required
 def delete_key(provider: str):
-    key = f"{provider}_api_key"
+    captcha_provider = provider.removeprefix("captcha-")
+    key = (f"{captcha_provider}_secret_key" if provider.startswith("captcha-")
+           else f"{provider}_api_key")
     if key not in SECRET_KEYS:
         return jsonify(error=tr("Unknown provider")), 404
+    current = read_settings()
+    if (captcha_provider in CAPTCHA_PROVIDERS
+            and current["captcha_provider"] == captcha_provider
+            and any(current[name] == "1" for name in CAPTCHA_ACTION_SETTINGS.values())):
+        return jsonify(error=tr("Disable CAPTCHA before removing its active secret key")), 409
     with db_lock, transaction(engine) as db:
         db.execute(delete(settings_table).where(settings_table.c.name == key))
     return jsonify(read_settings())
@@ -1062,6 +1287,9 @@ def delete_key(provider: str):
 @jwt_required()
 def create_jobs():
     user = current_user_row()
+    captcha_error = verify_captcha("upload", request.form.get("captcha_token"))
+    if captcha_error:
+        return captcha_error
     files = request.files.getlist("files")
     if not files or all(not item.filename for item in files):
         return jsonify(error=tr("Select at least one subtitle file")), 400

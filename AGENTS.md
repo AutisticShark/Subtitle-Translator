@@ -17,7 +17,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 
 - Never expose saved API-key values through `GET /api/settings`; the UI may receive only configured/not-configured state.
 - Keep provider settings and API-key mutation administrator-only. Saved API keys use `enc:v1:` Fernet encryption; never silently replace an unreadable key or log its value.
-- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, `/api/i18n`, the login/setup endpoints, and the initial HTML page are the intentional public boundaries. `/api/i18n` may expose only static catalog and language-label data.
+- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, `/api/i18n`, the setup-status/setup/login/registration endpoints, and the initial HTML page are the intentional public boundaries. `/api/i18n` may expose only static catalog and language-label data; setup-status may additionally expose only registration state and the active CAPTCHA provider's public widget configuration.
 - Scope every non-admin job read, mutation, and download by `user_id`. Use a not-found response for another user's job so its existence is not disclosed.
 - User deactivation, password changes, and role changes must invalidate existing tokens. Never allow deletion, deactivation, or demotion of the final active administrator.
 - Keep `/healthz` unauthenticated so Docker and reverse proxies can probe it.
@@ -42,6 +42,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 11. Translation submission limits count jobs, not HTTP requests: every uploaded subtitle consumes one unit. Enforce the per-account role limit and the panel-wide limit in the same database transaction as all job inserts, serialize submissions through the shared settings row, and reject a multi-file upload atomically with HTTP 429 and `Retry-After`.
 12. Keep stored job statuses and stages locale-neutral. Localize them while serializing the response so shared jobs can be viewed in different interface languages. Locale selection order is explicit `?lang=`, the non-sensitive `ui_locale` cookie, browser `Accept-Language`, then English fallback.
 13. Keep the Docker runtime manifest synchronized with application imports and non-Python runtime assets. Top-level Python modules are copied with `COPY *.py ./`; asset directories such as `locales/`, `templates/`, and `static/` require explicit copies. A missing `i18n.py` previously made Gunicorn workers fail at boot, and omitting `locales/` would fail catalog loading next.
+14. CAPTCHA is a server-side security boundary, not a trusted browser flag. Keep CAPTCHA secret keys write-only and encrypted, expose only the active provider's public site key, verify every required token against the provider's fixed Siteverify endpoint, and fail closed on missing configuration or provider errors. Validate the returned hostname and the Turnstile action. Retain rate limits because CAPTCHA does not replace request throttling.
 
 ## Validation
 

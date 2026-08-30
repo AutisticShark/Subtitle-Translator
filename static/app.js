@@ -1,5 +1,10 @@
 const state = {
   user: null, settings: null, jobs: [], overviewJobs: [], users: [], timer: null, setup: false,
+  authMode: 'login', authConfig: {
+    registration_enabled: false,
+    captcha: { provider: 'none', site_key: '', protected_actions: [] },
+  },
+  captchaWidgets: { auth: null, upload: null }, captchaLoaders: {},
   currentView: 'dashboard',
   i18n: { locale: document.body.dataset.locale || 'en', messages: {}, languages: {} },
 };
@@ -60,20 +65,142 @@ function escapeHtml(value) {
   return node.innerHTML;
 }
 
-function showAuth(setup = false) {
+function captchaRequired(action) {
+  const captcha = state.authConfig.captcha || {};
+  return captcha.provider !== 'none' && (captcha.protected_actions || []).includes(action);
+}
+
+const captchaSdkUrls = {
+  turnstile: 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit',
+  recaptcha: 'https://www.google.com/recaptcha/api.js?render=explicit',
+  hcaptcha: 'https://js.hcaptcha.com/1/api.js?render=explicit&recaptchacompat=off',
+};
+const captchaGlobalNames = {
+  turnstile: 'turnstile', recaptcha: 'grecaptcha', hcaptcha: 'hcaptcha',
+};
+
+function loadCaptchaSdk(provider) {
+  if (window[captchaGlobalNames[provider]]) return Promise.resolve();
+  if (state.captchaLoaders[provider]) return state.captchaLoaders[provider];
+  state.captchaLoaders[provider] = new Promise((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = captchaSdkUrls[provider];
+    script.async = true;
+    script.defer = true;
+    script.addEventListener('error', () => reject(new Error(t('Could not load CAPTCHA'))));
+    script.addEventListener('load', () => {
+      let checks = 0;
+      const ready = () => {
+        if (window[captchaGlobalNames[provider]]) return resolve();
+        checks += 1;
+        if (checks >= 50) return reject(new Error(t('Could not load CAPTCHA')));
+        setTimeout(ready, 100);
+      };
+      ready();
+    });
+    document.head.append(script);
+  });
+  state.captchaLoaders[provider].catch(() => { delete state.captchaLoaders[provider]; });
+  return state.captchaLoaders[provider];
+}
+
+function captchaApi(provider) {
+  return window[captchaGlobalNames[provider]];
+}
+
+function resetCaptcha(slot) {
+  const widget = state.captchaWidgets[slot];
+  if (!widget) return;
+  const apiObject = captchaApi(widget.provider);
+  try { apiObject?.reset(widget.id); } catch (_error) { /* SDK owns reset errors. */ }
+}
+
+function removeCaptcha(slot) {
+  const widget = state.captchaWidgets[slot];
+  if (widget) {
+    const apiObject = captchaApi(widget.provider);
+    try {
+      if (typeof apiObject?.remove === 'function') apiObject.remove(widget.id);
+      else apiObject?.reset(widget.id);
+    } catch (_error) { /* Replacing the container removes stale widget markup. */ }
+  }
+  state.captchaWidgets[slot] = null;
+  $(`#${slot}Captcha`).replaceChildren();
+}
+
+async function renderCaptcha(slot, action) {
+  const container = $(`#${slot}Captcha`);
+  if (!captchaRequired(action)) {
+    container.hidden = true;
+    removeCaptcha(slot);
+    return;
+  }
+  const { provider, site_key: siteKey } = state.authConfig.captcha;
+  container.hidden = false;
+  if (!siteKey) {
+    container.textContent = t('CAPTCHA is temporarily unavailable');
+    return;
+  }
+  const existing = state.captchaWidgets[slot];
+  if (existing && existing.provider === provider
+      && (provider !== 'turnstile' || existing.action === action)) {
+    resetCaptcha(slot);
+    return;
+  }
+  removeCaptcha(slot);
+  await loadCaptchaSdk(provider);
+  const options = { sitekey: siteKey, theme: 'dark' };
+  if (provider === 'turnstile') options.action = action;
+  const id = captchaApi(provider).render(container, options);
+  state.captchaWidgets[slot] = { id, provider, action };
+}
+
+function captchaToken(slot, action) {
+  if (!captchaRequired(action)) return '';
+  const widget = state.captchaWidgets[slot];
+  if (!widget) throw new Error(t('Complete the CAPTCHA challenge'));
+  const token = captchaApi(widget.provider)?.getResponse(widget.id) || '';
+  if (!token) throw new Error(t('Complete the CAPTCHA challenge'));
+  return token;
+}
+
+async function refreshAuthConfiguration(status = null) {
+  const configuration = status || await api('/api/auth/setup-status');
+  state.authConfig = {
+    registration_enabled: Boolean(configuration.registration_enabled),
+    captcha: configuration.captcha || { provider: 'none', site_key: '', protected_actions: [] },
+  };
+  return configuration;
+}
+
+function showAuth(setup = false, mode = 'login') {
   state.setup = setup;
+  state.authMode = setup ? 'setup' : mode;
   state.user = null;
   clearTimeout(state.timer);
   $('#appShell').hidden = true;
   $('#authView').hidden = false;
-  $('#authTitle').textContent = setup ? t('Create the first administrator') : t('Sign in');
+  const registering = state.authMode === 'register';
+  $('#authTitle').textContent = setup ? t('Create the first administrator') :
+    t(registering ? 'Create your account' : 'Sign in');
   $('#authEyebrow').textContent = setup ? t('Initial setup') : t('Authentication');
   $('#authDescription').textContent = setup
     ? t('This one-time account will manage users, provider keys, and all jobs.')
-    : t('Use your Subtitle Translator account.');
-  $('#authSubmit').textContent = setup ? t('Create administrator') : t('Sign in');
-  $('#authForm [name="password"]').autocomplete = setup ? 'new-password' : 'current-password';
+    : t(registering ? 'Choose a username and a strong password to join this workspace.' :
+      'Use your Subtitle Translator account.');
+  $('#authSubmit').textContent = setup ? t('Create administrator') :
+    t(registering ? 'Create account' : 'Sign in');
+  $('#authForm [name="password"]').autocomplete = setup || registering ?
+    'new-password' : 'current-password';
+  const confirmation = $('#confirmPasswordField');
+  confirmation.hidden = !registering;
+  confirmation.querySelector('input').required = registering;
+  confirmation.querySelector('input').disabled = !registering;
+  $('#authSwitch').hidden = setup || !state.authConfig.registration_enabled;
+  $('#authSwitchPrompt').textContent = t(registering ? 'Already have an account?' : 'Need an account?');
+  $('#authSwitchButton').textContent = t(registering ? 'Sign in' : 'Create one');
   $('#authError').textContent = '';
+  renderCaptcha('auth', state.authMode).catch(error => { $('#authError').textContent = error.message; });
 }
 
 async function enterApp(user) {
@@ -89,6 +216,7 @@ async function enterApp(user) {
   $('#allJobs').checked = admin;
   showView(window.location.hash.slice(1) || 'dashboard', false);
   await Promise.all([loadSettings(), loadJobs(), admin ? loadUsers() : Promise.resolve()]);
+  await renderCaptcha('upload', 'upload').catch(error => toast(error.message));
 }
 
 const viewLabels = {
@@ -196,10 +324,15 @@ async function submitAuth(event) {
   const form = event.currentTarget;
   const button = $('#authSubmit');
   const payload = Object.fromEntries(new FormData(form).entries());
-  button.disabled = true;
   $('#authError').textContent = '';
   try {
-    const endpoint = state.setup ? '/api/auth/setup' : '/api/auth/login';
+    if (state.authMode === 'register' && payload.password !== payload.confirm_password) {
+      throw new Error(t('Passwords do not match'));
+    }
+    payload.captcha_token = captchaToken('auth', state.authMode);
+    button.disabled = true;
+    const endpoint = state.setup ? '/api/auth/setup' :
+      state.authMode === 'register' ? '/api/auth/register' : '/api/auth/login';
     const data = await api(endpoint, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -208,6 +341,7 @@ async function submitAuth(event) {
     await enterApp(data.user);
   } catch (error) {
     $('#authError').textContent = error.message;
+    resetCaptcha('auth');
   } finally {
     button.disabled = false;
   }
@@ -216,7 +350,7 @@ async function submitAuth(event) {
 async function logout() {
   try { await api('/api/auth/logout', { method: 'POST' }); }
   catch (error) { if (error.status !== 401) toast(error.message); }
-  const status = await api('/api/auth/setup-status');
+  const status = await refreshAuthConfiguration();
   showAuth(!status.configured);
 }
 
@@ -238,7 +372,10 @@ async function loadSettings() {
     if (field && !key.endsWith('_api_key')) field.value = value;
   });
   $$('.key-state').forEach(element => {
-    const ready = state.settings.configured[element.dataset.provider];
+    const provider = element.dataset.provider;
+    const ready = provider.startsWith('captcha-') ?
+      state.settings.captcha_configured[provider.slice('captcha-'.length)] :
+      state.settings.configured[provider];
     element.textContent = ready ? t('Configured') : t('Not set');
     element.classList.toggle('ready', ready);
     const clearButton = $(`.clear-key[data-provider="${element.dataset.provider}"]`);
@@ -275,12 +412,14 @@ async function submitTranslation(event) {
   const provider = $('#provider').value;
   if (!state.settings.configured[provider]) return toast(t('This provider is not configured'));
   const button = $('#submitButton');
-  button.disabled = true;
   try {
+    const token = captchaToken('upload', 'upload');
+    button.disabled = true;
     const data = new FormData(form);
     data.delete('files');
     files.forEach(file => data.append('files', file));
     data.set('target_languages', targets.join(','));
+    if (token) data.set('captcha_token', token);
     await api('/api/jobs', { method: 'POST', body: data });
     form.querySelector('[name="model"]').value = '';
     $('#fileInput').value = '';
@@ -289,7 +428,7 @@ async function submitTranslation(event) {
       t('{count} translations queued', { count: files.length }));
     await loadJobs();
   } catch (error) { toast(error.message); }
-  finally { button.disabled = false; }
+  finally { button.disabled = false; resetCaptcha('upload'); }
 }
 
 function renderJobs() {
@@ -369,7 +508,8 @@ async function saveSettings(event) {
     });
     form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
     $('#settingsMessage').textContent = t('Saved');
-    await loadSettings();
+    await Promise.all([loadSettings(), refreshAuthConfiguration()]);
+    await renderCaptcha('upload', 'upload');
     setTimeout(() => { $('#settingsMessage').textContent = ''; $('#settingsDialog').close(); }, 600);
   } catch (error) { $('#settingsMessage').textContent = error.message; }
 }
@@ -378,14 +518,15 @@ async function removeKey(event) {
   const button = event.target.closest('.clear-key');
   if (!button) return;
   const provider = button.dataset.provider;
-  if (!window.confirm(t('Remove the saved {provider} API key?', { provider }))) return;
+  if (!window.confirm(t('Remove the saved secret for {provider}?', { provider }))) return;
   button.disabled = true;
   try {
     state.settings = await api(`/api/settings/keys/${encodeURIComponent(provider)}`, {
       method: 'DELETE',
     });
-    await loadSettings();
-    toast(t('API key removed'));
+    await Promise.all([loadSettings(), refreshAuthConfiguration()]);
+    await renderCaptcha('upload', 'upload');
+    toast(t('Secret removed'));
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
 }
@@ -457,7 +598,7 @@ async function userAction(event) {
 
 async function initialize() {
   await loadI18n();
-  const status = await api('/api/auth/setup-status');
+  const status = await refreshAuthConfiguration();
   if (!status.configured) return showAuth(true);
   try {
     const data = await api('/api/auth/me');
@@ -466,6 +607,10 @@ async function initialize() {
 }
 
 $('#authForm').addEventListener('submit', submitAuth);
+$('#authSwitchButton').addEventListener('click', () => {
+  $('#authForm').reset();
+  showAuth(false, state.authMode === 'register' ? 'login' : 'register');
+});
 $('#localeSelect').addEventListener('change', event => {
   const url = new URL(window.location.href);
   url.searchParams.set('lang', event.currentTarget.value);

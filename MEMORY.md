@@ -117,3 +117,10 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Regular-user and administrator limits apply independently per account; the panel-wide limit covers all accounts. All limits share a configurable fixed window, and `0` means unlimited.
 - Each uploaded subtitle consumes one job unit. A multi-file submission is admitted and inserted as one database transaction or rejected in full with HTTP 429 and a `Retry-After` header.
 - Rate counters live in `rate_limit_buckets`. Job submissions and rate-setting changes first lock the `panel_job_limit` settings row, keeping counters and configuration race-safe across web workers and supported database backends. Changing any rate-limit setting starts fresh windows.
+
+## Self-registration and CAPTCHA
+
+- Self-registration creates active regular-user accounts only; it never participates in the one-time first-administrator setup. Administrators can disable public registration without removing their ability to create users.
+- Cloudflare Turnstile, Google reCAPTCHA v2, and hCaptcha share one server-side verification boundary. Only the selected provider's site key and protected-action list are public. CAPTCHA secret keys use the existing `enc:v1:` encrypted, write-only settings path.
+- Login, registration, and upload protection can be selected independently. A required token is posted only to a fixed provider verification URL with a bounded timeout. Missing keys, network failures, invalid JSON, rejected or replayed tokens, hostname mismatches, and Turnstile action mismatches all fail closed.
+- CAPTCHA complements the existing login/registration request throttles and persistent translation-job quotas; it does not replace them. Browser widget rendering and third-party connectivity still require a live browser/deployment smoke test beyond the mocked offline provider tests.

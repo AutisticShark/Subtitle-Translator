@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest.mock import patch
 
 
@@ -33,8 +34,20 @@ class WebApplicationTests(unittest.TestCase):
             "user_job_limit": 0,
             "admin_job_limit": 0,
             "panel_job_limit": 0,
+            "registration_enabled": "1",
+            "captcha_provider": "none",
+            "captcha_on_login": "1",
+            "captcha_on_register": "1",
+            "captcha_on_upload": "1",
         })
         self.assertEqual(response.status_code, 200, response.get_json())
+
+    def tearDown(self):
+        # CAPTCHA settings persist across tests; leave login open for the next fixture setup.
+        self.client.put("/api/settings", json={
+            "captcha_provider": "none", "registration_enabled": "1",
+        })
+        super().tearDown()
 
     def insert_job(self, job_id, *, status="completed", outputs=None, filename="sample.srt"):
         outputs = outputs or []
@@ -79,6 +92,229 @@ class WebApplicationTests(unittest.TestCase):
         self.assertTrue(stored.startswith("enc:v1:"))
         self.assertNotIn("anthropic-secret", stored)
 
+    def test_public_registration_creates_only_regular_users_and_signs_them_in(self):
+        anonymous = webapp.app.test_client()
+        status = anonymous.get("/api/auth/setup-status").get_json()
+        self.assertTrue(status["configured"])
+        self.assertTrue(status["registration_enabled"])
+        self.assertEqual(status["captcha"], {
+            "provider": "none", "site_key": "", "protected_actions": [],
+        })
+
+        response = anonymous.post("/api/auth/register", json={
+            "username": "self-service-user",
+            "password": "self-service-password",
+            "confirm_password": "self-service-password",
+        })
+        self.assertEqual(response.status_code, 201, response.get_json())
+        user = response.get_json()["user"]
+        self.addCleanup(self.client.delete, f"/api/users/{user['id']}")
+        self.assertEqual(user["role"], "user")
+        self.assertEqual(anonymous.get("/api/auth/me").get_json()["user"]["id"], user["id"])
+        self.assertEqual(anonymous.post("/api/auth/register", json={
+            "username": "another-user",
+            "password": "two-different-passwords",
+            "confirm_password": "not-the-same-password",
+        }).status_code, 400)
+        self.assertEqual(anonymous.post("/api/auth/register", json={
+            "username": "self-service-user",
+            "password": "self-service-password",
+            "confirm_password": "self-service-password",
+        }).status_code, 409)
+
+    def test_registration_can_be_disabled_by_an_administrator(self):
+        disabled = self.client.put("/api/settings", json={"registration_enabled": "0"})
+        self.assertEqual(disabled.status_code, 200, disabled.get_json())
+        anonymous = webapp.app.test_client()
+        self.assertFalse(anonymous.get("/api/auth/setup-status").get_json()[
+            "registration_enabled"
+        ])
+        response = anonymous.post("/api/auth/register", json={
+            "username": "blocked-signup",
+            "password": "blocked-signup-password",
+            "confirm_password": "blocked-signup-password",
+        })
+        self.assertEqual(response.status_code, 403, response.get_json())
+
+    def test_registration_requires_a_server_verified_captcha_when_enabled(self):
+        configured = self.client.put("/api/settings", json={
+            "captcha_provider": "recaptcha",
+            "captcha_hostname": "localhost",
+            "captcha_on_login": "0",
+            "captcha_on_register": "1",
+            "captcha_on_upload": "0",
+            "recaptcha_site_key": "registration-site-key",
+            "recaptcha_secret_key": "registration-secret-key",
+        })
+        self.assertEqual(configured.status_code, 200, configured.get_json())
+        payload = {
+            "username": "captcha-registration-user",
+            "password": "captcha-registration-password",
+            "confirm_password": "captcha-registration-password",
+        }
+        anonymous = webapp.app.test_client()
+        self.assertEqual(anonymous.post(
+            "/api/auth/register", json=payload,
+        ).status_code, 400)
+        with patch.object(
+            webapp.urllib.request, "urlopen",
+            return_value=io.BytesIO(json.dumps({
+                "success": True, "hostname": "localhost",
+            }).encode()),
+        ):
+            accepted = anonymous.post("/api/auth/register", json={
+                **payload, "captcha_token": "fresh-registration-token",
+            })
+        self.assertEqual(accepted.status_code, 201, accepted.get_json())
+        user_id = accepted.get_json()["user"]["id"]
+        self.addCleanup(self.client.delete, f"/api/users/{user_id}")
+
+    def test_all_captcha_providers_verify_login_server_side_and_mask_secrets(self):
+        created = self.client.post("/api/users", json={
+            "username": "captcha-login-user",
+            "password": "captcha-login-password",
+            "role": "user",
+        }).get_json()["user"]
+        self.addCleanup(self.client.delete, f"/api/users/{created['id']}")
+        endpoints = {
+            "turnstile": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            "recaptcha": "https://www.google.com/recaptcha/api/siteverify",
+            "hcaptcha": "https://api.hcaptcha.com/siteverify",
+        }
+        for provider, endpoint in endpoints.items():
+            with self.subTest(provider=provider):
+                saved = self.client.put("/api/settings", json={
+                    "captcha_provider": provider,
+                    "captcha_hostname": "localhost",
+                    "captcha_on_login": "1",
+                    "captcha_on_register": "0",
+                    "captcha_on_upload": "0",
+                    f"{provider}_site_key": f"{provider}-site",
+                    f"{provider}_secret_key": f"{provider}-secret",
+                })
+                self.assertEqual(saved.status_code, 200, saved.get_json())
+                settings = self.client.get("/api/settings").get_json()
+                self.assertTrue(settings["captcha_configured"][provider])
+                self.assertNotIn(f"{provider}_secret_key", settings)
+                with webapp.connect_db() as db:
+                    encrypted = db.execute(
+                        "SELECT value FROM settings WHERE name=?",
+                        (f"{provider}_secret_key",),
+                    ).fetchone()["value"]
+                self.assertTrue(encrypted.startswith("enc:v1:"))
+                self.assertNotIn(f"{provider}-secret", encrypted)
+                public = webapp.app.test_client().get("/api/auth/setup-status").get_json()
+                self.assertEqual(public["captcha"]["site_key"], f"{provider}-site")
+                self.assertNotIn("secret", json.dumps(public).lower())
+
+                missing = webapp.app.test_client().post("/api/auth/login", json={
+                    "username": "captcha-login-user",
+                    "password": "captcha-login-password",
+                })
+                self.assertEqual(missing.status_code, 400, missing.get_json())
+
+                verification = {"success": True, "hostname": "localhost"}
+                if provider == "turnstile":
+                    verification["action"] = "login"
+                with patch.object(
+                    webapp.urllib.request, "urlopen",
+                    return_value=io.BytesIO(json.dumps(verification).encode()),
+                ) as urlopen:
+                    accepted = webapp.app.test_client().post("/api/auth/login", json={
+                        "username": "captcha-login-user",
+                        "password": "captcha-login-password",
+                        "captcha_token": "fresh-token",
+                    })
+                self.assertEqual(accepted.status_code, 200, accepted.get_json())
+                verification_request = urlopen.call_args.args[0]
+                self.assertEqual(verification_request.full_url, endpoint)
+                form = webapp.urllib.parse.parse_qs(verification_request.data.decode())
+                self.assertEqual(form["secret"], [f"{provider}-secret"])
+                self.assertEqual(form["response"], ["fresh-token"])
+                if provider == "hcaptcha":
+                    self.assertEqual(form["sitekey"], ["hcaptcha-site"])
+
+    def test_captcha_fails_closed_for_outages_hostname_and_turnstile_action(self):
+        saved = self.client.put("/api/settings", json={
+            "captcha_provider": "turnstile",
+            "captcha_hostname": "expected.example",
+            "captcha_on_login": "1",
+            "captcha_on_register": "0",
+            "captcha_on_upload": "0",
+            "turnstile_site_key": "site-key",
+            "turnstile_secret_key": "secret-key",
+        })
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        payload = {
+            "username": "admin", "password": "correct-horse-battery-staple",
+            "captcha_token": "token",
+        }
+        with patch.object(
+            webapp.urllib.request, "urlopen", side_effect=urllib.error.URLError("offline"),
+        ):
+            self.assertEqual(
+                webapp.app.test_client().post("/api/auth/login", json=payload).status_code,
+                503,
+            )
+        for result in (
+            {"success": True, "hostname": "wrong.example", "action": "login"},
+            {"success": True, "hostname": "expected.example", "action": "upload"},
+            {"success": False, "error-codes": ["timeout-or-duplicate"]},
+        ):
+            with self.subTest(result=result), patch.object(
+                webapp.urllib.request, "urlopen",
+                return_value=io.BytesIO(json.dumps(result).encode()),
+            ):
+                self.assertEqual(
+                    webapp.app.test_client().post("/api/auth/login", json=payload).status_code,
+                    400,
+                )
+
+    def test_upload_requires_a_fresh_server_verified_captcha(self):
+        saved = self.client.put("/api/settings", json={
+            "captcha_provider": "turnstile",
+            "captcha_hostname": "localhost",
+            "captcha_on_login": "0",
+            "captcha_on_register": "0",
+            "captcha_on_upload": "1",
+            "turnstile_site_key": "upload-site-key",
+            "turnstile_secret_key": "upload-secret-key",
+        })
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        source = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+        missing = self.client.post("/api/jobs", data={
+            "provider": "echo",
+            "target_languages": "es",
+            "files": (io.BytesIO(source), "captcha.srt"),
+        }, content_type="multipart/form-data")
+        self.assertEqual(missing.status_code, 400, missing.get_json())
+
+        verification = {"success": True, "hostname": "localhost", "action": "upload"}
+        with patch.object(
+            webapp.urllib.request, "urlopen",
+            return_value=io.BytesIO(json.dumps(verification).encode()),
+        ), patch.object(webapp.executor, "submit") as submit:
+            accepted = self.client.post("/api/jobs", data={
+                "provider": "echo",
+                "target_languages": "es",
+                "captcha_token": "fresh-upload-token",
+                "files": (io.BytesIO(source), "captcha.srt"),
+            }, content_type="multipart/form-data")
+        self.assertEqual(accepted.status_code, 202, accepted.get_json())
+        job_id = accepted.get_json()["jobs"][0]
+        submit.assert_called_once_with(webapp.run_job, job_id)
+
+        def cleanup_job():
+            with webapp.connect_db() as db:
+                db.execute("DELETE FROM rate_limit_buckets WHERE scope='panel'")
+                db.execute("DELETE FROM rate_limit_buckets WHERE scope=?", (
+                    f"user:{self.client.get('/api/auth/me').get_json()['user']['id']}",
+                ))
+                db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+            shutil.rmtree(webapp.JOBS_DIR / job_id, ignore_errors=True)
+
+        self.addCleanup(cleanup_job)
+
     def test_signed_in_shell_has_dedicated_role_aware_dashboard_views(self):
         page = self.client.get("/")
 
@@ -91,6 +327,11 @@ class WebApplicationTests(unittest.TestCase):
         self.assertIn(b'id="dashboardMetrics"', page.data)
         self.assertIn(b'id="adminMetrics"', page.data)
         self.assertIn(b'id="userList"', page.data)
+        self.assertIn(b'id="authSwitchButton"', page.data)
+        self.assertIn(b'id="authCaptcha"', page.data)
+        self.assertIn(b'id="uploadCaptcha"', page.data)
+        self.assertIn(b'name="captcha_provider"', page.data)
+        self.assertIn(b'name="registration_enabled"', page.data)
         self.assertNotIn(b'id="usersDialog"', page.data)
 
     def test_ui_locale_detection_catalog_and_persistence(self):
@@ -209,6 +450,11 @@ class WebApplicationTests(unittest.TestCase):
             ({"workers": "many"}, "could not convert string to float"),
             ({"rate_limit_window_minutes": 0}, "must be a whole number between 1 and 10080"),
             ({"user_job_limit": "1.5"}, "must be a whole number between 0 and 100000"),
+            ({"captcha_provider": "robot-checker"}, "Invalid CAPTCHA provider"),
+            ({"registration_enabled": "yes"}, "must be enabled or disabled"),
+            ({"captcha_hostname": "https://example.com:443"}, "without a scheme or port"),
+            ({"captcha_provider": "turnstile", "turnstile_site_key": ""},
+             "Configure the selected CAPTCHA site key and secret key"),
         ]
         for payload, error in cases:
             with self.subTest(payload=payload):
@@ -248,6 +494,27 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(deleted.status_code, 200)
         self.assertFalse(deleted.get_json()["configured"]["openai"])
         self.assertEqual(self.client.delete("/api/settings/keys/unknown").status_code, 404)
+
+    def test_active_captcha_secret_cannot_be_removed_until_protection_is_disabled(self):
+        configured = self.client.put("/api/settings", json={
+            "captcha_provider": "hcaptcha",
+            "captcha_on_login": "1",
+            "hcaptcha_site_key": "active-site-key",
+            "hcaptcha_secret_key": "active-secret-key",
+        })
+        self.assertEqual(configured.status_code, 200, configured.get_json())
+        blocked = self.client.delete("/api/settings/keys/captcha-hcaptcha")
+        self.assertEqual(blocked.status_code, 409, blocked.get_json())
+        self.assertTrue(self.client.get("/api/settings").get_json()[
+            "captcha_configured"
+        ]["hcaptcha"])
+        self.assertEqual(
+            self.client.put("/api/settings", json={"captcha_provider": "none"}).status_code,
+            200,
+        )
+        removed = self.client.delete("/api/settings/keys/captcha-hcaptcha")
+        self.assertEqual(removed.status_code, 200, removed.get_json())
+        self.assertFalse(removed.get_json()["captcha_configured"]["hcaptcha"])
 
     def test_google_provider_uses_the_saved_key(self):
         throttle = webapp.Throttle()

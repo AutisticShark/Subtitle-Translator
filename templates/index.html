@@ -30,9 +30,12 @@
       <form id="authForm">
         <label>{{ tr('Username') }}<input name="username" autocomplete="username" required minlength="3" maxlength="64"></label>
         <label>{{ tr('Password') }}<input name="password" type="password" autocomplete="current-password" required minlength="12" maxlength="256"></label>
+        <label id="confirmPasswordField" hidden>{{ tr('Confirm password') }}<input name="confirm_password" type="password" autocomplete="new-password" minlength="12" maxlength="256"></label>
+        <div class="captcha-slot" id="authCaptcha" hidden></div>
         <div class="auth-error" id="authError" role="alert"></div>
         <button class="primary" id="authSubmit" type="submit">{{ tr('Sign in') }}</button>
       </form>
+      <p class="auth-switch" id="authSwitch"><span id="authSwitchPrompt">{{ tr('Need an account?') }}</span> <button class="text-button" id="authSwitchButton" type="button">{{ tr('Create one') }}</button></p>
     </section>
   </main>
 
@@ -131,6 +134,7 @@
               <input name="model" placeholder="{{ tr('Use the configured model') }}">
             </label>
           </div>
+          <div class="captcha-slot wide" id="uploadCaptcha" hidden></div>
           <div class="submit-row">
             <p id="providerState"></p>
             <button class="primary" type="submit" id="submitButton">{{ tr('Start translating') }} <span>→</span></button>
@@ -188,7 +192,7 @@
         <div><span class="eyebrow">{{ tr('Administration') }}</span><h2>{{ tr('Panel settings') }}</h2></div>
         <button class="icon-button" id="closeSettings" type="button" aria-label="{{ tr('Close') }}">×</button>
       </div>
-      <p class="settings-intro">{{ tr('Provider keys are write-only, encrypted before database storage, and available only to administrators.') }}</p>
+      <p class="settings-intro">{{ tr('Provider and CAPTCHA secrets are write-only, encrypted before database storage, and available only to administrators.') }}</p>
       <div class="settings-group">
         <h3>{{ tr('Providers') }}</h3>
         <label>{{ tr('Default provider') }}<select name="default_provider" id="defaultProvider"></select></label>
@@ -200,6 +204,29 @@
         <label>{{ tr('DeepL API key') }}<div class="key-row"><input type="password" name="deepl_api_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="deepl"></span><button class="clear-key" data-provider="deepl" type="button">{{ tr('Remove') }}</button></div></label>
         <label>{{ tr('Google Cloud Translation API key') }}<div class="key-row"><input type="password" name="google_api_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="google"></span><button class="clear-key" data-provider="google" type="button">{{ tr('Remove') }}</button></div></label>
       </div>
+      <details>
+        <summary>{{ tr('Registration and CAPTCHA') }}</summary>
+        <p class="settings-intro">{{ tr('CAPTCHA tokens are verified by the server. Choose which actions require a fresh challenge; a broken active configuration fails closed.') }}</p>
+        <div class="settings-group compact-grid">
+          <label>{{ tr('Allow new user sign-up') }}<select name="registration_enabled"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
+          <label>{{ tr('CAPTCHA provider') }}<select name="captcha_provider"><option value="none">{{ tr('Disabled') }}</option><option value="turnstile">Cloudflare Turnstile</option><option value="recaptcha">Google reCAPTCHA v2</option><option value="hcaptcha">hCaptcha</option></select></label>
+          <label class="wide">{{ tr('Expected hostname') }}<input name="captcha_hostname" placeholder="translate.example.com"><small>{{ tr('Leave blank to use the request hostname') }}</small></label>
+          <label>{{ tr('Protect login') }}<select name="captcha_on_login"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
+          <label>{{ tr('Protect registration') }}<select name="captcha_on_register"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
+          <label>{{ tr('Protect uploads') }}<select name="captcha_on_upload"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
+        </div>
+        <div class="settings-group">
+          <h3>Cloudflare Turnstile</h3>
+          <label>{{ tr('Site key') }}<input name="turnstile_site_key" autocomplete="off"></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="turnstile_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-turnstile"></span><button class="clear-key" data-provider="captcha-turnstile" type="button">{{ tr('Remove') }}</button></div></label>
+          <h3>Google reCAPTCHA v2</h3>
+          <label>{{ tr('Site key') }}<input name="recaptcha_site_key" autocomplete="off"></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="recaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-recaptcha"></span><button class="clear-key" data-provider="captcha-recaptcha" type="button">{{ tr('Remove') }}</button></div></label>
+          <h3>hCaptcha</h3>
+          <label>{{ tr('Site key') }}<input name="hcaptcha_site_key" autocomplete="off"></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="hcaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-hcaptcha"></span><button class="clear-key" data-provider="captcha-hcaptcha" type="button">{{ tr('Remove') }}</button></div></label>
+        </div>
+      </details>
       <details>
         <summary>{{ tr('Translation defaults') }}</summary>
         <div class="settings-group compact-grid">

@@ -124,6 +124,11 @@ summary { cursor: pointer; font-weight: 700; }
 .auth-copy p { color: var(--muted); }
 #authForm { display: grid; gap: 16px; }
 .auth-error { min-height: 22px; color: var(--danger); font-size: 13px; }
+.auth-switch { margin: 18px 0 0; color: var(--muted); font-size: 13px; text-align: center; }
+.auth-switch .text-button { display: inline; }
+.captcha-slot { min-height: 68px; max-width: 100%; overflow-x: auto; padding: 4px 0; }
+.captcha-slot[hidden] { min-height: 0; padding: 0; }
+#uploadCaptcha { margin-top: 20px; }
 .dialog-body { padding: 26px; }
 .create-user-form { display: grid; grid-template-columns: 1fr 1.4fr .8fr auto; gap: 10px; align-items: end; margin: 24px 0; }
 .create-user-form .primary { min-height: 43px; }

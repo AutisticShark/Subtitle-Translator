@@ -9,6 +9,8 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Multi-user JWT login with administrator and user roles
+- Self-service user registration with administrator control
+- Server-verified Cloudflare Turnstile, Google reCAPTCHA v2, or hCaptcha protection for login, registration, and uploads
 - Localized web interface with browser-language detection and a persistent language selector
 - Administrator-only user management and encrypted, write-only provider keys
 - Per-user job isolation, with administrator access to cross-user job cleanup
@@ -43,11 +45,17 @@ docker compose down -v  # also permanently deletes saved settings and jobs
 
 Browser sessions use short-lived signed JWTs in HttpOnly, `SameSite=Strict` cookies. State-changing browser requests also require the JWT-bound double-submit CSRF token. Non-browser clients can post the normal login fields plus `"token_transport": "header"`; the response returns `access_token`, which protected APIs accept as `Authorization: Bearer <JWT>` without browser CSRF. Logout revokes the current token; disabling a user or changing a password/role invalidates all of that user's existing tokens.
 
-Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Provider keys saved through the administrator UI are encrypted with Fernet before database storage and are never returned by `GET /api/settings`. By default the encryption key is derived separately from `JWT_SECRET_KEY`. For independent JWT-key rotation, set a stable `API_KEY_ENCRYPTION_KEY` before saving provider keys. Losing or changing the encryption key makes saved provider keys unreadable.
+Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Provider and CAPTCHA secrets saved through the administrator UI are encrypted with Fernet before database storage and are never returned by `GET /api/settings`. By default the encryption key is derived separately from `JWT_SECRET_KEY`. For independent JWT-key rotation, set a stable `API_KEY_ENCRYPTION_KEY` before saving secrets. Losing or changing the encryption key makes saved secrets unreadable.
 
 Set `JWT_COOKIE_SECURE=1` whenever the app is served over HTTPS. Plain `http://localhost` needs `0`. For any network deployment, terminate TLS at the app or a trusted reverse proxy; secure cookies and JWT authentication do not encrypt HTTP traffic.
 
 Administrators can manage provider settings, create/disable/promote/delete users, reset passwords, unlock accounts, and select **All users** when inspecting or deleting jobs. Regular users can operate only their own jobs. The final active administrator cannot be deleted, disabled, or demoted.
+
+Self-registration is enabled by default and creates regular-user accounts only. An administrator can disable it under **Settings → Registration and CAPTCHA**. The initial setup flow remains separate: the first account must be the administrator created by the one-time setup screen or `ADMIN_PASSWORD` bootstrap.
+
+The same settings section can enable one CAPTCHA provider and independently protect login, registration, and upload submissions. Supported providers are [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/), [Google reCAPTCHA v2](https://developers.google.com/recaptcha/docs/display), and [hCaptcha](https://docs.hcaptcha.com/). Enter the provider's public site key and private secret key, then set the expected public hostname if the request hostname seen by Flask is not the hostname registered with the CAPTCHA provider. Secret keys are write-only and encrypted like translation-provider keys. Every challenge token is checked server-side, including its hostname and (for Turnstile) action; provider errors fail closed. Keep the existing request limits enabled too, because CAPTCHA complements rather than replaces rate limiting.
+
+CAPTCHA can instead be bootstrapped with `CAPTCHA_PROVIDER`, `CAPTCHA_HOSTNAME`, the three `CAPTCHA_ON_*` switches, and the matching `*_SITE_KEY` / `*_SECRET_KEY` variables shown in `.env.example`. `CAPTCHA_PROVIDER=none` disables all CAPTCHA checks. Use HTTPS in production and restrict each widget key to the deployment's real hostname in its provider dashboard.
 
 ### Interface languages
 
@@ -119,7 +127,7 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The `/healthz` endpoint is unauthenticated for container and reverse-proxy health checks. All other API data is authenticated. Uploaded filenames are sanitized, stored under random job IDs, associated with an owning user, and downloads are restricted to both the owner/administrator and registered output files.
+The `/healthz` endpoint is unauthenticated for container and reverse-proxy health checks. `/api/i18n` and the authentication setup-status, setup, login, and registration routes are the intentional public API boundaries; setup-status exposes only registration state and the active CAPTCHA provider's public widget configuration. All application data APIs are authenticated. Uploaded filenames are sanitized, stored under random job IDs, associated with an owning user, and downloads are restricted to both the owner/administrator and registered output files.
 
 ## Publishing Docker images
 
