@@ -68,6 +68,12 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Job state is shared data and must not be stored in the submitting user's locale. Workers keep stable English stage values; `job_dict` localizes known stage patterns for each request, allowing different viewers to use different UI locales.
 - Technical provider and subtitle-parser failures remain in their original form so diagnostic details are not hidden by incomplete catalog coverage.
 
+### Docker runtime manifest must include localization sources
+
+- Evidence: the 2026-08-30 production log showed every Gunicorn worker exiting with code 3 at `from i18n import ...`, reporting `ModuleNotFoundError: No module named 'i18n'`.
+- Cause: the Dockerfile copied an explicit pre-i18n list of Python modules and never added `i18n.py`. The new `locales/` runtime directory was also absent, which would have caused catalog initialization to fail immediately after fixing the module alone.
+- Fix and prevention: copy all root Python modules with `COPY *.py ./`, copy `locales/` explicitly, and keep a deployment-manifest regression test. When adding an imported module or runtime asset directory, validate the container manifest as well as the host-side test suite.
+
 ## Google Cloud Translation adapter
 
 - The Google provider uses the API-key-compatible Cloud Translation - Basic v2 endpoint and the standard NMT model; it does not require a service-account file.

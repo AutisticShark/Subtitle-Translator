@@ -11,9 +11,10 @@ RUN addgroup --system app && adduser --system --ingroup app app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY srt_translate.py subtitle_formats.py database.py webapp.py ./
+COPY *.py ./
 COPY templates ./templates
 COPY static ./static
+COPY locales ./locales
 RUN mkdir -p /app/data && chown -R app:app /app/data
 
 USER app

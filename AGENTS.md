@@ -41,6 +41,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 10. Database portability requires SQLAlchemy expressions, not backend-specific placeholders or upsert syntax. Ordinary `postgresql://`, `mariadb://`, and `mysql://` URLs are normalized to installed drivers; compile schema tests for all supported dialects when changing tables.
 11. Translation submission limits count jobs, not HTTP requests: every uploaded subtitle consumes one unit. Enforce the per-account role limit and the panel-wide limit in the same database transaction as all job inserts, serialize submissions through the shared settings row, and reject a multi-file upload atomically with HTTP 429 and `Retry-After`.
 12. Keep stored job statuses and stages locale-neutral. Localize them while serializing the response so shared jobs can be viewed in different interface languages. Locale selection order is explicit `?lang=`, the non-sensitive `ui_locale` cookie, browser `Accept-Language`, then English fallback.
+13. Keep the Docker runtime manifest synchronized with application imports and non-Python runtime assets. Top-level Python modules are copied with `COPY *.py ./`; asset directories such as `locales/`, `templates/`, and `static/` require explicit copies. A missing `i18n.py` previously made Gunicorn workers fail at boot, and omitting `locales/` would fail catalog loading next.
 
 ## Validation
 
