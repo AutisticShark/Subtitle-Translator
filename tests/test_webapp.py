@@ -79,6 +79,20 @@ class WebApplicationTests(unittest.TestCase):
         self.assertTrue(stored.startswith("enc:v1:"))
         self.assertNotIn("anthropic-secret", stored)
 
+    def test_signed_in_shell_has_dedicated_role_aware_dashboard_views(self):
+        page = self.client.get("/")
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b'data-view="dashboard"', page.data)
+        self.assertIn(b'data-view="translate" hidden', page.data)
+        self.assertIn(b'data-view="jobs" hidden', page.data)
+        self.assertIn(b'data-view="admin" id="adminView" hidden', page.data)
+        self.assertIn(b'id="adminNavButton"', page.data)
+        self.assertIn(b'id="dashboardMetrics"', page.data)
+        self.assertIn(b'id="adminMetrics"', page.data)
+        self.assertIn(b'id="userList"', page.data)
+        self.assertNotIn(b'id="usersDialog"', page.data)
+
     def test_ui_locale_detection_catalog_and_persistence(self):
         anonymous = webapp.app.test_client()
         page = anonymous.get("/", headers={"Accept-Language": "zh-Hant, en;q=0.8"})

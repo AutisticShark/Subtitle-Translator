@@ -36,28 +36,79 @@
     </section>
   </main>
 
-  <div class="shell" id="appShell" hidden>
-    <header>
-      <a class="brand" href="/" aria-label="{{ tr('Subtitle Translator') }}">
+  <div class="app-shell" id="appShell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#dashboard" aria-label="{{ tr('Subtitle Translator') }}">
         <span class="brand-mark">文</span>
-        <span>{{ tr('Subtitle Translator') }}<small>{{ tr('Context-aware translations, timing intact') }}</small></span>
+        <span>{{ tr('Subtitle Translator') }}<small>{{ tr('Private workspace') }}</small></span>
       </a>
-      <div class="header-actions">
-        <span class="user-badge" id="userBadge"></span>
-        <button class="ghost" id="usersButton" type="button" hidden>{{ tr('Users') }}</button>
-        <button class="ghost" id="settingsButton" type="button" hidden>{{ tr('Settings') }}</button>
-        <button class="ghost" id="logoutButton" type="button">{{ tr('Sign out') }}</button>
+      <nav class="primary-nav" aria-label="{{ tr('Main navigation') }}">
+        <button class="nav-item active" type="button" data-view-button="dashboard">
+          <span class="nav-icon" aria-hidden="true">⌂</span>{{ tr('Dashboard') }}
+        </button>
+        <button class="nav-item" type="button" data-view-button="translate">
+          <span class="nav-icon" aria-hidden="true">＋</span>{{ tr('New translation') }}
+        </button>
+        <button class="nav-item" type="button" data-view-button="jobs">
+          <span class="nav-icon" aria-hidden="true">≡</span>{{ tr('Translation history') }}
+        </button>
+        <button class="nav-item" id="adminNavButton" type="button" data-view-button="admin" hidden>
+          <span class="nav-icon" aria-hidden="true">⚙</span>{{ tr('Administration') }}
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="account-chip">
+          <span class="account-avatar" id="userInitial" aria-hidden="true"></span>
+          <span><strong id="userName"></strong><small id="userRole"></small></span>
+        </div>
+        <button class="sign-out" id="logoutButton" type="button">{{ tr('Sign out') }}</button>
       </div>
-    </header>
+    </aside>
 
-    <main>
-      <section class="hero">
-        <span class="eyebrow">SRT · WEBVTT · ASS · SSA</span>
-        <h1>{{ tr('Translate subtitles') }}<br><em>{{ tr('without losing the performance.') }}</em></h1>
-        <p>{{ tr('Upload one file or a whole season. Dialogue, timing, positioning, styles, and inline tags stay where they belong.') }}</p>
-      </section>
+    <div class="app-main">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow" id="viewEyebrow">{{ tr('Workspace overview') }}</span>
+          <h1 id="viewTitle">{{ tr('Dashboard') }}</h1>
+        </div>
+        <button class="primary topbar-action" type="button" data-go-view="translate">{{ tr('New translation') }} <span>→</span></button>
+      </header>
 
-      <section class="panel translator-panel">
+      <main class="content">
+        <section class="app-view" data-view="dashboard">
+          <div class="welcome-row">
+            <div>
+              <h2 id="welcomeTitle">{{ tr('Welcome back') }}</h2>
+              <p id="welcomeDescription">{{ tr('Here is what is happening in your translation workspace.') }}</p>
+            </div>
+            <button class="ghost" type="button" id="dashboardRefresh">{{ tr('Refresh overview') }}</button>
+          </div>
+          <div class="metric-grid" id="dashboardMetrics"></div>
+          <div class="dashboard-grid">
+            <section class="panel dashboard-card recent-card">
+              <div class="card-heading">
+                <div><span class="eyebrow">{{ tr('Activity') }}</span><h2>{{ tr('Recent translations') }}</h2></div>
+                <button class="text-button" type="button" data-go-view="jobs">{{ tr('View all') }} →</button>
+              </div>
+              <div class="recent-list" id="dashboardRecent"></div>
+            </section>
+            <aside class="panel dashboard-card quick-card">
+              <span class="eyebrow">{{ tr('Quick start') }}</span>
+              <h2>{{ tr('Translate another subtitle') }}</h2>
+              <p>{{ tr('Start with SRT, VTT, ASS, or SSA files. Timing and styling stay intact.') }}</p>
+              <button class="primary" type="button" data-go-view="translate">{{ tr('Open translation workspace') }} <span>→</span></button>
+              <div class="provider-summary" id="dashboardProviders"></div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="app-view" data-view="translate" hidden>
+          <div class="page-intro">
+            <span class="eyebrow">SRT · WEBVTT · ASS · SSA</span>
+            <h2>{{ tr('Translate subtitles without losing the performance.') }}</h2>
+            <p>{{ tr('Upload one file or a whole season. Dialogue, timing, positioning, styles, and inline tags stay where they belong.') }}</p>
+          </div>
+          <section class="panel translator-panel">
         <form id="translateForm">
           <label class="dropzone" id="dropzone" for="fileInput">
             <input id="fileInput" name="files" type="file" multiple accept=".srt,.vtt,.ass,.ssa">
@@ -85,19 +136,50 @@
             <button class="primary" type="submit" id="submitButton">{{ tr('Start translating') }} <span>→</span></button>
           </div>
         </form>
-      </section>
+          </section>
+        </section>
 
-      <section class="jobs-section">
+        <section class="app-view" data-view="jobs" hidden>
         <div class="section-heading">
-          <div><span class="eyebrow">{{ tr('Workspace') }}</span><h2>{{ tr('Recent jobs') }}</h2></div>
+          <div><span class="eyebrow">{{ tr('Workspace') }}</span><h2>{{ tr('Translation history') }}</h2><p>{{ tr('Monitor active work and download completed subtitles.') }}</p></div>
           <div class="section-actions">
             <label class="toggle-label" id="allJobsLabel" hidden><input id="allJobs" type="checkbox"> {{ tr('All users') }}</label>
             <button class="ghost small" id="refreshButton" type="button">{{ tr('Refresh') }}</button>
           </div>
         </div>
         <div id="jobs" class="jobs"><div class="empty">{{ tr('No translations yet.') }}</div></div>
-      </section>
-    </main>
+        </section>
+
+        <section class="app-view" data-view="admin" id="adminView" hidden>
+          <div class="admin-hero">
+            <div><span class="eyebrow">{{ tr('Administration') }}</span><h2>{{ tr('Panel control center') }}</h2><p>{{ tr('Manage access, provider readiness, and panel-wide translation activity.') }}</p></div>
+            <button class="primary" id="settingsButton" type="button">{{ tr('Configure panel') }} <span>→</span></button>
+          </div>
+          <div class="metric-grid admin-metrics" id="adminMetrics"></div>
+          <div class="admin-grid">
+            <section class="panel dashboard-card admin-providers-card">
+              <div class="card-heading">
+                <div><span class="eyebrow">{{ tr('Providers') }}</span><h2>{{ tr('Provider readiness') }}</h2></div>
+                <button class="text-button" id="providerSettingsButton" type="button">{{ tr('Edit settings') }}</button>
+              </div>
+              <div class="provider-admin-list" id="adminProviders"></div>
+            </section>
+            <section class="panel dashboard-card user-management-card">
+              <div class="card-heading">
+                <div><span class="eyebrow">{{ tr('Access') }}</span><h2>{{ tr('User management') }}</h2></div>
+              </div>
+              <form id="createUserForm" class="create-user-form">
+                <label>{{ tr('Username') }}<input name="username" required minlength="3" maxlength="64" autocomplete="off"></label>
+                <label>{{ tr('Temporary password') }}<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label>
+                <label>{{ tr('Role') }}<select name="role"><option value="user">{{ tr('User') }}</option><option value="admin">{{ tr('Administrator') }}</option></select></label>
+                <button class="primary" type="submit">{{ tr('Create user') }}</button>
+              </form>
+              <div class="user-list" id="userList"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
   </div>
 
   <dialog id="settingsDialog">
@@ -140,22 +222,6 @@
       </details>
       <div class="dialog-actions"><span id="settingsMessage"></span><button class="primary" type="submit">{{ tr('Save settings') }}</button></div>
     </form>
-  </dialog>
-
-  <dialog id="usersDialog">
-    <div class="dialog-body">
-      <div class="dialog-heading">
-        <div><span class="eyebrow">{{ tr('Administration') }}</span><h2>{{ tr('Users') }}</h2></div>
-        <button class="icon-button" id="closeUsers" type="button" aria-label="{{ tr('Close') }}">×</button>
-      </div>
-      <form id="createUserForm" class="create-user-form">
-        <label>{{ tr('Username') }}<input name="username" required minlength="3" maxlength="64" autocomplete="off"></label>
-        <label>{{ tr('Temporary password') }}<input name="password" type="password" required minlength="12" maxlength="256" autocomplete="new-password"></label>
-        <label>{{ tr('Role') }}<select name="role"><option value="user">{{ tr('User') }}</option><option value="admin">{{ tr('Administrator') }}</option></select></label>
-        <button class="primary" type="submit">{{ tr('Create user') }}</button>
-      </form>
-      <div class="user-list" id="userList"></div>
-    </div>
   </dialog>
 
   <div class="toast" id="toast" role="status"></div>

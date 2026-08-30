@@ -1,5 +1,6 @@
 const state = {
-  user: null, settings: null, jobs: [], users: [], timer: null, setup: false,
+  user: null, settings: null, jobs: [], overviewJobs: [], users: [], timer: null, setup: false,
+  currentView: 'dashboard',
   i18n: { locale: document.body.dataset.locale || 'en', messages: {}, languages: {} },
 };
 const $ = (selector) => document.querySelector(selector);
@@ -80,11 +81,114 @@ async function enterApp(user) {
   $('#authView').hidden = true;
   $('#appShell').hidden = false;
   const admin = user.role === 'admin';
-  $('#userBadge').textContent = `${user.username} · ${t(user.role === 'admin' ? 'Administrator' : 'User')}`;
-  $('#settingsButton').hidden = !admin;
-  $('#usersButton').hidden = !admin;
+  $('#userName').textContent = user.username;
+  $('#userRole').textContent = t(admin ? 'Administrator' : 'User');
+  $('#userInitial').textContent = user.username.slice(0, 1);
+  $('#adminNavButton').hidden = !admin;
   $('#allJobsLabel').hidden = !admin;
-  await Promise.all([loadSettings(), loadJobs()]);
+  $('#allJobs').checked = admin;
+  showView(window.location.hash.slice(1) || 'dashboard', false);
+  await Promise.all([loadSettings(), loadJobs(), admin ? loadUsers() : Promise.resolve()]);
+}
+
+const viewLabels = {
+  dashboard: ['Workspace overview', 'Dashboard'],
+  translate: ['Translation workspace', 'New translation'],
+  jobs: ['Activity', 'Translation history'],
+  admin: ['Panel management', 'Administration'],
+};
+
+function showView(requestedView, updateHash = true) {
+  const allowed = new Set(['dashboard', 'translate', 'jobs']);
+  if (state.user?.role === 'admin') allowed.add('admin');
+  const view = allowed.has(requestedView) ? requestedView : 'dashboard';
+  state.currentView = view;
+  $$('[data-view]').forEach(element => { element.hidden = element.dataset.view !== view; });
+  $$('[data-view-button]').forEach(button => {
+    const active = button.dataset.viewButton === view;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-current', active ? 'page' : 'false');
+  });
+  $('#viewEyebrow').textContent = t(viewLabels[view][0]);
+  $('#viewTitle').textContent = t(viewLabels[view][1]);
+  $('.topbar-action').hidden = view === 'translate';
+  if (updateHash) window.history.replaceState(null, '', `#${view}`);
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function metricCard(label, value, note, accent = false) {
+  return `<article class="metric-card${accent ? ' accent' : ''}">
+    <span class="metric-label">${escapeHtml(label)}</span>
+    <strong class="metric-value">${escapeHtml(value)}</strong>
+    <span class="metric-note">${escapeHtml(note)}</span>
+  </article>`;
+}
+
+function formatJobDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat(state.i18n.locale, {
+    dateStyle: 'medium', timeStyle: 'short',
+  }).format(date);
+}
+
+function renderProviderSummaries() {
+  if (!state.settings) return;
+  const providers = Object.entries(state.settings.providers);
+  const readyCount = providers.filter(([key]) => state.settings.configured[key]).length;
+  $('#dashboardProviders').innerHTML = `
+    <div class="provider-summary-row"><span>${escapeHtml(t('Providers ready'))}</span><strong>${readyCount}/${providers.length}</strong></div>
+    <div class="provider-summary-row"><span>${escapeHtml(t('Default provider'))}</span><strong>${escapeHtml(state.settings.providers[state.settings.default_provider])}</strong></div>`;
+  $('#adminProviders').innerHTML = providers.map(([key, label]) => {
+    const ready = state.settings.configured[key];
+    return `<div class="provider-admin-row">
+      <div><strong>${escapeHtml(label)}</strong><small>${escapeHtml(key === state.settings.default_provider ? t('Panel default') : t('Available provider'))}</small></div>
+      <span class="readiness${ready ? ' ready' : ''}">${escapeHtml(t(ready ? 'Configured' : 'Not set'))}</span>
+    </div>`;
+  }).join('');
+}
+
+function renderDashboard() {
+  if (!state.user) return;
+  const overviewJobs = state.overviewJobs;
+  const active = overviewJobs.filter(job => ['queued', 'processing', 'canceling'].includes(job.status)).length;
+  const completed = overviewJobs.filter(job => job.status === 'completed').length;
+  const failed = overviewJobs.filter(job => job.status === 'failed').length;
+  const scope = state.user.role === 'admin' ? t('Across all users') : t('In your workspace');
+  $('#welcomeTitle').textContent = t('Welcome back, {username}', { username: state.user.username });
+  $('#welcomeDescription').textContent = state.user.role === 'admin'
+    ? t('Your panel-wide activity and access overview is ready.')
+    : t('Here is what is happening in your translation workspace.');
+  $('#dashboardMetrics').innerHTML = [
+    metricCard(t('Total jobs'), overviewJobs.length, scope),
+    metricCard(t('Active now'), active,
+      active === 1 ? t('Translation in progress') : t('Translations in progress'), active > 0),
+    metricCard(t('Completed'), completed, t('Ready or downloaded')),
+    metricCard(t('Needs attention'), failed, t('Failed translations')),
+  ].join('');
+  $('#dashboardRecent').innerHTML = overviewJobs.length ? overviewJobs.slice(0, 5).map(job => `
+    <div class="recent-row">
+      <div><div class="recent-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
+      <div class="recent-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(job.options.target_languages.map(languageName).join(', '))} · ${escapeHtml(formatJobDate(job.created_at))}</div></div>
+      <span class="status ${escapeHtml(job.status)}">${escapeHtml(t(job.status))}</span>
+    </div>`).join('') : `<div class="empty">${escapeHtml(t('No translations yet.'))}</div>`;
+  renderProviderSummaries();
+  renderAdminDashboard();
+}
+
+function renderAdminDashboard() {
+  if (state.user?.role !== 'admin') return;
+  const activeUsers = state.users.filter(user => user.active).length;
+  const admins = state.users.filter(user => user.role === 'admin' && user.active).length;
+  const activeJobs = state.overviewJobs.filter(job => ['queued', 'processing', 'canceling'].includes(job.status)).length;
+  const providers = state.settings ? Object.keys(state.settings.providers) : [];
+  const readyProviders = state.settings ? providers.filter(key => state.settings.configured[key]).length : 0;
+  $('#adminMetrics').innerHTML = [
+    metricCard(t('Total users'), state.users.length, t('{count} active accounts', { count: activeUsers })),
+    metricCard(t('Active administrators'), admins, t('Protected panel access')),
+    metricCard(t('Panel jobs'), state.overviewJobs.length, t('{count} currently active', { count: activeJobs }), activeJobs > 0),
+    metricCard(t('Ready providers'), `${readyProviders}/${providers.length}`, t('Configured for translation')),
+  ].join('');
 }
 
 async function submitAuth(event) {
@@ -141,6 +245,7 @@ async function loadSettings() {
     if (clearButton) clearButton.hidden = !ready;
   });
   updateProviderState();
+  renderDashboard();
 }
 
 function updateProviderState() {
@@ -220,9 +325,12 @@ function renderJobs() {
 
 async function loadJobs() {
   try {
-    const all = state.user?.role === 'admin' && $('#allJobs').checked ? '?all=1' : '';
-    state.jobs = (await api(`/api/jobs${all}`)).jobs;
+    const admin = state.user?.role === 'admin';
+    const all = admin && $('#allJobs').checked;
+    state.jobs = (await api(`/api/jobs${all ? '?all=1' : ''}`)).jobs;
+    state.overviewJobs = admin && !all ? (await api('/api/jobs?all=1')).jobs : state.jobs;
     renderJobs();
+    renderDashboard();
     const active = state.jobs.some(job => ['queued', 'processing', 'canceling'].includes(job.status));
     clearTimeout(state.timer);
     state.timer = setTimeout(loadJobs, active ? 1500 : 8000);
@@ -296,6 +404,7 @@ async function loadUsers() {
         ${user.id !== state.user.id ? `<button class="reset-user ghost small" type="button">${escapeHtml(t('Reset password'))}</button><button class="toggle-user ghost small" type="button">${escapeHtml(t(user.active ? 'Disable' : 'Enable'))}</button><button class="remove-user ghost small" type="button">${escapeHtml(t('Delete'))}</button>` : ''}
       </div>
     </article>`).join('');
+  renderAdminDashboard();
 }
 
 async function createUser(event) {
@@ -368,16 +477,26 @@ $('#provider').addEventListener('change', updateProviderState);
 $('#translateForm').addEventListener('submit', submitTranslation);
 $('#settingsForm').addEventListener('submit', saveSettings);
 $('#settingsForm').addEventListener('click', removeKey);
-$('#settingsButton').addEventListener('click', () => $('#settingsDialog').showModal());
+function openSettings() {
+  if (state.user?.role === 'admin') $('#settingsDialog').showModal();
+}
+$('#settingsButton').addEventListener('click', openSettings);
+$('#providerSettingsButton').addEventListener('click', openSettings);
 $('#closeSettings').addEventListener('click', () => $('#settingsDialog').close());
-$('#usersButton').addEventListener('click', async () => { $('#usersDialog').showModal(); await loadUsers(); });
-$('#closeUsers').addEventListener('click', () => $('#usersDialog').close());
 $('#createUserForm').addEventListener('submit', createUser);
 $('#userList').addEventListener('click', userAction);
 $('#userList').addEventListener('change', userAction);
 $('#refreshButton').addEventListener('click', loadJobs);
+$('#dashboardRefresh').addEventListener('click', async () => {
+  await Promise.all([loadJobs(), state.user?.role === 'admin' ? loadUsers() : Promise.resolve()]);
+});
 $('#allJobs').addEventListener('change', loadJobs);
 $('#jobs').addEventListener('click', jobAction);
+document.addEventListener('click', event => {
+  const control = event.target.closest('[data-view-button], [data-go-view]');
+  if (control) showView(control.dataset.viewButton || control.dataset.goView);
+});
+window.addEventListener('hashchange', () => showView(window.location.hash.slice(1), false));
 const dropzone = $('#dropzone');
 ['dragenter', 'dragover'].forEach(name => dropzone.addEventListener(name, event => {
   event.preventDefault(); dropzone.classList.add('dragging');
