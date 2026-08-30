@@ -1,7 +1,27 @@
-const state = { user: null, settings: null, jobs: [], users: [], timer: null, setup: false };
+const state = {
+  user: null, settings: null, jobs: [], users: [], timer: null, setup: false,
+  i18n: { locale: document.body.dataset.locale || 'en', messages: {}, languages: {} },
+};
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const unsafeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+function t(message, values = {}) {
+  const translated = state.i18n.messages[message] || message;
+  return translated.replace(/\{([a-z_]+)\}/gi, (match, key) =>
+    Object.hasOwn(values, key) ? String(values[key]) : match
+  );
+}
+
+function languageName(code) {
+  return state.i18n.languages[code] || code;
+}
+
+async function loadI18n() {
+  const response = await fetch('/api/i18n', { credentials: 'same-origin' });
+  if (!response.ok) throw new Error(`Request failed (${response.status})`);
+  state.i18n = await response.json();
+}
 
 function cookie(name) {
   const prefix = `${encodeURIComponent(name)}=`;
@@ -26,7 +46,7 @@ async function api(url, options = {}) {
   const response = await fetch(url, { ...options, method, headers, credentials: 'same-origin' });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    const error = new Error(data.error || `Request failed (${response.status})`);
+    const error = new Error(data.error || t('Request failed ({status})', { status: response.status }));
     error.status = response.status;
     throw error;
   }
@@ -45,12 +65,12 @@ function showAuth(setup = false) {
   clearTimeout(state.timer);
   $('#appShell').hidden = true;
   $('#authView').hidden = false;
-  $('#authTitle').textContent = setup ? 'Create the first administrator' : 'Sign in';
-  $('#authEyebrow').textContent = setup ? 'Initial setup' : 'Authentication';
+  $('#authTitle').textContent = setup ? t('Create the first administrator') : t('Sign in');
+  $('#authEyebrow').textContent = setup ? t('Initial setup') : t('Authentication');
   $('#authDescription').textContent = setup
-    ? 'This one-time account will manage users, provider keys, and all jobs.'
-    : 'Use your Subtitle Translator account.';
-  $('#authSubmit').textContent = setup ? 'Create administrator' : 'Sign in';
+    ? t('This one-time account will manage users, provider keys, and all jobs.')
+    : t('Use your Subtitle Translator account.');
+  $('#authSubmit').textContent = setup ? t('Create administrator') : t('Sign in');
   $('#authForm [name="password"]').autocomplete = setup ? 'new-password' : 'current-password';
   $('#authError').textContent = '';
 }
@@ -60,7 +80,7 @@ async function enterApp(user) {
   $('#authView').hidden = true;
   $('#appShell').hidden = false;
   const admin = user.role === 'admin';
-  $('#userBadge').textContent = `${user.username} · ${user.role}`;
+  $('#userBadge').textContent = `${user.username} · ${t(user.role === 'admin' ? 'Administrator' : 'User')}`;
   $('#settingsButton').hidden = !admin;
   $('#usersButton').hidden = !admin;
   $('#allJobsLabel').hidden = !admin;
@@ -115,7 +135,7 @@ async function loadSettings() {
   });
   $$('.key-state').forEach(element => {
     const ready = state.settings.configured[element.dataset.provider];
-    element.textContent = ready ? 'Configured' : 'Not set';
+    element.textContent = ready ? t('Configured') : t('Not set');
     element.classList.toggle('ready', ready);
     const clearButton = $(`.clear-key[data-provider="${element.dataset.provider}"]`);
     if (clearButton) clearButton.hidden = !ready;
@@ -126,9 +146,9 @@ async function loadSettings() {
 function updateProviderState() {
   const provider = $('#provider').value;
   const ready = state.settings?.configured?.[provider];
-  $('#providerState').textContent = provider === 'echo' ? 'Offline test mode — no API calls' :
-    ready ? `${$('#provider').selectedOptions[0].text} is configured` :
-      'Ask an administrator to configure this provider';
+  $('#providerState').textContent = provider === 'echo' ? t('Offline test mode — no API calls') :
+    ready ? t('{provider} is configured', { provider: $('#provider').selectedOptions[0].text }) :
+      t('Ask an administrator to configure this provider');
   $('#modelField').style.display = ['anthropic', 'openai'].includes(provider) ? '' : 'none';
 }
 
@@ -145,10 +165,10 @@ async function submitTranslation(event) {
   const form = event.currentTarget;
   const files = selectedFiles();
   const targets = $$('#languagePicker input:checked').map(element => element.value);
-  if (!files.length) return toast('Choose at least one subtitle file');
-  if (!targets.length) return toast('Choose at least one target language');
+  if (!files.length) return toast(t('Choose at least one subtitle file'));
+  if (!targets.length) return toast(t('Choose at least one target language'));
   const provider = $('#provider').value;
-  if (!state.settings.configured[provider]) return toast('This provider is not configured');
+  if (!state.settings.configured[provider]) return toast(t('This provider is not configured'));
   const button = $('#submitButton');
   button.disabled = true;
   try {
@@ -160,7 +180,8 @@ async function submitTranslation(event) {
     form.querySelector('[name="model"]').value = '';
     $('#fileInput').value = '';
     renderFiles();
-    toast(files.length === 1 ? 'Translation queued' : `${files.length} translations queued`);
+    toast(files.length === 1 ? t('Translation queued') :
+      t('{count} translations queued', { count: files.length }));
     await loadJobs();
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
@@ -169,24 +190,24 @@ async function submitTranslation(event) {
 function renderJobs() {
   const container = $('#jobs');
   if (!state.jobs.length) {
-    container.innerHTML = '<div class="empty">No translations yet.</div>';
+    container.innerHTML = `<div class="empty">${escapeHtml(t('No translations yet.'))}</div>`;
     return;
   }
   container.innerHTML = state.jobs.map(job => {
     const jobId = encodeURIComponent(job.id);
-    const targetNames = job.options.target_languages.join(', ');
-    const owner = job.owner !== undefined ? ` · ${escapeHtml(job.owner || 'deleted user')}` : '';
+    const targetNames = job.options.target_languages.map(languageName).join(', ');
+    const owner = job.owner !== undefined ? ` · ${escapeHtml(job.owner || t('deleted user'))}` : '';
     const outputLinks = job.outputs.map(output =>
-      `<a href="/api/jobs/${jobId}/download/${encodeURIComponent(output.name)}">${escapeHtml(output.language)}</a>`
+      `<a href="/api/jobs/${jobId}/download/${encodeURIComponent(output.name)}">${escapeHtml(languageName(output.language))}</a>`
     ).join('');
     const primaryAction = job.status === 'completed' ?
-      `<div class="download-actions"><a class="download" href="/api/jobs/${jobId}/download">Download${job.outputs.length > 1 ? ' ZIP' : ''}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
-      `<span class="status ${escapeHtml(job.status)}">${escapeHtml(job.status)}</span>`;
+      `<div class="download-actions"><a class="download" href="/api/jobs/${jobId}/download">${escapeHtml(t(job.outputs.length > 1 ? 'Download ZIP' : 'Download'))}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
+      `<span class="status ${escapeHtml(job.status)}">${escapeHtml(t(job.status))}</span>`;
     const cancelAction = ['queued', 'processing'].includes(job.status) ?
-      `<button class="cancel-job" type="button" data-job-id="${jobId}">Cancel</button>` :
-      job.status === 'canceling' ? '<button class="cancel-job" type="button" disabled>Canceling…</button>' : '';
+      `<button class="cancel-job" type="button" data-job-id="${jobId}">${escapeHtml(t('Cancel'))}</button>` :
+      job.status === 'canceling' ? `<button class="cancel-job" type="button" disabled>${escapeHtml(t('Canceling…'))}</button>` : '';
     const deleteAction = ['completed', 'failed', 'canceled'].includes(job.status) ?
-      `<button class="delete-job" type="button" data-job-id="${jobId}">Delete</button>` : '';
+      `<button class="delete-job" type="button" data-job-id="${jobId}">${escapeHtml(t('Delete'))}</button>` : '';
     return `<article class="job">
       <div><div class="job-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
       <div class="job-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(targetNames)}${owner}</div></div>
@@ -218,13 +239,15 @@ async function jobAction(event) {
   const jobId = decodeURIComponent(button.dataset.jobId);
   const job = state.jobs.find(item => item.id === jobId);
   const action = cancelButton ? 'cancel' : 'delete';
-  if (!job || !window.confirm(`${action === 'cancel' ? 'Cancel' : 'Delete'} ${job.filename}?`)) return;
+  if (!job || !window.confirm(t(action === 'cancel' ? 'Cancel {filename}?' : 'Delete {filename}?', {
+    filename: job.filename,
+  }))) return;
   button.disabled = true;
   try {
     if (cancelButton) await api(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
     else await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: 'DELETE' });
     await loadJobs();
-    toast(cancelButton ? 'Cancellation requested' : 'Translation deleted');
+    toast(t(cancelButton ? 'Cancellation requested' : 'Translation deleted'));
   } catch (error) { button.disabled = false; toast(error.message); }
 }
 
@@ -237,7 +260,7 @@ async function saveSettings(event) {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     });
     form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
-    $('#settingsMessage').textContent = 'Saved';
+    $('#settingsMessage').textContent = t('Saved');
     await loadSettings();
     setTimeout(() => { $('#settingsMessage').textContent = ''; $('#settingsDialog').close(); }, 600);
   } catch (error) { $('#settingsMessage').textContent = error.message; }
@@ -247,14 +270,14 @@ async function removeKey(event) {
   const button = event.target.closest('.clear-key');
   if (!button) return;
   const provider = button.dataset.provider;
-  if (!window.confirm(`Remove the saved ${provider} API key?`)) return;
+  if (!window.confirm(t('Remove the saved {provider} API key?', { provider }))) return;
   button.disabled = true;
   try {
     state.settings = await api(`/api/settings/keys/${encodeURIComponent(provider)}`, {
       method: 'DELETE',
     });
     await loadSettings();
-    toast('API key removed');
+    toast(t('API key removed'));
   } catch (error) { toast(error.message); }
   finally { button.disabled = false; }
 }
@@ -263,14 +286,14 @@ async function loadUsers() {
   state.users = (await api('/api/users')).users;
   $('#userList').innerHTML = state.users.map(user => `
     <article class="user-row" data-user-id="${escapeHtml(user.id)}">
-      <div><strong>${escapeHtml(user.username)}</strong><div class="job-meta">${user.job_count} jobs · ${user.active ? 'active' : 'disabled'}${user.locked ? ' · locked' : ''}</div></div>
-      <select class="user-role" ${user.id === state.user.id ? 'disabled' : ''} aria-label="Role for ${escapeHtml(user.username)}">
-        <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
-        <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Administrator</option>
+      <div><strong>${escapeHtml(user.username)}</strong><div class="job-meta">${escapeHtml(t('{count} jobs', { count: user.job_count }))} · ${escapeHtml(t(user.active ? 'active' : 'disabled'))}${user.locked ? ` · ${escapeHtml(t('locked'))}` : ''}</div></div>
+      <select class="user-role" ${user.id === state.user.id ? 'disabled' : ''} aria-label="${escapeHtml(t('Role for {username}', { username: user.username }))}">
+        <option value="user" ${user.role === 'user' ? 'selected' : ''}>${escapeHtml(t('User'))}</option>
+        <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>${escapeHtml(t('Administrator'))}</option>
       </select>
       <div class="user-actions">
-        ${user.locked ? '<button class="unlock-user ghost small" type="button">Unlock</button>' : ''}
-        ${user.id !== state.user.id ? `<button class="reset-user ghost small" type="button">Reset password</button><button class="toggle-user ghost small" type="button">${user.active ? 'Disable' : 'Enable'}</button><button class="remove-user ghost small" type="button">Delete</button>` : ''}
+        ${user.locked ? `<button class="unlock-user ghost small" type="button">${escapeHtml(t('Unlock'))}</button>` : ''}
+        ${user.id !== state.user.id ? `<button class="reset-user ghost small" type="button">${escapeHtml(t('Reset password'))}</button><button class="toggle-user ghost small" type="button">${escapeHtml(t(user.active ? 'Disable' : 'Enable'))}</button><button class="remove-user ghost small" type="button">${escapeHtml(t('Delete'))}</button>` : ''}
       </div>
     </article>`).join('');
 }
@@ -285,7 +308,7 @@ async function createUser(event) {
     });
     form.reset();
     await loadUsers();
-    toast('User created');
+    toast(t('User created'));
   } catch (error) { toast(error.message); }
 }
 
@@ -302,11 +325,15 @@ async function userAction(event) {
   else if (event.target.closest('.unlock-user')) payload = { unlock: true };
   else if (event.target.closest('.toggle-user')) payload = { active: !user.active };
   else if (event.target.closest('.reset-user')) {
-    const password = window.prompt(`New password for ${user.username} (12+ characters):`);
+    const password = window.prompt(t('New password for {username} (12+ characters):', {
+      username: user.username,
+    }));
     if (!password) return;
     payload = { password };
   } else if (event.target.closest('.remove-user')) {
-    if (!window.confirm(`Delete user ${user.username}? Their finished jobs will remain for administrator cleanup.`)) return;
+    if (!window.confirm(t('Delete user {username}? Their finished jobs will remain for administrator cleanup.', {
+      username: user.username,
+    }))) return;
     method = 'DELETE';
   } else return;
   try {
@@ -315,11 +342,12 @@ async function userAction(event) {
       body: payload ? JSON.stringify(payload) : undefined,
     });
     await loadUsers();
-    toast(method === 'DELETE' ? 'User deleted' : 'User updated');
+    toast(t(method === 'DELETE' ? 'User deleted' : 'User updated'));
   } catch (error) { toast(error.message); await loadUsers(); }
 }
 
 async function initialize() {
+  await loadI18n();
   const status = await api('/api/auth/setup-status');
   if (!status.configured) return showAuth(true);
   try {
@@ -329,6 +357,11 @@ async function initialize() {
 }
 
 $('#authForm').addEventListener('submit', submitAuth);
+$('#localeSelect').addEventListener('change', event => {
+  const url = new URL(window.location.href);
+  url.searchParams.set('lang', event.currentTarget.value);
+  window.location.assign(url);
+});
 $('#logoutButton').addEventListener('click', logout);
 $('#fileInput').addEventListener('change', renderFiles);
 $('#provider').addEventListener('change', updateProviderState);

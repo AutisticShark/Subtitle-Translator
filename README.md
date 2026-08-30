@@ -9,6 +9,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Multi-user JWT login with administrator and user roles
+- Localized web interface with browser-language detection and a persistent language selector
 - Administrator-only user management and encrypted, write-only provider keys
 - Per-user job isolation, with administrator access to cross-user job cleanup
 - SQLite by default, plus PostgreSQL and MariaDB/MySQL through SQLAlchemy
@@ -47,6 +48,12 @@ Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Prov
 Set `JWT_COOKIE_SECURE=1` whenever the app is served over HTTPS. Plain `http://localhost` needs `0`. For any network deployment, terminate TLS at the app or a trusted reverse proxy; secure cookies and JWT authentication do not encrypt HTTP traffic.
 
 Administrators can manage provider settings, create/disable/promote/delete users, reset passwords, unlock accounts, and select **All users** when inspecting or deleting jobs. Regular users can operate only their own jobs. The final active administrator cannot be deleted, disabled, or demoted.
+
+### Interface languages
+
+The web interface supports English, Traditional Chinese, and Simplified Chinese. It chooses a language from an explicit `?lang=` selection, the saved `ui_locale` cookie, or the browser's `Accept-Language` header, in that order. `zh-Hant` variants select Traditional Chinese, while `zh`, `zh-Hans`, `zh-CN`, and `zh-SG` select Simplified Chinese. Use the language selector in the lower-right corner to save a preference. Unsupported or missing strings fall back to English.
+
+Localization catalogs live in `locales/*.json`. Each catalog declares its locale code, display name, aliases, and translated messages; adding a valid catalog makes that locale available automatically. Stored job states remain locale-neutral so the same job can be rendered in each viewer's selected language. Technical provider and subtitle-parser errors remain unchanged to preserve their diagnostic details.
 
 The Settings portal also controls translation-submission rate limits. Regular-user and administrator limits apply independently to each account, while the panel-wide limit covers all accounts. The shared window is configurable from 1 minute to 7 days; `0` disables an individual limit. Each uploaded subtitle counts as one job, and a multi-file request is accepted or rejected as a unit. Counters are stored in the application database so limits remain effective across restarts and multiple web workers.
 

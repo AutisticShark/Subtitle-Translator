@@ -60,6 +60,14 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Echo is the safe, deterministic provider for the CLI and offline tests. The web UI and API expose and accept Echo only while Flask debug mode is enabled; normal instances must reject crafted Echo job requests server-side as well as hiding the option.
 - Docker publishing always targets GHCR. Docker Hub is optional and requires `DOCKERHUB_IMAGE`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` together.
 
+## Web interface localization
+
+- UI localization is dependency-free: `i18n.py` discovers `locales/*.json`, negotiates an explicit query selection, the `ui_locale` cookie, and `Accept-Language` in that order, and falls back to English source strings. English, Traditional Chinese, and Simplified Chinese are bundled; `zh-Hant` aliases select `zh-TW`, while generic `zh` and `zh-Hans` aliases select `zh-CN`.
+- Catalog coverage tests extract static `tr(...)`/`t(...)` calls from Python, JavaScript, and Jinja sources and require every non-English catalog to cover them. Keep this check generic when adding locales instead of hard-coding one catalog.
+- `/api/i18n` is intentionally public because the sign-in and one-time setup screens need dynamic browser messages before authentication. It must expose only static translations and target-language labels.
+- Job state is shared data and must not be stored in the submitting user's locale. Workers keep stable English stage values; `job_dict` localizes known stage patterns for each request, allowing different viewers to use different UI locales.
+- Technical provider and subtitle-parser failures remain in their original form so diagnostic details are not hidden by incomplete catalog coverage.
+
 ## Google Cloud Translation adapter
 
 - The Google provider uses the API-key-compatible Cloud Translation - Basic v2 endpoint and the standard NMT model; it does not require a service-account file.

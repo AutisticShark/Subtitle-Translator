@@ -22,6 +22,8 @@ header { height: 92px; display: flex; align-items: center; justify-content: spac
 .ghost, .icon-button { border: 1px solid var(--line); background: transparent; color: var(--text); border-radius: 999px; padding: 9px 16px; cursor: pointer; }
 .ghost:hover { border-color: #626a77; background: #ffffff08; }
 .small { padding: 7px 13px; font-size: 13px; }
+.locale-picker { position: fixed; right: 16px; bottom: 16px; z-index: 20; display: flex; flex-direction: row; align-items: center; gap: 8px; color: var(--muted); font-size: 11px; font-weight: 600; }
+.locale-picker select { width: auto; min-width: 108px; padding: 7px 28px 7px 10px; border-radius: 999px; }
 .hero { padding: 70px 0 50px; max-width: 850px; }
 .eyebrow { color: var(--accent); font-size: 11px; letter-spacing: .18em; text-transform: uppercase; font-weight: 800; }
 h1 { margin: 16px 0 18px; font: 500 clamp(46px, 7vw, 84px)/.96 Georgia, 'Times New Roman', serif; letter-spacing: -.055em; }
@@ -135,4 +137,5 @@ summary { cursor: pointer; font-weight: 700; }
   .header-actions { flex-wrap: wrap; justify-content: flex-end; }
   .create-user-form, .user-row { grid-template-columns: 1fr; }
   .user-actions { flex-wrap: wrap; }
+  .locale-picker { right: 12px; bottom: 12px; }
 }

@@ -79,6 +79,51 @@ class WebApplicationTests(unittest.TestCase):
         self.assertTrue(stored.startswith("enc:v1:"))
         self.assertNotIn("anthropic-secret", stored)
 
+    def test_ui_locale_detection_catalog_and_persistence(self):
+        anonymous = webapp.app.test_client()
+        page = anonymous.get("/", headers={"Accept-Language": "zh-Hant, en;q=0.8"})
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(b'<html lang="zh-TW">', page.data)
+        self.assertIn("字幕翻譯器".encode(), page.data)
+        self.assertEqual(page.headers["Content-Language"], "zh-TW")
+
+        selected = anonymous.get("/?lang=zh-TW")
+        self.assertIn("ui_locale=zh-TW", selected.headers["Set-Cookie"])
+        persisted = anonymous.get("/")
+        self.assertIn(b'<html lang="zh-TW">', persisted.data)
+
+        catalog = anonymous.get("/api/i18n").get_json()
+        self.assertEqual(catalog["locale"], "zh-TW")
+        self.assertEqual(catalog["languages"]["ja"], "日文")
+        self.assertEqual(catalog["messages"]["Sign in"], "登入")
+
+        simplified_client = webapp.app.test_client()
+        simplified_page = simplified_client.get("/?lang=zh-CN")
+        self.assertIn("ui_locale=zh-CN", simplified_page.headers["Set-Cookie"])
+        self.assertIn(b'<html lang="zh-CN">', simplified_page.data)
+        self.assertIn("字幕翻译器".encode(), simplified_page.data)
+
+        simplified = simplified_client.get("/api/i18n").get_json()
+        self.assertEqual(simplified["locale"], "zh-CN")
+        self.assertEqual(simplified["languages"]["ja"], "日语")
+        self.assertEqual(simplified["messages"]["Sign in"], "登录")
+
+    def test_api_errors_and_job_stages_follow_request_locale(self):
+        anonymous = webapp.app.test_client()
+        login = anonymous.post(
+            "/api/auth/login", json={"username": "missing", "password": "incorrect"},
+            headers={"Accept-Language": "zh-TW"},
+        )
+        self.assertEqual(login.status_code, 401)
+        self.assertEqual(login.get_json()["error"], "使用者名稱或密碼無效")
+
+        with webapp.app.test_request_context(headers={"Accept-Language": "zh-TW"}):
+            self.assertEqual(webapp.localized_job_stage("Reading subtitle"), "正在讀取字幕")
+            self.assertEqual(
+                webapp.localized_job_stage("Translating to Japanese (2/5 segments)"),
+                "正在翻譯為日文（2/5 個片段）",
+            )
+
     def test_health_is_public_but_api_requires_jwt(self):
         anonymous = webapp.app.test_client()
         self.assertEqual(anonymous.get("/healthz").status_code, 200)

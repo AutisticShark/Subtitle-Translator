@@ -24,7 +24,7 @@ from typing import Any, Callable
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from cryptography.fernet import Fernet, InvalidToken
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, make_response, render_template, request, send_file
 from flask_jwt_extended import (
     JWTManager, create_access_token, get_jwt, get_jwt_identity, jwt_required,
     get_jwt_request_location, set_access_cookies, unset_jwt_cookies,
@@ -37,6 +37,10 @@ from werkzeug.utils import secure_filename
 from database import (
     connection, create_database_engine, initialize_database, jobs, revoked_tokens,
     rate_limit_buckets, settings as settings_table, transaction, users,
+)
+from i18n import (
+    LOCALE_COOKIE, LOCALE_LABELS, current_locale, messages_for, normalize_locale,
+    translate as tr,
 )
 from srt_translate import (
     LANGS, FatalTranslationError, Throttle, TranslationCanceled, make_anthropic,
@@ -205,15 +209,15 @@ def record_login_failure(remote_address: str) -> None:
 
 def validate_username(username: str) -> str | None:
     if not USERNAME_PATTERN.fullmatch(username):
-        return "Username must be 3-64 lowercase letters, numbers, dots, dashes, or underscores"
+        return tr("Username must be 3-64 lowercase letters, numbers, dots, dashes, or underscores")
     return None
 
 
 def validate_password(password: Any) -> str | None:
     if not isinstance(password, str) or len(password) < PASSWORD_MIN_LENGTH:
-        return f"Password must contain at least {PASSWORD_MIN_LENGTH} characters"
+        return tr("Password must contain at least {minimum} characters", minimum=PASSWORD_MIN_LENGTH)
     if len(password) > 256:
-        return "Password is too long"
+        return tr("Password is too long")
     return None
 
 
@@ -334,22 +338,22 @@ def token_is_revoked(_header: dict, payload: dict) -> bool:
 
 @jwt.unauthorized_loader
 def missing_token(reason: str):
-    return jsonify(error="Authentication required", detail=reason), 401
+    return jsonify(error=tr("Authentication required"), detail=reason), 401
 
 
 @jwt.invalid_token_loader
 def invalid_token(reason: str):
-    return jsonify(error="Invalid authentication token", detail=reason), 401
+    return jsonify(error=tr("Invalid authentication token"), detail=reason), 401
 
 
 @jwt.expired_token_loader
 def expired_token(_header: dict, _payload: dict):
-    return jsonify(error="Authentication token expired"), 401
+    return jsonify(error=tr("Authentication token expired")), 401
 
 
 @jwt.revoked_token_loader
 def revoked_token(_header: dict, _payload: dict):
-    return jsonify(error="Authentication token revoked"), 401
+    return jsonify(error=tr("Authentication token revoked")), 401
 
 
 def current_user_row() -> Any | None:
@@ -363,7 +367,7 @@ def admin_required(function: Callable):
     def wrapped(*args, **kwargs):
         user = current_user_row()
         if user is None or user.role != "admin":
-            return jsonify(error="Administrator access required"), 403
+            return jsonify(error=tr("Administrator access required")), 403
         return function(*args, **kwargs)
     return wrapped
 
@@ -379,6 +383,9 @@ def security_headers(response):
         "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
     )
     response.headers.setdefault("Cache-Control", "no-store")
+    response.headers.setdefault("Content-Language", current_locale())
+    response.vary.add("Accept-Language")
+    response.vary.add("Cookie")
     if request.endpoint == "logout":
         return response
     try:
@@ -412,7 +419,7 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
         "google": bool(values.get("google_api_key") or os.environ.get("GOOGLE_API_KEY")),
         "echo": True,
     }
-    result["providers"] = {name: PROVIDER_LABELS[name] for name in providers}
+    result["providers"] = {name: tr(PROVIDER_LABELS[name]) for name in providers}
     result["configured"] = {name: configured[name] for name in providers}
     if include_secrets:
         for key in SECRET_KEYS:
@@ -461,14 +468,18 @@ def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
     for scope, limit, started, used in checks:
         if limit and used + amount > limit:
             retry_after = max(1, math.ceil((started + window - timestamp_datetime).total_seconds()))
-            label = "Administrator" if scope == "admin" else (
-                "Regular-user" if scope == "user" else "Panel-wide"
+            label = tr("Administrator") if scope == "admin" else (
+                tr("Regular-user") if scope == "user" else tr("Panel-wide")
             )
             return {
-                "error": (
-                    f"{label} rate limit of {limit} translation job"
-                    f"{'s' if limit != 1 else ''} per {limits['rate_limit_window_minutes']} "
-                    f"minute{'s' if limits['rate_limit_window_minutes'] != 1 else ''} exceeded"
+                "error": tr(
+                    "{label} rate limit of {limit} translation job{job_plural} per "
+                    "{minutes} minute{minute_plural} exceeded",
+                    label=label, limit=limit, job_plural="s" if limit != 1 else "",
+                    minutes=limits["rate_limit_window_minutes"],
+                    minute_plural=(
+                        "s" if limits["rate_limit_window_minutes"] != 1 else ""
+                    ),
                 ),
                 "scope": scope,
                 "limit": limit,
@@ -493,11 +504,34 @@ def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
     return None
 
 
+def localized_job_stage(stage: str) -> str:
+    if stage in {"Reading subtitle", "Ready to download", "Canceled", "Canceling",
+                 "Translation failed"}:
+        return tr(stage)
+    parsed = re.fullmatch(r"Parsed (\d+) cues", stage)
+    if parsed:
+        return tr("Parsed {count} cues", count=parsed.group(1))
+    translating = re.fullmatch(
+        r"Translating to (.+?)(?: \((\d+)/(\d+) segments\))?", stage,
+    )
+    if translating:
+        source_name, done, total = translating.groups()
+        language = tr(source_name)
+        if done is not None:
+            return tr(
+                "Translating to {language} ({done}/{total} segments)",
+                language=language, done=done, total=total,
+            )
+        return tr("Translating to {language}", language=language)
+    return stage
+
+
 def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
     source = dict(row._mapping if hasattr(row, "_mapping") else row)
     result = {key: source.get(key) for key in jobs.c.keys()}
     result["options"] = json.loads(result["options"])
     result["outputs"] = json.loads(result["outputs"])
+    result["stage"] = localized_job_stage(result.get("stage") or "")
     result.pop("stored_name", None)
     result.pop("user_id", None)
     if include_owner:
@@ -665,7 +699,30 @@ def owned_job(job_id: str, user: Any) -> Any | None:
 
 @app.get("/")
 def index():
-    return render_template("index.html", languages=LANGS, max_upload_mb=MAX_UPLOAD_MB)
+    locale = current_locale()
+    languages = {
+        code: {**language, "name": tr(language["name"])}
+        for code, language in LANGS.items()
+    }
+    response = make_response(render_template(
+        "index.html", languages=languages, max_upload_mb=MAX_UPLOAD_MB,
+        locale=locale, locales=LOCALE_LABELS, tr=tr,
+    ))
+    selected = normalize_locale(request.args.get("lang"))
+    if selected:
+        response.set_cookie(
+            LOCALE_COOKIE, selected, max_age=365 * 24 * 60 * 60,
+            secure=app.config["JWT_COOKIE_SECURE"], httponly=False, samesite="Strict",
+        )
+    return response
+
+
+@app.get("/api/i18n")
+def i18n_catalog():
+    return jsonify(
+        locale=current_locale(), messages=messages_for(),
+        languages={code: tr(language["name"]) for code, language in LANGS.items()},
+    )
 
 
 @app.get("/healthz")
@@ -683,7 +740,7 @@ def setup_status():
 @app.post("/api/auth/setup")
 def setup_first_admin():
     if request.content_length and request.content_length > 8192:
-        return jsonify(error="Authentication request is too large"), 413
+        return jsonify(error=tr("Authentication request is too large")), 413
     payload = json_payload()
     username = normalize_username(payload.get("username"))
     password = payload.get("password")
@@ -695,7 +752,7 @@ def setup_first_admin():
     try:
         with transaction(engine) as db:
             if db.scalar(select(func.count()).select_from(users)):
-                return jsonify(error="Initial setup is already complete"), 409
+                return jsonify(error=tr("Initial setup is already complete")), 409
             db.execute(insert(settings_table).values(
                 name="_auth_setup_complete", value="1", updated_at=timestamp
             ))
@@ -706,7 +763,7 @@ def setup_first_admin():
             ))
             db.execute(update(jobs).where(jobs.c.user_id.is_(None)).values(user_id=user_id))
     except IntegrityError:
-        return jsonify(error="Initial setup is already complete"), 409
+        return jsonify(error=tr("Initial setup is already complete")), 409
     with connection(engine) as db:
         user = db.execute(select(users).where(users.c.id == user_id)).first()
     response = jsonify(user=public_user(user))
@@ -717,10 +774,10 @@ def setup_first_admin():
 @app.post("/api/auth/login")
 def login():
     if request.content_length and request.content_length > 8192:
-        return jsonify(error="Authentication request is too large"), 413
+        return jsonify(error=tr("Authentication request is too large")), 413
     remote_address = request.remote_addr or "unknown"
     if login_rate_limited(remote_address):
-        return jsonify(error="Too many login attempts; try again later"), 429
+        return jsonify(error=tr("Too many login attempts; try again later")), 429
     payload = json_payload()
     raw_username = payload.get("username")
     password = payload.get("password")
@@ -753,7 +810,7 @@ def login():
                 )
             with transaction(engine) as db:
                 db.execute(update(users).where(users.c.id == user.id).values(**values))
-        return jsonify(error="Invalid username or password"), 401
+        return jsonify(error=tr("Invalid username or password")), 401
     values = {"failed_login_count": 0, "locked_until": None, "updated_at": now()}
     if password_hasher.check_needs_rehash(user.password_hash):
         values["password_hash"] = password_hasher.hash(candidate_password)
@@ -782,7 +839,7 @@ def logout():
             db.execute(insert(revoked_tokens).values(
                 jti=claims["jti"], expires_at=expires_at, created_at=now()
             ))
-    response = jsonify(message="Logged out")
+    response = jsonify(message=tr("Logged out"))
     unset_jwt_cookies(response)
     return response
 
@@ -791,7 +848,7 @@ def logout():
 @jwt_required()
 def who_am_i():
     user = current_user_row()
-    return jsonify(user=public_user(user)) if user else (jsonify(error="User not found"), 401)
+    return jsonify(user=public_user(user)) if user else (jsonify(error=tr("User not found")), 401)
 
 
 @app.get("/api/users")
@@ -818,7 +875,7 @@ def create_user():
     if error:
         return jsonify(error=error), 400
     if role not in {"user", "admin"}:
-        return jsonify(error="Invalid role"), 400
+        return jsonify(error=tr("Invalid role")), 400
     user_id = uuid.uuid4().hex
     timestamp = now()
     try:
@@ -829,7 +886,7 @@ def create_user():
                 locked_until=None, created_at=timestamp, updated_at=timestamp,
             ))
     except IntegrityError:
-        return jsonify(error="Username already exists"), 409
+        return jsonify(error=tr("Username already exists")), 409
     with connection(engine) as db:
         user = db.execute(select(users).where(users.c.id == user_id)).first()
     return jsonify(user=public_user(user)), 201
@@ -848,15 +905,15 @@ def update_user(user_id: str):
     payload = json_payload()
     unknown = set(payload) - {"role", "active", "password", "unlock"}
     if unknown:
-        return jsonify(error=f"Unknown fields: {', '.join(sorted(unknown))}"), 400
+        return jsonify(error=tr("Unknown fields: {fields}", fields=', '.join(sorted(unknown)))), 400
     values: dict[str, Any] = {"updated_at": now()}
     if "role" in payload:
         if payload["role"] not in {"user", "admin"}:
-            return jsonify(error="Invalid role"), 400
+            return jsonify(error=tr("Invalid role")), 400
         values["role"] = payload["role"]
     if "active" in payload:
         if not isinstance(payload["active"], bool):
-            return jsonify(error="active must be a boolean"), 400
+            return jsonify(error=tr("active must be a boolean")), 400
         values["active"] = payload["active"]
     if "password" in payload:
         error = validate_password(payload["password"])
@@ -870,16 +927,16 @@ def update_user(user_id: str):
     if user_id == actor.id and (
         values.get("active") is False or values.get("role") == "user"
     ):
-        return jsonify(error="You cannot deactivate or demote your own account"), 409
+        return jsonify(error=tr("You cannot deactivate or demote your own account")), 409
     with transaction(engine) as db:
         target = db.execute(select(users).where(users.c.id == user_id)).first()
         if target is None:
-            return jsonify(error="User not found"), 404
+            return jsonify(error=tr("User not found")), 404
         removes_admin = target.role == "admin" and target.active and (
             values.get("active") is False or values.get("role") == "user"
         )
         if removes_admin and active_admin_count(db) <= 1:
-            return jsonify(error="At least one active administrator is required"), 409
+            return jsonify(error=tr("At least one active administrator is required")), 409
         if "active" in values or "role" in values:
             values["token_version"] = users.c.token_version + 1
         db.execute(update(users).where(users.c.id == user_id).values(**values))
@@ -893,17 +950,17 @@ def update_user(user_id: str):
 def delete_user(user_id: str):
     actor = current_user_row()
     if user_id == actor.id:
-        return jsonify(error="You cannot delete your own account"), 409
+        return jsonify(error=tr("You cannot delete your own account")), 409
     with transaction(engine) as db:
         target = db.execute(select(users).where(users.c.id == user_id)).first()
         if target is None:
-            return jsonify(error="User not found"), 404
+            return jsonify(error=tr("User not found")), 404
         if target.role == "admin" and target.active and active_admin_count(db) <= 1:
-            return jsonify(error="At least one active administrator is required"), 409
+            return jsonify(error=tr("At least one active administrator is required")), 409
         if db.scalar(select(func.count()).select_from(jobs).where(
             jobs.c.user_id == user_id, jobs.c.status.in_(ACTIVE_STATUSES)
         )):
-            return jsonify(error="Cancel or finish this user's active jobs first"), 409
+            return jsonify(error=tr("Cancel or finish this user's active jobs first")), 409
         db.execute(update(jobs).where(jobs.c.user_id == user_id).values(user_id=None))
         db.execute(delete(rate_limit_buckets).where(
             rate_limit_buckets.c.scope == f"user:{user_id}"
@@ -924,12 +981,12 @@ def save_settings():
     payload = json_payload()
     unknown = set(payload) - ALL_SETTING_KEYS
     if unknown:
-        return jsonify(error=f"Unknown settings: {', '.join(sorted(unknown))}"), 400
+        return jsonify(error=tr("Unknown settings: {settings}", settings=', '.join(sorted(unknown)))), 400
     if payload.get("default_provider") and payload["default_provider"] not in available_providers():
-        return jsonify(error="Invalid default provider"), 400
+        return jsonify(error=tr("Invalid default provider")), 400
     if any(key in payload and str(payload[key]).strip() for key in SECRET_KEYS):
         if not configured_jwt_secret and not os.environ.get("API_KEY_ENCRYPTION_KEY"):
-            return jsonify(error="Configure JWT_SECRET_KEY before saving API keys"), 503
+            return jsonify(error=tr("Configure JWT_SECRET_KEY before saving API keys")), 503
     numeric = {"batch_size": (1, 100), "workers": (1, 16), "rpm": (0, 10000),
                "width": (4, 80), "max_lines": (1, 5)}
     integer_numeric = {
@@ -941,7 +998,10 @@ def save_settings():
     try:
         for key, (minimum, maximum) in numeric.items():
             if key in payload and not minimum <= float(payload[key]) <= maximum:
-                raise ValueError(f"{key} must be between {minimum} and {maximum}")
+                raise ValueError(tr(
+                    "{key} must be between {minimum} and {maximum}",
+                    key=key, minimum=minimum, maximum=maximum,
+                ))
         for key, (minimum, maximum) in integer_numeric.items():
             if key not in payload:
                 continue
@@ -949,10 +1009,16 @@ def save_settings():
                 value = int(str(payload[key]).strip())
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    f"{key} must be a whole number between {minimum} and {maximum}"
+                    tr(
+                        "{key} must be a whole number between {minimum} and {maximum}",
+                        key=key, minimum=minimum, maximum=maximum,
+                    )
                 ) from exc
             if str(value) != str(payload[key]).strip() or not minimum <= value <= maximum:
-                raise ValueError(f"{key} must be a whole number between {minimum} and {maximum}")
+                raise ValueError(tr(
+                    "{key} must be a whole number between {minimum} and {maximum}",
+                    key=key, minimum=minimum, maximum=maximum,
+                ))
     except (TypeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
     timestamp = now()
@@ -986,7 +1052,7 @@ def save_settings():
 def delete_key(provider: str):
     key = f"{provider}_api_key"
     if key not in SECRET_KEYS:
-        return jsonify(error="Unknown provider"), 404
+        return jsonify(error=tr("Unknown provider")), 404
     with db_lock, transaction(engine) as db:
         db.execute(delete(settings_table).where(settings_table.c.name == key))
     return jsonify(read_settings())
@@ -998,22 +1064,22 @@ def create_jobs():
     user = current_user_row()
     files = request.files.getlist("files")
     if not files or all(not item.filename for item in files):
-        return jsonify(error="Select at least one subtitle file"), 400
+        return jsonify(error=tr("Select at least one subtitle file")), 400
     validated_files = []
     for upload in files:
         original = secure_filename(upload.filename or "")
         if not original or Path(original).suffix.lower() not in SUPPORTED_EXTENSIONS:
-            return jsonify(error=f"Unsupported file: {upload.filename}"), 400
+            return jsonify(error=tr("Unsupported file: {filename}", filename=upload.filename)), 400
         validated_files.append((upload, original))
     current_settings = read_settings()
     provider = request.form.get("provider", current_settings["default_provider"])
     if provider not in available_providers():
-        return jsonify(error="Invalid provider"), 400
+        return jsonify(error=tr("Invalid provider")), 400
     targets = [value.strip() for value in request.form.get(
         "target_languages", current_settings["target_languages"]
     ).split(",") if value.strip()]
     if not targets or any(language not in LANGS for language in targets):
-        return jsonify(error="Choose one or more valid target languages"), 400
+        return jsonify(error=tr("Choose one or more valid target languages")), 400
     options = {
         "provider": provider, "model": request.form.get("model", "").strip() or None,
         "source_language": request.form.get(
@@ -1082,7 +1148,7 @@ def list_jobs():
 def get_job(job_id: str):
     user = current_user_row()
     row = owned_job(job_id, user)
-    return jsonify(job_dict(row)) if row else (jsonify(error="Job not found"), 404)
+    return jsonify(job_dict(row)) if row else (jsonify(error=tr("Job not found")), 404)
 
 
 @app.post("/api/jobs/<job_id>/cancel")
@@ -1095,12 +1161,12 @@ def cancel_job(job_id: str):
             statement = statement.where(jobs.c.user_id == user.id)
         row = db.execute(statement).first()
         if row is None:
-            return jsonify(error="Job not found"), 404
+            return jsonify(error=tr("Job not found")), 404
         if row.status == "canceling":
             cancel_event_for(job_id).set()
             return jsonify(job_dict(row)), 202
         if row.status not in {"queued", "processing"}:
-            return jsonify(error="Only an active job can be canceled"), 409
+            return jsonify(error=tr("Only an active job can be canceled")), 409
         db.execute(update(jobs).where(jobs.c.id == job_id).values(
             status="canceling", stage="Canceling", updated_at=now()
         ))
@@ -1119,18 +1185,18 @@ def delete_job(job_id: str):
             statement = statement.where(jobs.c.user_id == user.id)
         row = db.execute(statement).first()
         if row is None:
-            return jsonify(error="Job not found"), 404
+            return jsonify(error=tr("Job not found")), 404
         if row.status not in TERMINAL_STATUSES:
-            return jsonify(error="Wait for the job to finish before deleting it"), 409
+            return jsonify(error=tr("Wait for the job to finish before deleting it")), 409
         jobs_root = JOBS_DIR.resolve()
         folder = (jobs_root / job_id).resolve()
         if folder.parent != jobs_root:
-            return jsonify(error="Invalid job path"), 400
+            return jsonify(error=tr("Invalid job path")), 400
         try:
             if folder.exists():
                 shutil.rmtree(folder)
         except OSError:
-            return jsonify(error="Could not delete the job files"), 500
+            return jsonify(error=tr("Could not delete the job files")), 500
         db.execute(delete(jobs).where(jobs.c.id == job_id))
         with cancel_events_lock:
             cancel_events.pop(job_id, None)
@@ -1143,10 +1209,10 @@ def download_output(job_id: str, name: str):
     user = current_user_row()
     row = owned_job(job_id, user)
     if row is None:
-        return jsonify(error="Job not found"), 404
+        return jsonify(error=tr("Job not found")), 404
     allowed = {item["name"] for item in json.loads(row.outputs)}
     if name not in allowed:
-        return jsonify(error="Output not found"), 404
+        return jsonify(error=tr("Output not found")), 404
     return send_file(JOBS_DIR / job_id / name, as_attachment=True, download_name=name)
 
 
@@ -1156,10 +1222,10 @@ def download_all(job_id: str):
     user = current_user_row()
     row = owned_job(job_id, user)
     if row is None:
-        return jsonify(error="Job not found"), 404
+        return jsonify(error=tr("Job not found")), 404
     outputs = json.loads(row.outputs)
     if not outputs:
-        return jsonify(error="No outputs are ready"), 404
+        return jsonify(error=tr("No outputs are ready")), 404
     if len(outputs) == 1:
         return download_output(job_id, outputs[0]["name"])
     archive = JOBS_DIR / job_id / (Path(row.filename).stem + ".translations.zip")
@@ -1173,7 +1239,9 @@ def download_all(job_id: str):
 
 @app.errorhandler(413)
 def too_large(_error):
-    return jsonify(error=f"Upload exceeds the {MAX_UPLOAD_MB} MB limit"), 413
+    return jsonify(error=tr(
+        "Upload exceeds the {max_upload_mb} MB limit", max_upload_mb=MAX_UPLOAD_MB,
+    )), 413
 
 
 if __name__ == "__main__":

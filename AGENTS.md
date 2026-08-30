@@ -9,6 +9,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 - `webapp.py` is the Flask API, authentication/authorization layer, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time.
 - `database.py` defines the portable SQLAlchemy schema, SQLite legacy migration, and URL normalization for SQLite, PostgreSQL, MariaDB, and MySQL.
 - `static/app.js` and `templates/index.html` implement the browser UI.
+- `i18n.py` and `locales/*.json` provide request-locale negotiation and web/API message catalogs. English source strings are the fallback.
 - `tests/` currently covers subtitle-format preservation and an Echo-provider web job. Echo is the preferred offline end-to-end provider.
 - `.github/workflows/docker-publish.yml` publishes to GHCR unconditionally and to Docker Hub only when all three Docker Hub settings are present.
 
@@ -16,7 +17,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 
 - Never expose saved API-key values through `GET /api/settings`; the UI may receive only configured/not-configured state.
 - Keep provider settings and API-key mutation administrator-only. Saved API keys use `enc:v1:` Fernet encryption; never silently replace an unreadable key or log its value.
-- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, the login/setup endpoints, and the initial HTML page are the intentional public boundaries.
+- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, `/api/i18n`, the login/setup endpoints, and the initial HTML page are the intentional public boundaries. `/api/i18n` may expose only static catalog and language-label data.
 - Scope every non-admin job read, mutation, and download by `user_id`. Use a not-found response for another user's job so its existence is not disclosed.
 - User deactivation, password changes, and role changes must invalidate existing tokens. Never allow deletion, deactivation, or demotion of the final active administrator.
 - Keep `/healthz` unauthenticated so Docker and reverse proxies can probe it.
@@ -39,6 +40,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 9. JWT cookie authentication requires a CSRF header on `POST`, `PUT`, `PATCH`, and `DELETE`. Browser code reads `csrf_access_token` only for the double-submit header; it must never copy the HttpOnly access JWT into JavaScript storage.
 10. Database portability requires SQLAlchemy expressions, not backend-specific placeholders or upsert syntax. Ordinary `postgresql://`, `mariadb://`, and `mysql://` URLs are normalized to installed drivers; compile schema tests for all supported dialects when changing tables.
 11. Translation submission limits count jobs, not HTTP requests: every uploaded subtitle consumes one unit. Enforce the per-account role limit and the panel-wide limit in the same database transaction as all job inserts, serialize submissions through the shared settings row, and reject a multi-file upload atomically with HTTP 429 and `Retry-After`.
+12. Keep stored job statuses and stages locale-neutral. Localize them while serializing the response so shared jobs can be viewed in different interface languages. Locale selection order is explicit `?lang=`, the non-sensitive `ui_locale` cookie, browser `Accept-Language`, then English fallback.
 
 ## Validation
 
