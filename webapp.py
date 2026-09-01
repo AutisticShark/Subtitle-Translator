@@ -67,6 +67,7 @@ LOGIN_RATE_LIMIT = 30
 REGISTER_RATE_LIMIT = 10
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 ACTIVE_STATUSES = {"queued", "processing", "canceling"}
+ACCOUNT_THEMES = {"system", "light", "dark"}
 
 
 def environment_flag(name: str, default: bool = False) -> bool:
@@ -275,6 +276,7 @@ def public_user(row: Any) -> dict[str, Any]:
     locked_until = parse_timestamp(values.get("locked_until"))
     result = {
         "id": values["id"], "username": values["username"], "role": values["role"],
+        "theme": values.get("theme", "system"),
         "active": bool(values["active"]),
         "locked": bool(locked_until and locked_until > now_datetime()),
         "created_at": values["created_at"],
@@ -842,13 +844,23 @@ def owned_job(job_id: str, user: Any) -> Any | None:
 @app.get("/")
 def index():
     locale = current_locale()
+    theme = "system"
+    try:
+        verify_jwt_in_request(optional=True)
+        if get_jwt_identity():
+            user = current_user_row()
+            if user is not None and user.active and user.theme in ACCOUNT_THEMES:
+                theme = user.theme
+    except Exception:
+        # Invalid or expired browser credentials should still receive the public shell.
+        pass
     languages = {
         code: {**language, "name": tr(language["name"])}
         for code, language in LANGS.items()
     }
     response = make_response(render_template(
         "index.html", languages=languages, max_upload_mb=MAX_UPLOAD_MB,
-        locale=locale, locales=LOCALE_LABELS, tr=tr,
+        locale=locale, locales=LOCALE_LABELS, theme=theme, tr=tr,
     ))
     selected = normalize_locale(request.args.get("lang"))
     if selected:
@@ -1036,6 +1048,30 @@ def logout():
 def who_am_i():
     user = current_user_row()
     return jsonify(user=public_user(user)) if user else (jsonify(error=tr("User not found")), 401)
+
+
+@app.patch("/api/auth/me")
+@jwt_required()
+def update_my_preferences():
+    user = current_user_row()
+    if user is None:
+        return jsonify(error=tr("User not found")), 401
+    payload = json_payload()
+    unknown = set(payload) - {"theme"}
+    if unknown:
+        return jsonify(error=tr(
+            "Unknown fields: {fields}", fields=', '.join(sorted(unknown))
+        )), 400
+    theme = payload.get("theme")
+    if theme not in ACCOUNT_THEMES:
+        return jsonify(error=tr("Theme must be system, light, or dark")), 400
+    with transaction(engine) as db:
+        db.execute(update(users).where(users.c.id == user.id).values(
+            theme=theme, updated_at=now(),
+        ))
+    with connection(engine) as db:
+        updated = db.execute(select(users).where(users.c.id == user.id)).first()
+    return jsonify(user=public_user(updated))
 
 
 @app.get("/api/users")

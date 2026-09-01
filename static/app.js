@@ -11,6 +11,19 @@ const state = {
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const unsafeMethods = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const supportedThemes = new Set(['system', 'light', 'dark']);
+const systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+
+function resolvedTheme(theme = document.documentElement.dataset.theme || 'system') {
+  return theme === 'system' ? (systemTheme.matches ? 'dark' : 'light') : theme;
+}
+
+function applyTheme(theme) {
+  const selected = supportedThemes.has(theme) ? theme : 'system';
+  document.documentElement.dataset.theme = selected;
+  const selector = $('#themeSelect');
+  if (selector) selector.value = selected;
+}
 
 function t(message, values = {}) {
   const translated = state.i18n.messages[message] || message;
@@ -136,23 +149,24 @@ async function renderCaptcha(slot, action) {
     return;
   }
   const { provider, site_key: siteKey } = state.authConfig.captcha;
+  const theme = resolvedTheme();
   container.hidden = false;
   if (!siteKey) {
     container.textContent = t('CAPTCHA is temporarily unavailable');
     return;
   }
   const existing = state.captchaWidgets[slot];
-  if (existing && existing.provider === provider
+  if (existing && existing.provider === provider && existing.theme === theme
       && (provider !== 'turnstile' || existing.action === action)) {
     resetCaptcha(slot);
     return;
   }
   removeCaptcha(slot);
   await loadCaptchaSdk(provider);
-  const options = { sitekey: siteKey, theme: 'dark' };
+  const options = { sitekey: siteKey, theme };
   if (provider === 'turnstile') options.action = action;
   const id = captchaApi(provider).render(container, options);
-  state.captchaWidgets[slot] = { id, provider, action };
+  state.captchaWidgets[slot] = { id, provider, action, theme };
 }
 
 function captchaToken(slot, action) {
@@ -177,6 +191,7 @@ function showAuth(setup = false, mode = 'login') {
   state.setup = setup;
   state.authMode = setup ? 'setup' : mode;
   state.user = null;
+  applyTheme('system');
   clearTimeout(state.timer);
   $('#appShell').hidden = true;
   $('#authView').hidden = false;
@@ -205,6 +220,7 @@ function showAuth(setup = false, mode = 'login') {
 
 async function enterApp(user) {
   state.user = user;
+  applyTheme(user.theme);
   $('#authView').hidden = true;
   $('#appShell').hidden = false;
   const admin = user.role === 'admin';
@@ -352,6 +368,29 @@ async function logout() {
   catch (error) { if (error.status !== 401) toast(error.message); }
   const status = await refreshAuthConfiguration();
   showAuth(!status.configured);
+}
+
+async function saveTheme(event) {
+  const selector = event.currentTarget;
+  const previous = state.user?.theme || 'system';
+  const theme = selector.value;
+  applyTheme(theme);
+  selector.disabled = true;
+  try {
+    const data = await api('/api/auth/me', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ theme }),
+    });
+    state.user = data.user;
+    applyTheme(data.user.theme);
+    toast(t('Theme updated'));
+    renderCaptcha('upload', 'upload').catch(error => toast(error.message));
+  } catch (error) {
+    applyTheme(previous);
+    toast(error.message);
+  } finally {
+    selector.disabled = false;
+  }
 }
 
 function configureProviderSelect(selectElement, selected) {
@@ -617,6 +656,7 @@ $('#localeSelect').addEventListener('change', event => {
   window.location.assign(url);
 });
 $('#logoutButton').addEventListener('click', logout);
+$('#themeSelect').addEventListener('change', saveTheme);
 $('#fileInput').addEventListener('change', renderFiles);
 $('#provider').addEventListener('change', updateProviderState);
 $('#translateForm').addEventListener('submit', submitTranslation);
@@ -642,6 +682,12 @@ document.addEventListener('click', event => {
   if (control) showView(control.dataset.viewButton || control.dataset.goView);
 });
 window.addEventListener('hashchange', () => showView(window.location.hash.slice(1), false));
+systemTheme.addEventListener('change', () => {
+  if ((state.user?.theme || 'system') === 'system') {
+    renderCaptcha(state.user ? 'upload' : 'auth', state.user ? 'upload' : state.authMode)
+      .catch(error => toast(error.message));
+  }
+});
 const dropzone = $('#dropzone');
 ['dragenter', 'dragover'].forEach(name => dropzone.addEventListener(name, event => {
   event.preventDefault(); dropzone.classList.add('dragging');

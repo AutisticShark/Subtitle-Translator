@@ -27,6 +27,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import Connection, Engine, make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 
 NAMING_CONVENTION = {
@@ -45,6 +46,13 @@ users = Table(
     Column("username", String(64), nullable=False, unique=True),
     Column("password_hash", Text, nullable=False),
     Column("role", String(16), nullable=False, default="user"),
+    Column(
+        "theme",
+        String(16),
+        nullable=False,
+        default="system",
+        server_default=text("'system'"),
+    ),
     Column("active", Boolean, nullable=False, default=True, server_default=true()),
     Column("token_version", Integer, nullable=False, default=0, server_default=text("0")),
     Column("failed_login_count", Integer, nullable=False, default=0, server_default=text("0")),
@@ -155,6 +163,29 @@ def _migrate_legacy_sqlite(engine: Engine) -> None:
             )
 
 
+def _migrate_user_theme(engine: Engine) -> None:
+    """Add the account theme preference to databases created by older releases."""
+    inspector = inspect(engine)
+    if not inspector.has_table("users"):
+        return
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "theme" not in columns:
+        try:
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE users ADD COLUMN theme "
+                    "VARCHAR(16) NOT NULL DEFAULT 'system'"
+                ))
+        except SQLAlchemyError:
+            # Another startup worker may have completed the same migration.
+            refreshed = inspect(engine)
+            refreshed_columns = {
+                column["name"] for column in refreshed.get_columns("users")
+            }
+            if "theme" not in refreshed_columns:
+                raise
+
+
 def initialize_database(
     engine: Engine,
     defaults: dict[str, str],
@@ -162,6 +193,7 @@ def initialize_database(
 ) -> None:
     _migrate_legacy_sqlite(engine)
     metadata.create_all(engine)
+    _migrate_user_theme(engine)
     with engine.begin() as connection:
         existing = set(connection.execute(select(settings.c.name)).scalars())
         missing = [

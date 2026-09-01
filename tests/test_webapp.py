@@ -332,20 +332,63 @@ class WebApplicationTests(unittest.TestCase):
         self.assertIn(b'id="uploadCaptcha"', page.data)
         self.assertIn(b'name="captcha_provider"', page.data)
         self.assertIn(b'name="registration_enabled"', page.data)
+        self.assertIn(b'id="themeSelect"', page.data)
+        self.assertIn(b'data-theme="system"', page.data)
         self.assertNotIn(b'id="usersDialog"', page.data)
+
+    def test_theme_preference_is_validated_persisted_and_account_scoped(self):
+        self.addCleanup(self.client.patch, "/api/auth/me", json={"theme": "system"})
+
+        invalid = self.client.patch("/api/auth/me", json={"theme": "midnight"})
+        self.assertEqual(invalid.status_code, 400, invalid.get_json())
+        self.assertIn("Theme must be", invalid.get_json()["error"])
+
+        saved = self.client.patch("/api/auth/me", json={"theme": "dark"})
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        self.assertEqual(saved.get_json()["user"]["theme"], "dark")
+        self.assertIn(b'data-theme="dark"', self.client.get("/").data)
+
+        fresh_admin = webapp.app.test_client()
+        login = fresh_admin.post("/api/auth/login", json={
+            "username": "admin", "password": "correct-horse-battery-staple",
+        })
+        self.assertEqual(login.status_code, 200, login.get_json())
+        self.assertEqual(login.get_json()["user"]["theme"], "dark")
+        self.assertIn(b'data-theme="dark"', fresh_admin.get("/").data)
+
+        created = self.client.post("/api/users", json={
+            "username": "theme-user", "password": "theme-user-password", "role": "user",
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        user_id = created.get_json()["user"]["id"]
+        self.addCleanup(self.client.delete, f"/api/users/{user_id}")
+
+        user_client = webapp.app.test_client()
+        user_login = user_client.post("/api/auth/login", json={
+            "username": "theme-user", "password": "theme-user-password",
+        })
+        self.assertEqual(user_login.status_code, 200, user_login.get_json())
+        self.assertEqual(user_login.get_json()["user"]["theme"], "system")
+        user_saved = user_client.patch("/api/auth/me", json={"theme": "light"})
+        self.assertEqual(user_saved.status_code, 200, user_saved.get_json())
+        self.assertEqual(user_saved.get_json()["user"]["theme"], "light")
+        self.assertEqual(
+            self.client.get("/api/auth/me").get_json()["user"]["theme"], "dark",
+        )
+        self.assertIn(b'data-theme="system"', webapp.app.test_client().get("/").data)
 
     def test_ui_locale_detection_catalog_and_persistence(self):
         anonymous = webapp.app.test_client()
         page = anonymous.get("/", headers={"Accept-Language": "zh-Hant, en;q=0.8"})
         self.assertEqual(page.status_code, 200)
-        self.assertIn(b'<html lang="zh-TW">', page.data)
+        self.assertIn(b'<html lang="zh-TW" data-theme="system">', page.data)
         self.assertIn("字幕翻譯器".encode(), page.data)
         self.assertEqual(page.headers["Content-Language"], "zh-TW")
 
         selected = anonymous.get("/?lang=zh-TW")
         self.assertIn("ui_locale=zh-TW", selected.headers["Set-Cookie"])
         persisted = anonymous.get("/")
-        self.assertIn(b'<html lang="zh-TW">', persisted.data)
+        self.assertIn(b'<html lang="zh-TW" data-theme="system">', persisted.data)
 
         catalog = anonymous.get("/api/i18n").get_json()
         self.assertEqual(catalog["locale"], "zh-TW")
@@ -355,7 +398,7 @@ class WebApplicationTests(unittest.TestCase):
         simplified_client = webapp.app.test_client()
         simplified_page = simplified_client.get("/?lang=zh-CN")
         self.assertIn("ui_locale=zh-CN", simplified_page.headers["Set-Cookie"])
-        self.assertIn(b'<html lang="zh-CN">', simplified_page.data)
+        self.assertIn(b'<html lang="zh-CN" data-theme="system">', simplified_page.data)
         self.assertIn("字幕翻译器".encode(), simplified_page.data)
 
         simplified = simplified_client.get("/api/i18n").get_json()

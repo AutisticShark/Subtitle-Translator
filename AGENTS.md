@@ -43,6 +43,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 12. Keep stored job statuses and stages locale-neutral. Localize them while serializing the response so shared jobs can be viewed in different interface languages. Locale selection order is explicit `?lang=`, the non-sensitive `ui_locale` cookie, browser `Accept-Language`, then English fallback.
 13. Keep the Docker runtime manifest synchronized with application imports and non-Python runtime assets. Top-level Python modules are copied with `COPY *.py ./`; asset directories such as `locales/`, `templates/`, and `static/` require explicit copies. A missing `i18n.py` previously made Gunicorn workers fail at boot, and omitting `locales/` would fail catalog loading next.
 14. CAPTCHA is a server-side security boundary, not a trusted browser flag. Keep CAPTCHA secret keys write-only and encrypted, expose only the active provider's public site key, verify every required token against the provider's fixed Siteverify endpoint, and fail closed on missing configuration or provider errors. Validate the returned hostname and the Turnstile action. Retain rate limits because CAPTCHA does not replace request throttling.
+15. Appearance is an account preference, not a global panel setting. Preserve `system`, `light`, and `dark` as the accepted values, render the authenticated preference on the initial HTML response to avoid a theme flash, and recreate theme-sensitive CAPTCHA widgets when the resolved scheme changes.
 
 ## Validation
 

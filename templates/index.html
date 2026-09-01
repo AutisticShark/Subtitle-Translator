@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="{{ locale }}">
+<html lang="{{ locale }}" data-theme="{{ theme }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light dark">
   <title>{{ tr('Subtitle Translator') }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
 </head>
@@ -74,7 +74,17 @@
           <span class="eyebrow" id="viewEyebrow">{{ tr('Workspace overview') }}</span>
           <h1 id="viewTitle">{{ tr('Dashboard') }}</h1>
         </div>
-        <button class="primary topbar-action" type="button" data-go-view="translate">{{ tr('New translation') }} <span>→</span></button>
+        <div class="topbar-actions">
+          <label class="theme-picker">
+            <span>{{ tr('Appearance') }}</span>
+            <select id="themeSelect" aria-label="{{ tr('Appearance') }}">
+              <option value="system">{{ tr('System theme') }}</option>
+              <option value="light">{{ tr('Light') }}</option>
+              <option value="dark">{{ tr('Dark') }}</option>
+            </select>
+          </label>
+          <button class="primary topbar-action" type="button" data-go-view="translate">{{ tr('New translation') }} <span>→</span></button>
+        </div>
       </header>
 
       <main class="content">

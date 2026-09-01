@@ -12,6 +12,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Self-service user registration with administrator control
 - Server-verified Cloudflare Turnstile, Google reCAPTCHA v2, or hCaptcha protection for login, registration, and uploads
 - Localized web interface with browser-language detection and a persistent language selector
+- Light, dark, and device-matched themes with a preference saved to each account
 - Administrator-only user management and encrypted, write-only provider keys
 - Per-user job isolation, with administrator access to cross-user job cleanup
 - SQLite by default, plus PostgreSQL and MariaDB/MySQL through SQLAlchemy
@@ -62,6 +63,10 @@ CAPTCHA can instead be bootstrapped with `CAPTCHA_PROVIDER`, `CAPTCHA_HOSTNAME`,
 The web interface supports English, Traditional Chinese, and Simplified Chinese. It chooses a language from an explicit `?lang=` selection, the saved `ui_locale` cookie, or the browser's `Accept-Language` header, in that order. `zh-Hant` variants select Traditional Chinese, while `zh`, `zh-Hans`, `zh-CN`, and `zh-SG` select Simplified Chinese. Use the language selector in the lower-right corner to save a preference. Unsupported or missing strings fall back to English.
 
 Localization catalogs live in `locales/*.json`. Each catalog declares its locale code, display name, aliases, and translated messages; adding a valid catalog makes that locale available automatically. Stored job states remain locale-neutral so the same job can be rendered in each viewer's selected language. Technical provider and subtitle-parser errors remain unchanged to preserve their diagnostic details.
+
+### Appearance
+
+Signed-in users can choose **System theme**, **Light**, or **Dark** from the appearance selector in the top bar. The choice is stored on the user account, so it follows that account to other browsers and devices. **System theme** follows the device's `prefers-color-scheme` setting; signed-out and first-time views also use the system theme.
 
 The Settings portal also controls translation-submission rate limits. Regular-user and administrator limits apply independently to each account, while the panel-wide limit covers all accounts. The shared window is configurable from 1 minute to 7 days; `0` disables an individual limit. Each uploaded subtitle counts as one job, and a multi-file request is accepted or rejected as a unit. Counters are stored in the application database so limits remain effective across restarts and multiple web workers.
 

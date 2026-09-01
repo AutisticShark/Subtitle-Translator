@@ -88,3 +88,48 @@ def test_legacy_sqlite_jobs_gain_ownership_without_losing_records():
             assert row == ("legacy", None, "failed")
         finally:
             engine.dispose()
+
+
+def test_existing_users_gain_a_system_theme_preference():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "legacy-users.db"
+        with closing(sqlite3.connect(path)) as legacy_connection:
+            legacy_connection.executescript("""
+                CREATE TABLE users (
+                    id VARCHAR(32) PRIMARY KEY,
+                    username VARCHAR(64) NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    role VARCHAR(16) NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT 1,
+                    token_version INTEGER NOT NULL DEFAULT 0,
+                    failed_login_count INTEGER NOT NULL DEFAULT 0,
+                    locked_until VARCHAR(40),
+                    created_at VARCHAR(40) NOT NULL,
+                    updated_at VARCHAR(40) NOT NULL
+                );
+                INSERT INTO users (
+                    id, username, password_hash, role, created_at, updated_at
+                ) VALUES (
+                    'legacy-user', 'legacy', 'hash', 'user',
+                    '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                );
+            """)
+            legacy_connection.commit()
+        engine = create_database_engine(path)
+        try:
+            initialize_database(
+                engine, {"default_provider": "anthropic"},
+                "2026-01-02T00:00:00+00:00",
+            )
+            with closing(sqlite3.connect(path)) as verification_connection:
+                columns = {
+                    row[1]
+                    for row in verification_connection.execute("PRAGMA table_info(users)")
+                }
+                theme = verification_connection.execute(
+                    "SELECT theme FROM users WHERE id='legacy-user'"
+                ).fetchone()[0]
+            assert "theme" in columns
+            assert theme == "system"
+        finally:
+            engine.dispose()

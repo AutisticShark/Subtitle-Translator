@@ -124,3 +124,9 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Cloudflare Turnstile, Google reCAPTCHA v2, and hCaptcha share one server-side verification boundary. Only the selected provider's site key and protected-action list are public. CAPTCHA secret keys use the existing `enc:v1:` encrypted, write-only settings path.
 - Login, registration, and upload protection can be selected independently. A required token is posted only to a fixed provider verification URL with a bounded timeout. Missing keys, network failures, invalid JSON, rejected or replayed tokens, hostname mismatches, and Turnstile action mismatches all fail closed.
 - CAPTCHA complements the existing login/registration request throttles and persistent translation-job quotas; it does not replace them. Browser widget rendering and third-party connectivity still require a live browser/deployment smoke test beyond the mocked offline provider tests.
+
+## Account appearance preferences
+
+- Theme selection is per account, not an administrator-controlled panel setting. The `users.theme` value accepts `system`, `light`, or `dark`; existing databases are migrated to `system`, and `/api/auth/me` returns and updates the signed-in user's own preference.
+- Render the authenticated account theme on the initial HTML response to avoid a wrong-theme flash before JavaScript loads. Signed-out views use `system`, and CSS resolves that value with `prefers-color-scheme`.
+- Theme-aware CAPTCHA widgets must be recreated when the resolved color scheme changes because resetting an existing provider widget does not change its visual theme.
