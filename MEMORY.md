@@ -135,3 +135,8 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 
 - The CLI sidecar cache is untrusted because a user can edit it between runs. Load it through `json.load` and retain only the expected mapping of 24-character lowercase hexadecimal content hashes to translated strings.
 - Keep path selection separate from cache serialization: open the already-selected sidecar path first, then stream the cache with `json.dump`. Passing `json.dumps(cache)` to `Path.write_text` caused Sonar rule `pythonsecurity:S2083` to trace untrusted cache content into an I/O path sink even though the value was intended as file content.
+
+## Development server network boundary
+
+- `python webapp.py` is the local development entry point and must bind only to loopback, matching the documented `localhost` URL and Sonar rule `python:S8392`.
+- Docker remains network-accessible through the separate Gunicorn command. Do not change its container-side listener when restricting Flask's development server.

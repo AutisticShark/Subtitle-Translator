@@ -45,6 +45,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 14. CAPTCHA is a server-side security boundary, not a trusted browser flag. Keep CAPTCHA secret keys write-only and encrypted, expose only the active provider's public site key, verify every required token against the provider's fixed Siteverify endpoint, and fail closed on missing configuration or provider errors. Validate the returned hostname and the Turnstile action. Retain rate limits because CAPTCHA does not replace request throttling.
 15. Appearance is an account preference, not a global panel setting. Preserve `system`, `light`, and `dark` as the accepted values, render the authenticated preference on the initial HTML response to avoid a theme flash, and recreate theme-sensitive CAPTCHA widgets when the resolved scheme changes.
 16. Treat CLI sidecar caches as untrusted input. Load them through a file handle, accept only the expected 24-character lowercase hexadecimal hash keys with string values, and stream JSON back to the already-selected file handle. Do not feed serialized cache content to `Path.write_text`; besides obscuring the data/path boundary, Sonar rule `pythonsecurity:S2083` can treat that content as a path-injection flow.
+17. Keep the direct `python webapp.py` development server bound to a loopback address. Network-facing container access belongs to the production Gunicorn command in `Dockerfile`; do not expose Flask's development server on every interface.
 
 ## Validation
 
