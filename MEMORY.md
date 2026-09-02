@@ -130,3 +130,8 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Theme selection is per account, not an administrator-controlled panel setting. The `users.theme` value accepts `system`, `light`, or `dark`; existing databases are migrated to `system`, and `/api/auth/me` returns and updates the signed-in user's own preference.
 - Render the authenticated account theme on the initial HTML response to avoid a wrong-theme flash before JavaScript loads. Signed-out views use `system`, and CSS resolves that value with `prefers-color-scheme`.
 - Theme-aware CAPTCHA widgets must be recreated when the resolved color scheme changes because resetting an existing provider widget does not change its visual theme.
+
+## Translation-cache I/O boundary
+
+- The CLI sidecar cache is untrusted because a user can edit it between runs. Load it through `json.load` and retain only the expected mapping of 24-character lowercase hexadecimal content hashes to translated strings.
+- Keep path selection separate from cache serialization: open the already-selected sidecar path first, then stream the cache with `json.dump`. Passing `json.dumps(cache)` to `Path.write_text` caused Sonar rule `pythonsecurity:S2083` to trace untrusted cache content into an I/O path sink even though the value was intended as file content.

@@ -896,6 +896,34 @@ def output_path(src: Path, tgt_key: str, outdir: Path | None) -> Path:
     return (outdir or src.parent) / name
 
 
+_CACHE_KEY_RE = re.compile(r"[0-9a-f]{24}")
+
+
+def load_translation_cache(cache_path: Path) -> dict[str, str]:
+    """Load only the hash-to-text entries expected in a translation cache."""
+    try:
+        with cache_path.open("r", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        key: value
+        for key, value in payload.items()
+        if isinstance(key, str)
+        and _CACHE_KEY_RE.fullmatch(key)
+        and isinstance(value, str)
+    }
+
+
+def save_translation_cache(cache_path: Path, cache: dict[str, str]) -> None:
+    """Write cache data to an already-selected sidecar file."""
+    with cache_path.open("w", encoding="utf-8", newline="") as cache_file:
+        json.dump(cache, cache_file, ensure_ascii=False)
+
+
 def process(path: Path, args, provider, throttle: Throttle) -> None:
     raw = path.read_bytes()
     bom = raw.startswith(b"\xef\xbb\xbf")
@@ -913,12 +941,7 @@ def process(path: Path, args, provider, throttle: Throttle) -> None:
         segs.extend(segment_cue(cue, ci))
 
     cache_path = path.with_suffix(path.suffix + ".xlate-cache.json")
-    cache: dict = {}
-    if cache_path.exists() and not args.no_cache:
-        try:
-            cache = json.loads(cache_path.read_text("utf-8"))
-        except Exception:
-            cache = {}
+    cache = load_translation_cache(cache_path) if not args.no_cache else {}
 
     for tgt_key in args.langs:
         dest = output_path(path, tgt_key, args.outdir)
@@ -939,7 +962,7 @@ def process(path: Path, args, provider, throttle: Throttle) -> None:
         print(f"  -> {dest}", file=sys.stderr)
 
         if not args.no_cache:
-            cache_path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+            save_translation_cache(cache_path, cache)
 
     if args.zh_tw_mode == "opencc" and "zh-CN" in args.langs and "zh-TW" not in args.langs:
         convert_opencc(output_path(path, "zh-CN", args.outdir),

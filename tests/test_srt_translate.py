@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from srt_translate import (
     TranslationError,
     _parse_retry_after,
     display_width,
+    load_translation_cache,
     main,
     mask_tags,
     output_path,
@@ -21,6 +23,7 @@ from srt_translate import (
     parse_srt,
     rebuild_cues,
     resolve_key,
+    save_translation_cache,
     segment_cue,
     translate_segments,
     unmask_tags,
@@ -212,6 +215,30 @@ class CliTests(unittest.TestCase):
             output_path(Path("episode.en.srt"), "zh-TW", Path("translated")),
             Path("translated/episode.zh.tw.srt"),
         )
+
+    def test_translation_cache_rejects_unexpected_untrusted_entries(self):
+        valid_key = "a" * 24
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "input.srt.xlate-cache.json"
+            with cache_path.open("w", encoding="utf-8") as cache_file:
+                json.dump({
+                    valid_key: "Hola",
+                    "../outside.json": "not a cache key",
+                    "b" * 24: ["not", "text"],
+                }, cache_file)
+
+            self.assertEqual(load_translation_cache(cache_path), {valid_key: "Hola"})
+
+    def test_translation_cache_treats_path_like_values_as_json_data(self):
+        cache = {"a" * 24: "../../outside.json"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "input.srt.xlate-cache.json"
+
+            save_translation_cache(cache_path, cache)
+
+            with cache_path.open("r", encoding="utf-8") as cache_file:
+                self.assertEqual(json.load(cache_file), cache)
+            self.assertEqual(set(Path(temp_dir).iterdir()), {cache_path})
 
     def test_resolve_key_supports_file_stdin_and_environment(self):
         with tempfile.TemporaryDirectory() as temp_dir:
