@@ -46,6 +46,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 15. Appearance is an account preference, not a global panel setting. Preserve `system`, `light`, and `dark` as the accepted values, render the authenticated preference on the initial HTML response to avoid a theme flash, and recreate theme-sensitive CAPTCHA widgets when the resolved scheme changes.
 16. Treat CLI sidecar caches as untrusted input. Load them through a file handle, accept only the expected 24-character lowercase hexadecimal hash keys with string values, and stream JSON back to the already-selected file handle. Do not feed serialized cache content to `Path.write_text`; besides obscuring the data/path boundary, Sonar rule `pythonsecurity:S2083` can treat that content as a path-injection flow.
 17. Keep the direct `python webapp.py` development server bound to a loopback address. Network-facing container access belongs to the production Gunicorn command in `Dockerfile`; do not expose Flask's development server on every interface.
+18. Redis is a disposable read cache. Every settings or job mutation must bump its `cache_revisions` marker in the same SQL transaction, including ownership changes and startup recovery. Cache raw locale-neutral rows, scope job keys by account/admin view, and keep authentication, quotas, mutations, and download authorization in SQL. Never make Redis invalidation or availability a prerequisite for correctness.
 
 ## Validation
 

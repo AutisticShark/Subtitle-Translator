@@ -16,6 +16,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Administrator-only user management and encrypted, write-only provider keys
 - Per-user job isolation, with administrator access to cross-user job cleanup
 - SQLite by default, plus PostgreSQL and MariaDB/MySQL through SQLAlchemy
+- Optional Redis cache for settings and frequently polled job lists/details, with SQL fallback
 - Context-aware batching, shared rate-limit backoff, retries, resumable per-job cache, tag masking, and subtitle-aware line wrapping
 - Docker health check, persistent named volume, CSRF-protected HttpOnly auth cookies, and bearer-token API support
 - The original CLI remains available
@@ -81,6 +82,30 @@ mysql://subtitle:password@mysql/subtitle?charset=utf8mb4
 ```
 
 Ordinary PostgreSQL, MariaDB, and MySQL URLs are normalized to the bundled `pg8000` and `PyMySQL` drivers. URL-encode special characters in credentials. The job files still live below `DATA_DIR`; changing the relational database does not move uploads or translated outputs to object storage.
+
+### Redis caching
+
+Docker Compose includes a private Redis service and enables caching by default. It has no published port, uses an internal network, and caps cached data at 128 MB with LRU eviction. Persistence is disabled because every cached value can be reconstructed from SQL. Redis startup or downtime does not block application startup; reads fall back to SQL with 250 ms connection/command timeouts and a five-second retry cooldown.
+
+| Data | Storage and cache behavior |
+|---|---|
+| Panel settings, provider configuration, registration/CAPTCHA configuration | SQL remains authoritative; Redis caches the stored settings snapshot. Responses still mask secrets and apply the current request's language. |
+| Job lists and detail polling | Redis caches raw rows, scoped to the requesting account or explicit administrator view and list limit. Stages are localized after retrieval. |
+| Accounts, roles, token versions, logout revocations | Read directly from SQL so authentication changes take effect immediately. |
+| Job submission quotas, cancellation, deletion, download authorization | Enforced directly in SQL; quota counters and job inserts remain in one transaction. |
+| Uploads, translated outputs, resumable translation caches | Remain in the persistent data volume. |
+
+Settings and job writes change a random revision in the new `cache_revisions` SQL table **in the same transaction**. Cache reads check that revision before looking up Redis. This replaces full result queries with a small primary-key lookup on cache hits, and prevents an old cache value from being reused after a committed change, even if Redis was unavailable during the write. An in-flight reader can finish with its pre-change snapshot. All job changes invalidate the job cache; active workloads with frequent progress updates may therefore have fewer cache hits. No user/job/settings data is migrated out of SQL.
+
+Cache payloads are encrypted and authenticated using the application's existing Fernet key, and bound to their cache key. Plaintext secrets and subtitle metadata are not stored in Redis. Keep the existing JWT/encryption keys stable. Entries expire after `REDIS_CACHE_TTL` seconds (default `60`, accepted range `1`–`3600`); eviction, expiry, invalid payloads, and Redis failures all cause database reads. Do not edit cached SQL tables directly while the app is running: maintenance scripts must also update the relevant revision in the same transaction, or restart the app afterward.
+
+Set these variables in `.env` for Compose, or export them for a non-Docker process:
+
+- `REDIS_URL`: Compose defaults to `redis://redis:6379/0`. An explicitly blank value disables caching; outside Compose, unset also disables it. For an external service, use its authenticated `redis://` or TLS `rediss://` URL.
+- `REDIS_CACHE_TTL`: expiration in seconds.
+- `REDIS_KEY_PREFIX`: default `subtitle-translator`; choose a distinct value for independent deployments sharing Redis. Keys also include a hash of the database URL.
+
+Apply an upgrade with `docker compose up -d --build`; startup creates the revision table and retains existing records. Redis needs no backup; continue backing up the SQL database, data volume, and encryption key. To run only the app with caching disabled, set `REDIS_URL=` and use `docker compose up -d --build subtitle-translator` (stop an existing Redis container with `docker compose stop redis` if desired). This cache does not change the in-process job executor: retain the Dockerfile's single Gunicorn worker.
 
 ## Run without Docker
 

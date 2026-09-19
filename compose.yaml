@@ -7,6 +7,10 @@ services:
       - "${PORT:-8000}:8000"
     environment:
       DATABASE_URL: "${DATABASE_URL:-}"
+      # An explicitly blank REDIS_URL disables caching. Unset uses this stack's Redis.
+      REDIS_URL: "${REDIS_URL-redis://redis:6379/0}"
+      REDIS_CACHE_TTL: "${REDIS_CACHE_TTL:-60}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-subtitle-translator}"
       JWT_SECRET_KEY: "${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}"
       API_KEY_ENCRYPTION_KEY: "${API_KEY_ENCRYPTION_KEY:-}"
       JWT_COOKIE_SECURE: "${JWT_COOKIE_SECURE:-0}"
@@ -36,6 +40,30 @@ services:
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
     volumes:
       - subtitle_data:/app/data
+    networks:
+      - default
+      - cache
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    mem_limit: 192m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    # Cache only: no published port or persistent data volume.
+    tmpfs:
+      - /data
+    networks:
+      - cache
+
+networks:
+  default:
+  cache:
+    internal: true
 
 volumes:
   subtitle_data:

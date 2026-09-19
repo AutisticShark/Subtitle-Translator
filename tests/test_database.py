@@ -3,16 +3,45 @@ import sqlite3
 import tempfile
 from contextlib import closing
 
+import pytest
+from sqlalchemy import select
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from database import (
+    bump_cache_revision,
+    cache_revisions,
     create_database_engine,
     initialize_database,
     jobs,
     metadata,
     normalize_database_url,
 )
+
+
+def test_cache_revision_changes_roll_back_with_data_and_refresh_at_startup(tmp_path):
+    engine = create_database_engine(tmp_path / "cache.db")
+    try:
+        initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")
+        statement = select(cache_revisions.c.revision).where(cache_revisions.c.name == "jobs")
+        with engine.connect() as db:
+            original = db.scalar(statement)
+        with pytest.raises(RuntimeError), engine.begin() as db:
+            bump_cache_revision(db, "jobs")
+            assert db.scalar(statement) != original
+            raise RuntimeError("rollback")
+        with engine.connect() as db:
+            assert db.scalar(statement) == original
+        with engine.begin() as db:
+            bump_cache_revision(db, "jobs")
+        with engine.connect() as db:
+            committed = db.scalar(statement)
+            assert committed != original
+        initialize_database(engine, {}, "2026-01-02T00:00:00+00:00")
+        with engine.connect() as db:
+            assert db.scalar(statement) != committed
+    finally:
+        engine.dispose()
 
 
 def test_database_url_aliases_select_installed_drivers():

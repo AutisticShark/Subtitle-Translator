@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
@@ -109,6 +110,21 @@ revoked_tokens = Table(
     Column("created_at", String(40), nullable=False),
 )
 
+# Updated in the same SQL transaction as the records being cached. Redis never
+# owns these markers, so an outage cannot lose an invalidation.
+cache_revisions = Table(
+    "cache_revisions",
+    metadata,
+    Column("name", String(32), primary_key=True),
+    Column("revision", String(32), nullable=False),
+)
+
+
+def bump_cache_revision(db: Connection, name: str) -> None:
+    db.execute(update(cache_revisions).where(cache_revisions.c.name == name).values(
+        revision=uuid.uuid4().hex,
+    ))
+
 
 def normalize_database_url(raw_url: str | None, sqlite_path: Path) -> str:
     """Return an explicit SQLAlchemy URL with supported production drivers."""
@@ -195,6 +211,14 @@ def initialize_database(
     metadata.create_all(engine)
     _migrate_user_theme(engine)
     with engine.begin() as connection:
+        existing_revisions = set(connection.execute(select(cache_revisions.c.name)).scalars())
+        for name in ("settings", "jobs"):
+            if name not in existing_revisions:
+                connection.execute(cache_revisions.insert().values(
+                    name=name, revision=uuid.uuid4().hex,
+                ))
+            else:
+                bump_cache_revision(connection, name)
         existing = set(connection.execute(select(settings.c.name)).scalars())
         missing = [
             {"name": name, "value": value, "updated_at": timestamp}

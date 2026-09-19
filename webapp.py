@@ -38,9 +38,11 @@ from sqlalchemy.exc import IntegrityError
 from werkzeug.utils import secure_filename
 
 from database import (
+    bump_cache_revision, cache_revisions,
     connection, create_database_engine, initialize_database, jobs, revoked_tokens,
     rate_limit_buckets, settings as settings_table, transaction, users,
 )
+from redis_cache import RedisCache
 from i18n import (
     LOCALE_COOKIE, LOCALE_LABELS, current_locale, messages_for, normalize_locale,
     translate as tr,
@@ -184,6 +186,9 @@ def encryption_key() -> bytes:
 
 
 secret_cipher = Fernet(encryption_key())
+read_cache = RedisCache.from_environment(
+    secret_cipher, engine.url.render_as_string(hide_password=False),
+)
 password_hasher = PasswordHasher()
 DUMMY_PASSWORD_HASH = password_hasher.hash(secrets.token_urlsafe(32))
 
@@ -318,6 +323,7 @@ def bootstrap_admin() -> None:
                 locked_until=None, created_at=timestamp, updated_at=timestamp,
             ))
             db.execute(update(jobs).where(jobs.c.user_id.is_(None)).values(user_id=user_id))
+            bump_cache_revision(db, "jobs")
     except IntegrityError:
         with connection(engine) as db:
             if not db.scalar(select(func.count()).select_from(users)):
@@ -369,6 +375,7 @@ def encrypt_existing_api_keys() -> None:
                 db.execute(update(settings_table).where(
                     settings_table.c.name == row.name
                 ).values(value=encrypt_secret(row.value), updated_at=now()))
+        bump_cache_revision(db, "settings")
 
 
 encrypt_existing_api_keys()
@@ -459,11 +466,26 @@ def security_headers(response):
     return response
 
 
-def read_settings(include_secrets: bool = False) -> dict[str, Any]:
+def cached_rows(name: str, scope: str, statement) -> list[dict[str, Any]]:
+    """Read a revision in SQL before using Redis; cache raw, locale-neutral rows."""
     with connection(engine) as db:
-        values = dict(db.execute(select(
-            settings_table.c.name, settings_table.c.value
-        )).all())
+        def load():
+            return [dict(row) for row in db.execute(statement).mappings()]
+
+        if not read_cache.available:
+            return load()
+        revision = db.scalar(select(cache_revisions.c.revision).where(
+            cache_revisions.c.name == name,
+        ))
+        if revision is None:
+            return load()
+        return read_cache.remember(f"{name}:{revision}:{scope}", load)
+
+
+def read_settings(include_secrets: bool = False) -> dict[str, Any]:
+    values = {row["name"]: row["value"] for row in cached_rows(
+        "settings", "all", select(settings_table.c.name, settings_table.c.value),
+    )}
     result: dict[str, Any] = {key: values.get(key, default) for key, default in DEFAULTS.items()}
     providers = available_providers()
     if result["default_provider"] not in providers:
@@ -687,6 +709,7 @@ def update_job(job_id: str, **fields: Any) -> None:
     fields["updated_at"] = now()
     with db_lock, transaction(engine) as db:
         db.execute(update(jobs).where(jobs.c.id == job_id).values(**fields))
+        bump_cache_revision(db, "jobs")
 
 
 def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool:
@@ -695,6 +718,8 @@ def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool
         result = db.execute(update(jobs).where(
             jobs.c.id == job_id, jobs.c.status.in_(statuses)
         ).values(**fields))
+        if result.rowcount:
+            bump_cache_revision(db, "jobs")
         return result.rowcount == 1
 
 
@@ -916,6 +941,7 @@ def setup_first_admin():
                 locked_until=None, created_at=timestamp, updated_at=timestamp,
             ))
             db.execute(update(jobs).where(jobs.c.user_id.is_(None)).values(user_id=user_id))
+            bump_cache_revision(db, "jobs")
     except IntegrityError:
         return jsonify(error=tr("Initial setup is already complete")), 409
     with connection(engine) as db:
@@ -1189,6 +1215,7 @@ def delete_user(user_id: str):
             rate_limit_buckets.c.scope == f"user:{user_id}"
         ))
         db.execute(delete(users).where(users.c.id == user_id))
+        bump_cache_revision(db, "jobs")
     return jsonify(deleted=user_id)
 
 
@@ -1298,6 +1325,7 @@ def save_settings():
                 ))
         if RATE_LIMIT_KEYS & payload.keys():
             db.execute(delete(rate_limit_buckets))
+        bump_cache_revision(db, "settings")
     return jsonify(read_settings())
 
 
@@ -1316,6 +1344,7 @@ def delete_key(provider: str):
         return jsonify(error=tr("Disable CAPTCHA before removing its active secret key")), 409
     with db_lock, transaction(engine) as db:
         db.execute(delete(settings_table).where(settings_table.c.name == key))
+        bump_cache_revision(db, "settings")
     return jsonify(read_settings())
 
 
@@ -1374,6 +1403,7 @@ def create_jobs():
                         status="queued", progress=0, stage="", options=json.dumps(options),
                         outputs="[]", error=None, created_at=timestamp, updated_at=timestamp,
                     ))
+                bump_cache_revision(db, "jobs")
     except Exception:
         for _job_id, folder, _original, _stored in pending:
             shutil.rmtree(folder, ignore_errors=True)
@@ -1402,8 +1432,7 @@ def list_jobs():
     ).order_by(jobs.c.created_at.desc()).limit(limit)
     if not show_all:
         statement = statement.where(jobs.c.user_id == user.id)
-    with connection(engine) as db:
-        rows = db.execute(statement).all()
+    rows = cached_rows("jobs", f"list:{'all' if show_all else user.id}:{limit}", statement)
     return jsonify(jobs=[job_dict(row, include_owner=show_all) for row in rows])
 
 
@@ -1411,7 +1440,11 @@ def list_jobs():
 @jwt_required()
 def get_job(job_id: str):
     user = current_user_row()
-    row = owned_job(job_id, user)
+    statement = select(jobs).where(jobs.c.id == job_id)
+    if user.role != "admin":
+        statement = statement.where(jobs.c.user_id == user.id)
+    rows = cached_rows("jobs", f"detail:{user.role}:{user.id}:{job_id}", statement)
+    row = rows[0] if rows else None
     return jsonify(job_dict(row)) if row else (jsonify(error=tr("Job not found")), 404)
 
 
@@ -1434,6 +1467,7 @@ def cancel_job(job_id: str):
         db.execute(update(jobs).where(jobs.c.id == job_id).values(
             status="canceling", stage="Canceling", updated_at=now()
         ))
+        bump_cache_revision(db, "jobs")
         cancel_event_for(job_id).set()
         row = db.execute(select(jobs).where(jobs.c.id == job_id)).first()
     return jsonify(job_dict(row)), 202
@@ -1462,6 +1496,7 @@ def delete_job(job_id: str):
         except OSError:
             return jsonify(error=tr("Could not delete the job files")), 500
         db.execute(delete(jobs).where(jobs.c.id == job_id))
+        bump_cache_revision(db, "jobs")
         with cancel_events_lock:
             cancel_events.pop(job_id, None)
     return jsonify(deleted=job_id)

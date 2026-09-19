@@ -7,12 +7,13 @@ import threading
 import time
 import unittest
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 _data_directory = tempfile.TemporaryDirectory()
 os.environ["DATA_DIR"] = _data_directory.name
 os.environ["JOB_WORKERS"] = "1"
+os.environ["REDIS_URL"] = ""  # Never connect to deployment Redis in offline tests.
 os.environ["JWT_SECRET_KEY"] = "test-jwt-secret-that-is-long-and-stable-for-tests"
 os.environ["ADMIN_USERNAME"] = "admin"
 os.environ["ADMIN_PASSWORD"] = "correct-horse-battery-staple"
@@ -21,6 +22,112 @@ import webapp  # noqa: E402  (environment must be configured before import)
 
 
 class WebApplicationTests(unittest.TestCase):
+    def enable_cache(self):
+        client = Mock()
+        client.values = {}
+        client.get.side_effect = client.values.get
+
+        def put(key, value, *, ex):
+            client.values[key] = value
+            return True
+
+        client.set.side_effect = put
+        cache = webapp.RedisCache(client, webapp.secret_cipher, "web-tests")
+        patcher = patch.object(webapp, "read_cache", cache)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return client
+
+    def test_settings_cache_hits_mask_secrets_and_survive_outage_writes(self):
+        from redis.exceptions import ConnectionError
+        from sqlalchemy import event
+
+        client = self.enable_cache()
+        self.client.put("/api/settings", json={"openai_api_key": "cache-private-key"})
+        statements = []
+
+        def record(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement)
+
+        event.listen(webapp.engine, "before_cursor_execute", record)
+        try:
+            first = self.client.get("/api/settings").get_json()
+            second = self.client.get("/api/settings").get_json()
+        finally:
+            event.remove(webapp.engine, "before_cursor_execute", record)
+        self.assertEqual(first, second)
+        self.assertTrue(first["configured"]["openai"])
+        self.assertNotIn("openai_api_key", first)
+        self.assertFalse(any("FROM settings" in sql for sql in statements))
+        self.assertTrue(any("FROM cache_revisions" in sql for sql in statements))
+        self.assertFalse(any(b"cache-private-key" in raw for raw in client.values.values()))
+        self.assertEqual(webapp.read_settings(True)["openai_api_key"], "cache-private-key")
+
+        # Preserve old Redis entries while a committed write happens during outage.
+        client.get.side_effect = ConnectionError("offline")
+        response = self.client.put("/api/settings", json={"registration_enabled": "0"})
+        self.assertEqual(response.status_code, 200)
+        client.get.side_effect = client.values.get
+        webapp.read_cache._retry_at = 0
+        self.assertFalse(self.client.get("/api/auth/setup-status").get_json()[
+            "registration_enabled"
+        ])
+        self.client.delete("/api/settings/keys/openai")
+        self.assertFalse(self.client.get("/api/settings").get_json()["configured"]["openai"])
+
+    def test_cached_jobs_refresh_on_progress_cancel_complete_and_delete(self):
+        self.insert_job("cached-lifecycle", status="processing")
+        client = self.enable_cache()
+        url = "/api/jobs/cached-lifecycle"
+        self.assertEqual(self.client.get(url).get_json()["status"], "processing")
+        first_list = self.client.get("/api/jobs?all=1").get_json()
+        writes = client.set.call_count
+        self.assertEqual(self.client.get("/api/jobs?all=1").get_json(), first_list)
+        self.client.get(url)
+        self.assertEqual(client.set.call_count, writes)
+        webapp.update_job("cached-lifecycle", progress=40, stage="Translating")
+        self.assertEqual(self.client.get(url).get_json()["progress"], 40)
+        self.assertEqual(self.client.post(url + "/cancel").status_code, 202)
+        self.assertEqual(self.client.get(url).get_json()["status"], "canceling")
+        self.assertFalse(webapp.update_job_if_status(
+            "cached-lifecycle", {"processing"}, status="completed",
+        ))
+        self.assertTrue(webapp.update_job_if_status(
+            "cached-lifecycle", {"canceling"}, status="canceled", stage="Canceled",
+        ))
+        self.assertEqual(self.client.get(url).get_json()["status"], "canceled")
+        self.assertEqual(self.client.delete(url).status_code, 200)
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertNotIn("cached-lifecycle", {
+            row["id"] for row in self.client.get("/api/jobs?all=1").get_json()["jobs"]
+        })
+
+    def test_old_cache_fill_cannot_overwrite_a_committed_settings_change(self):
+        client = self.enable_cache()
+        normal_set = client.set.side_effect
+
+        def racing_set(key, value, *, ex):
+            client.set.side_effect = normal_set
+            with webapp.transaction(webapp.engine) as db:
+                db.execute(webapp.update(webapp.settings_table).where(
+                    webapp.settings_table.c.name == "registration_enabled",
+                ).values(value="0", updated_at=webapp.now()))
+                webapp.bump_cache_revision(db, "settings")
+            return normal_set(key, value, ex=ex)
+
+        client.set.side_effect = racing_set
+        self.assertEqual(webapp.read_settings()["registration_enabled"], "1")
+        # The old fill still exists, but the committed revision makes it unreachable.
+        self.assertEqual(webapp.read_settings()["registration_enabled"], "0")
+        self.assertEqual(len(client.values), 2)
+
+    def test_cached_authorization_localization_and_quota_regressions(self):
+        self.enable_cache()
+        self.test_regular_users_are_denied_admin_apis_and_other_users_jobs()
+        self.test_deactivating_user_revokes_existing_token()
+        self.test_api_errors_and_job_stages_follow_request_locale()
+        self.test_regular_users_and_administrators_have_separate_per_account_limits()
+
     def setUp(self):
         webapp.app.config.update(TESTING=True, DEBUG=True, JWT_COOKIE_CSRF_PROTECT=False)
         self.client = webapp.app.test_client()
@@ -1040,6 +1147,14 @@ class WebApplicationTests(unittest.TestCase):
         self.assertFalse(bob.get("/api/jobs").get_json()["jobs"])
         all_jobs = self.client.get("/api/jobs?all=1").get_json()["jobs"]
         self.assertEqual(next(job for job in all_jobs if job["id"] == job_id)["owner"], "alice")
+        # Warm authorized views before repeating unauthorized reads.
+        self.assertEqual(alice.get(f"/api/jobs/{job_id}").status_code, 200)
+        self.assertEqual(self.client.get(f"/api/jobs/{job_id}").status_code, 200)
+        self.assertEqual(bob.get(f"/api/jobs/{job_id}").status_code, 404)
+        self.assertFalse(bob.get("/api/jobs?all=1").get_json()["jobs"])
+        self.assertEqual(bob.post(f"/api/jobs/{job_id}/cancel").status_code, 404)
+        self.assertEqual(bob.delete(f"/api/jobs/{job_id}").status_code, 404)
+        self.assertEqual(bob.get(f"/api/jobs/{job_id}/download").status_code, 404)
 
         self.assertEqual(self.client.post(f"/api/jobs/{job_id}/cancel").status_code, 202)
         webapp.run_job(job_id)

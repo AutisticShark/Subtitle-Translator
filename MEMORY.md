@@ -140,3 +140,10 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 
 - `python webapp.py` is the local development entry point and must bind only to loopback, matching the documented `localhost` URL and Sonar rule `python:S8392`.
 - Docker remains network-accessible through the separate Gunicorn command. Do not change its container-side listener when restricting Flask's development server.
+
+## Optional Redis read cache
+
+- Settings snapshots and job list/detail polling use encrypted Redis entries; the database remains authoritative. Each read checks a SQL revision, and each relevant write changes that revision in the same transaction. Old fills and writes during Redis outages cannot make old entries current again.
+- Job creation, progress, conditional terminal transitions, cancellation, deletion, first-admin legacy ownership claims, and user deletion all invalidate the job revision. Settings updates, secret removal/migration, and startup invalidate settings revisions. Future mutation paths and direct maintenance scripts must preserve this rule.
+- Cache raw rows before localization and secret masking; keys distinguish account/admin view and list limit. Authentication, token revocation, quotas, and downloads continue to read SQL directly. Redis payloads use authenticated encryption bound to the cache key.
+- Redis is disabled outside Compose unless REDIS_URL is set. Compose supplies a private disposable Redis service. A cache hit replaces a full row/list/settings query with a small SQL revision lookup; frequent job updates invalidate the shared job revision, so Redis does not guarantee a speedup for every workload or turn the process-local executor into a distributed queue.
