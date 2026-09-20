@@ -9,6 +9,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Multi-file uploads and multiple target languages per job
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Multi-user JWT login with administrator and user roles
+- Optional per-account MFA with authenticator apps, email codes, and single-use recovery codes
 - Self-service user registration with administrator control
 - Server-verified Cloudflare Turnstile, Google reCAPTCHA v2, or hCaptcha protection for login, registration, and uploads
 - Localized web interface with browser-language detection and a persistent language selector
@@ -45,7 +46,7 @@ docker compose down -v  # also permanently deletes saved settings and jobs
 
 ### Authentication and secrets
 
-Browser sessions use short-lived signed JWTs in HttpOnly, `SameSite=Strict` cookies. State-changing browser requests also require the JWT-bound double-submit CSRF token. Non-browser clients can post the normal login fields plus `"token_transport": "header"`; the response returns `access_token`, which protected APIs accept as `Authorization: Bearer <JWT>` without browser CSRF. Logout revokes the current token; disabling a user or changing a password/role invalidates all of that user's existing tokens.
+Browser sessions use short-lived signed JWTs in HttpOnly, `SameSite=Strict` cookies. State-changing browser requests also require the JWT-bound double-submit CSRF token. Non-browser clients can post the normal login fields plus `"token_transport": "header"`; after all required authentication steps succeed, the response returns `access_token`, which protected APIs accept as `Authorization: Bearer <JWT>` without browser CSRF. Logout revokes the current token; disabling a user or changing a password/role invalidates all of that user's existing tokens.
 
 Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Provider and CAPTCHA secrets saved through the administrator UI are encrypted with Fernet before database storage and are never returned by `GET /api/settings`. By default the encryption key is derived separately from `JWT_SECRET_KEY`. For independent JWT-key rotation, set a stable `API_KEY_ENCRYPTION_KEY` before saving secrets. Losing or changing the encryption key makes saved secrets unreadable.
 
@@ -58,6 +59,34 @@ Self-registration is enabled by default and creates regular-user accounts only. 
 The same settings section can enable one CAPTCHA provider and independently protect login, registration, and upload submissions. Supported providers are [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/), [Google reCAPTCHA v2](https://developers.google.com/recaptcha/docs/display), and [hCaptcha](https://docs.hcaptcha.com/). Enter the provider's public site key and private secret key, then set the expected public hostname if the request hostname seen by Flask is not the hostname registered with the CAPTCHA provider. Secret keys are write-only and encrypted like translation-provider keys. Every challenge token is checked server-side, including its hostname and (for Turnstile) action; provider errors fail closed. Keep the existing request limits enabled too, because CAPTCHA complements rather than replaces rate limiting.
 
 CAPTCHA can instead be bootstrapped with `CAPTCHA_PROVIDER`, `CAPTCHA_HOSTNAME`, the three `CAPTCHA_ON_*` switches, and the matching `*_SITE_KEY` / `*_SECRET_KEY` variables shown in `.env.example`. `CAPTCHA_PROVIDER=none` disables all CAPTCHA checks. Use HTTPS in production and restrict each widget key to the deployment's real hostname in its provider dashboard.
+
+### Multi-factor authentication (MFA)
+
+Open **Account security** after signing in. Each account, including administrators, can opt into one second-factor method at a time:
+
+- **Authenticator app (recommended):** enter your current password, scan the locally generated QR code with Google Authenticator, Microsoft Authenticator, or another TOTP app, and enter its six-digit code. Manual setup keys are also provided. Uses standard SHA-1 TOTP with six digits and a 30-second period; the server accepts one adjacent time step for clock skew and rejects already-used steps. Keep the server and phone clocks synchronized.
+- **Email verification:** enter your password and an email address, then verify the six-digit code sent to that address. Email MFA becomes available when the deployment's SMTP settings are configured. Its protection depends on the security of the mailbox; use a separate mailbox password and enable MFA there too.
+
+MFA remains disabled until enrollment is confirmed. Email codes and login challenges expire after **5 minutes**; pending authenticator enrollment expires after **10 minutes**. Codes are single-use. Email sends have a **60-second per-account cooldown** and a **10-per-hour per-account limit**, shared by enrollment, login, and account-security actions. Five failed password/code checks in MFA flows lock those flows for **15 minutes** and invalidate outstanding challenges. This failure budget persists across new login challenges, processes, and restarts. Existing password-login and CAPTCHA protections still apply.
+
+Enabling MFA shows **10 recovery codes once**, with a download button. Keep them outside the browser in a safe place. Each recovery code replaces the second factor once; it does not replace your password. Recovery works even if SMTP is down. You can replace recovery codes or disable MFA under **Account security**, using your password plus an unused current-factor or recovery code. To switch methods or change the MFA email address, disable the existing method with both factors, then enroll again. Changes invalidate other access JWTs and all outstanding challenges, and refresh the current session. Password resets by administrators do not remove MFA. There is no password-only or administrator API bypass for a lost second factor: retain recovery codes, especially for the final administrator.
+
+For email delivery, set these deployment environment variables (`.env` for Compose), then recreate the application container:
+
+```dotenv
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_FROM=Subtitle Translator <noreply@example.com>
+SMTP_USERNAME=your-smtp-user
+SMTP_PASSWORD=your-smtp-password
+```
+
+`SMTP_SECURITY` accepts `starttls` or `ssl` (use port `465` for implicit TLS). Certificate validation is enabled and plaintext SMTP is not supported. Authentication is optional when your TLS relay does not require a username. SMTP credentials are deployment-only and never returned through the settings API. Authenticator MFA needs no SMTP or external QR service. Existing deployments gain the MFA tables automatically; existing accounts keep password-only login until they enroll. MFA reads, locking, and counters use SQL directly, independently of Redis. Back up the database and stable encryption key together: authenticator secrets use the existing `enc:v1:` Fernet encryption. OTP codes use keyed hashes and recovery codes use hashes; neither is stored in plaintext.
+
+**API login with MFA:** `POST /api/auth/login` returns `mfa_required: true`, `method`, `challenge_token`, and `expires_in` after a correct password, with no access token or new login cookie. Submit `{"challenge_token": "...", "code": "..."}` to `POST /api/auth/mfa/verify`. Successful verification returns the normal user response and access cookie, or `access_token` if the original login requested header transport. Challenge JWTs use a separate signing key and audience and cannot authorize application APIs. `POST /api/auth/mfa/resend` accepts an email challenge and returns a replacement challenge token; use the new token because the old token/code pair is invalidated. A delivery failure returns `email_sent: false` and a warning while allowing recovery-code verification. A new password login supersedes the previous login challenge, so use resend while remaining on the verification screen.
+
+Authenticated MFA endpoints are `GET /api/auth/mfa`, `POST /api/auth/mfa/setup` (`password`, `method`, and `email` for email enrollment), `/confirm` (`challenge_token`, `code`), `/email` (`password`, for a management email code), `/disable`, and `/recovery` (`password`, `code`, and a management `challenge_token` for email codes). Cookie-authenticated mutations require the usual CSRF header. Enrollment, disabling, and recovery-code replacement return a fresh session; bearer clients must replace their old access token. Only `/verify` and `/resend` operate without an access JWT, and both require a valid, unexpired, narrowly scoped challenge JWT.
 
 ### Interface languages
 

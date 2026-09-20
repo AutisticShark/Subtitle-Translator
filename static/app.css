@@ -332,6 +332,13 @@ summary { cursor: pointer; font-weight: 700; }
 .page-intro { max-width: 750px; margin-bottom: 28px; }
 .page-intro h2 { font-size: clamp(34px, 5vw, 56px); }
 .page-intro p { max-width: 680px; font-size: 16px; }
+.security-panel { max-width: 760px; }
+.security-panel form, #mfaLoginForm { display: grid; gap: 16px; }
+.security-panel [hidden], #mfaLoginForm[hidden] { display: none; }
+.mfa-qr { display: block; width: 240px; height: 240px; max-width: 100%; background: white; padding: 8px; margin-bottom: 16px; }
+#mfaSecret, #mfaRecoveryCodes { font-family: monospace; }
+#mfaRecoveryCodes { overflow-x: auto; padding: 16px; background: var(--management-bg); border-radius: 8px; }
+#mfaRecovery { margin-top: 24px; }
 .app-view .section-heading { margin-bottom: 20px; }
 .app-view .jobs { padding-bottom: 0; }
 .admin-hero { margin-bottom: 26px; }

@@ -27,6 +27,14 @@
         <h1 id="authTitle">{{ tr('Sign in') }}</h1>
         <p id="authDescription">{{ tr('Use your Subtitle Translator account.') }}</p>
       </div>
+      <form id="mfaLoginForm" hidden>
+        <p id="mfaLoginDescription"></p>
+        <label>{{ tr('Verification or recovery code') }}<input name="code" autocomplete="one-time-code" required maxlength="64" spellcheck="false"></label>
+        <p id="mfaLoginError" role="alert"></p>
+        <button class="primary" type="submit">{{ tr('Verify and sign in') }}</button>
+        <button class="ghost" id="mfaLoginResend" type="button">{{ tr('Resend email code') }}</button>
+        <button class="text-button" id="mfaLoginBack" type="button">{{ tr('Back to sign in') }}</button>
+      </form>
       <form id="authForm">
         <label>{{ tr('Username') }}<input name="username" autocomplete="username" required minlength="3" maxlength="64"></label>
         <label>{{ tr('Password') }}<input name="password" type="password" autocomplete="current-password" required minlength="12" maxlength="256"></label>
@@ -54,6 +62,9 @@
         </button>
         <button class="nav-item" type="button" data-view-button="jobs">
           <span class="nav-icon" aria-hidden="true">≡</span>{{ tr('Translation history') }}
+        </button>
+        <button class="nav-item" type="button" data-view-button="security">
+          <span class="nav-icon" aria-hidden="true">◇</span>{{ tr('Account security') }}
         </button>
         <button class="nav-item" id="adminNavButton" type="button" data-view-button="admin" hidden>
           <span class="nav-icon" aria-hidden="true">⚙</span>{{ tr('Administration') }}
@@ -88,6 +99,49 @@
       </header>
 
       <main class="content">
+        <section class="app-view" data-view="security" hidden>
+          <div class="page-intro"><h2>{{ tr('Multi-factor authentication') }}</h2>
+            <p>{{ tr('Protect your account with an authenticator app or email verification codes. Keep recovery codes somewhere safe.') }}</p>
+          </div>
+          <section class="panel dashboard-card security-panel">
+            <p id="mfaStatus" role="status"></p>
+            <p id="mfaSecurityError" role="alert"></p>
+            <form id="mfaSetupForm" hidden>
+              <label>{{ tr('MFA method') }}<select name="method" id="mfaMethod"><option value="totp">{{ tr('Authenticator app (recommended)') }}</option><option value="email">{{ tr('Email verification code') }}</option></select></label>
+              <p>{{ tr('Google Authenticator, Microsoft Authenticator, and other TOTP apps are supported. Email security depends on your mailbox security.') }}</p>
+              <label id="mfaEmailField" hidden>{{ tr('Email address') }}<input name="email" type="email" maxlength="254" autocomplete="email" disabled></label>
+              <label>{{ tr('Current password') }}<input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+              <button class="primary" type="submit">{{ tr('Start MFA setup') }}</button>
+            </form>
+            <form id="mfaConfirmForm" hidden>
+              <div id="mfaAuthenticator" hidden>
+                <p>{{ tr('Scan this QR code in your authenticator app, or enter the setup key manually. Then enter a new six-digit code.') }}</p>
+                <img id="mfaQr" class="mfa-qr" alt="{{ tr('Authenticator setup QR code') }}">
+                <label>{{ tr('Setup key') }}<input id="mfaSecret" readonly autocomplete="off"></label>
+              </div>
+              <p id="mfaEnrollmentNotice" role="status"></p>
+              <label>{{ tr('Verification code') }}<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" required maxlength="6"></label>
+              <button class="primary" type="submit">{{ tr('Verify and enable MFA') }}</button>
+              <button class="ghost" id="mfaSetupResend" type="button">{{ tr('Resend email code') }}</button>
+              <button class="text-button" id="mfaSetupCancel" type="button">{{ tr('Cancel setup') }}</button>
+            </form>
+            <form id="mfaManageForm" hidden>
+              <p>{{ tr('To disable MFA or replace recovery codes, enter your password and an unused verification or recovery code. Other sessions will be signed out.') }}</p>
+              <label>{{ tr('Current password') }}<input name="password" type="password" autocomplete="current-password" required maxlength="256"></label>
+              <button class="ghost" id="mfaManageEmail" type="button">{{ tr('Send email code') }}</button>
+              <label>{{ tr('Verification or recovery code') }}<input name="code" autocomplete="one-time-code" required maxlength="64" spellcheck="false"></label>
+              <button class="ghost" type="submit" value="recovery">{{ tr('Replace recovery codes') }}</button>
+              <button class="danger" type="submit" value="disable">{{ tr('Disable MFA') }}</button>
+            </form>
+            <div id="mfaRecovery" hidden>
+              <h3>{{ tr('Save your recovery codes') }}</h3>
+              <p>{{ tr('These codes are shown only once. Each code can be used once instead of your second factor. Your password is still required. Store them outside this browser.') }}</p>
+              <pre id="mfaRecoveryCodes"></pre>
+              <button class="primary" id="mfaDownloadRecovery" type="button">{{ tr('Download recovery codes') }}</button>
+              <button class="ghost" id="mfaSavedRecovery" type="button">{{ tr('I have saved my codes') }}</button>
+            </div>
+          </section>
+        </section>
         <section class="app-view" data-view="dashboard">
           <div class="welcome-row">
             <div>

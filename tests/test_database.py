@@ -114,6 +114,7 @@ def test_legacy_sqlite_jobs_gain_ownership_without_losing_records():
                 ).fetchone()
             assert "user_id" in columns
             assert "rate_limit_buckets" in tables
+            assert {"mfa_accounts", "mfa_challenges"} <= tables
             assert row == ("legacy", None, "failed")
         finally:
             engine.dispose()

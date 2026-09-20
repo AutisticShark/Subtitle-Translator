@@ -43,6 +43,7 @@ from database import (
     rate_limit_buckets, settings as settings_table, transaction, users,
 )
 from redis_cache import RedisCache
+from mfa import MFA
 from i18n import (
     LOCALE_COOKIE, LOCALE_LABELS, current_locale, messages_for, normalize_locale,
     translate as tr,
@@ -380,6 +381,13 @@ def encrypt_existing_api_keys() -> None:
 
 encrypt_existing_api_keys()
 
+mfa = MFA(
+    app, engine, password_hasher=password_hasher, encrypt=encrypt_secret,
+    decrypt=decrypt_secret, issue_token=issue_token, public_user=public_user,
+    clock=now_datetime, signing_secret=jwt_secret,
+    stable_keys=bool(configured_jwt_secret or os.environ.get("API_KEY_ENCRYPTION_KEY")),
+)
+
 
 @jwt.token_in_blocklist_loader
 def token_is_revoked(_header: dict, payload: dict) -> bool:
@@ -449,7 +457,7 @@ def security_headers(response):
     response.headers.setdefault("Content-Language", current_locale())
     response.vary.add("Accept-Language")
     response.vary.add("Cookie")
-    if request.endpoint == "logout":
+    if request.endpoint == "logout" or (request.endpoint or "").startswith("mfa_"):
         return response
     try:
         verify_jwt_in_request(optional=True)
@@ -998,16 +1006,15 @@ def login():
     if password_hasher.check_needs_rehash(user.password_hash):
         values["password_hash"] = password_hasher.hash(candidate_password)
     with transaction(engine) as db:
-        db.execute(update(users).where(users.c.id == user.id).values(**values))
-    with connection(engine) as db:
+        changed = db.execute(update(users).where(
+            users.c.id == user.id, users.c.active.is_(True),
+            users.c.token_version == user.token_version,
+            users.c.password_hash == user.password_hash,
+        ).values(**values))
+        if not changed.rowcount:
+            return jsonify(error=tr("Invalid username or password")), 401
         refreshed_user = db.execute(select(users).where(users.c.id == user.id)).first()
-    access_token = issue_token(refreshed_user)
-    if payload.get("token_transport") == "header":
-        response = jsonify(user=public_user(refreshed_user), access_token=access_token)
-    else:
-        response = jsonify(user=public_user(refreshed_user))
-        set_access_cookies(response, access_token)
-    return response
+    return mfa.begin_login(refreshed_user, payload)
 
 
 @app.post("/api/auth/register")

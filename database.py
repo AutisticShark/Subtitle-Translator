@@ -70,6 +70,39 @@ settings = Table(
     Column("updated_at", String(40), nullable=False),
 )
 
+# Separate tables allow existing accounts to adopt MFA without rewriting users.
+# All MFA operations first lock the associated users row, including on SQLite.
+mfa_accounts = Table(
+    "mfa_accounts", metadata,
+    Column("user_id", String(32), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True),
+    Column("method", String(16), nullable=False, default=""),
+    Column("secret", Text, nullable=False, default=""),
+    Column("email", String(254), nullable=False, default=""),
+    Column("last_step", Integer, nullable=False, default=-1),
+    Column("recovery_hashes", Text, nullable=False, default="[]"),
+    Column("failures", Integer, nullable=False, default=0),
+    Column("locked_until", Integer, nullable=False, default=0),
+    Column("next_send", Integer, nullable=False, default=0),
+    Column("send_window", Integer, nullable=False, default=0),
+    Column("send_count", Integer, nullable=False, default=0),
+)
+
+mfa_challenges = Table(
+    "mfa_challenges", metadata,
+    Column("id", String(64), primary_key=True),
+    Column("user_id", String(32), ForeignKey("users.id", ondelete="CASCADE"), nullable=False),
+    Column("version", Integer, nullable=False),
+    Column("purpose", String(16), nullable=False),
+    Column("method", String(16), nullable=False),
+    Column("secret", Text, nullable=False, default=""),
+    Column("email", String(254), nullable=False, default=""),
+    Column("code_hash", String(64), nullable=False, default=""),
+    Column("expires", Integer, nullable=False),
+    Column("transport", String(16), nullable=False, default="cookies"),
+)
+Index("ix_mfa_challenges_user_id", mfa_challenges.c.user_id)
+Index("ix_mfa_challenges_expires", mfa_challenges.c.expires)
+
 jobs = Table(
     "jobs",
     metadata,

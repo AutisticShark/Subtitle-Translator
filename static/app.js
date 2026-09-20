@@ -6,6 +6,7 @@ const state = {
   },
   captchaWidgets: { auth: null, upload: null }, captchaLoaders: {},
   currentView: 'dashboard',
+  loginChallenge: null, enrollmentChallenge: null, managementChallenge: null,
   i18n: { locale: document.body.dataset.locale || 'en', messages: {}, languages: {} },
 };
 const $ = (selector) => document.querySelector(selector);
@@ -188,6 +189,10 @@ async function refreshAuthConfiguration(status = null) {
 }
 
 function showAuth(setup = false, mode = 'login') {
+  clearMfaSecrets();
+  state.loginChallenge = null;
+  $('#authForm').hidden = false;
+  $('#mfaLoginForm').hidden = true;
   state.setup = setup;
   state.authMode = setup ? 'setup' : mode;
   state.user = null;
@@ -236,6 +241,7 @@ async function enterApp(user) {
 }
 
 const viewLabels = {
+  security: ['Account preferences', 'Account security'],
   dashboard: ['Workspace overview', 'Dashboard'],
   translate: ['Translation workspace', 'New translation'],
   jobs: ['Activity', 'Translation history'],
@@ -243,9 +249,11 @@ const viewLabels = {
 };
 
 function showView(requestedView, updateHash = true) {
-  const allowed = new Set(['dashboard', 'translate', 'jobs']);
+  const allowed = new Set(['dashboard', 'translate', 'jobs', 'security']);
   if (state.user?.role === 'admin') allowed.add('admin');
   const view = allowed.has(requestedView) ? requestedView : 'dashboard';
+  if (state.currentView === 'security' && view !== 'security') clearMfaSecrets();
+  if (view === 'security') loadMfa().catch(error => { $('#mfaSecurityError').textContent = error.message; });
   state.currentView = view;
   $$('[data-view]').forEach(element => { element.hidden = element.dataset.view !== view; });
   $$('[data-view-button]').forEach(button => {
@@ -354,6 +362,20 @@ async function submitAuth(event) {
       body: JSON.stringify(payload),
     });
     form.reset();
+    if (data.mfa_required) {
+      state.loginChallenge = data;
+      $('#authForm').hidden = true;
+      $('#authSwitch').hidden = true;
+      $('#mfaLoginForm').hidden = false;
+      $('#mfaLoginResend').hidden = data.method !== 'email';
+      $('#authTitle').textContent = t('Multi-factor authentication');
+      $('#mfaLoginDescription').textContent = data.method === 'email'
+        ? t('Enter the code sent to your email, or a recovery code.')
+        : t('Enter a new code from your authenticator app, or a recovery code.');
+      $('#mfaLoginError').textContent = data.warning || '';
+      $('#mfaLoginForm [name="code"]').focus();
+      return;
+    }
     await enterApp(data.user);
   } catch (error) {
     $('#authError').textContent = error.message;
@@ -361,6 +383,166 @@ async function submitAuth(event) {
   } finally {
     button.disabled = false;
   }
+}
+
+function mfaPost(path, payload) {
+  return api(`/api/auth/mfa${path}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  });
+}
+
+function clearMfaSecrets() {
+  state.enrollmentChallenge = null;
+  state.managementChallenge = null;
+  $('#mfaQr').removeAttribute('src');
+  $('#mfaSecret').value = '';
+  $('#mfaRecoveryCodes').textContent = '';
+  $('#mfaRecovery').hidden = true;
+  $('#mfaConfirmForm').hidden = true;
+  $('#mfaSetupForm').reset();
+  $('#mfaManageForm').reset();
+  $('#mfaConfirmForm').reset();
+  $('#mfaLoginForm').reset();
+  $('#mfaSecurityError').textContent = '';
+  updateMfaMethod();
+}
+
+function updateMfaMethod() {
+  const email = $('#mfaMethod').value === 'email';
+  $('#mfaEmailField').hidden = !email;
+  $('#mfaEmailField input').disabled = !email;
+  $('#mfaEmailField input').required = email;
+}
+
+async function loadMfa() {
+  const data = await api('/api/auth/mfa');
+  $('#mfaStatus').textContent = data.method
+    ? t('MFA enabled: {method}. Recovery codes remaining: {count}.', {
+      method: data.method === 'totp' ? t('Authenticator app') : data.email,
+      count: data.recovery_remaining,
+    }) : t('MFA is not enabled');
+  if (!data.enrollment_available) $('#mfaStatus').textContent = t('Configure JWT_SECRET_KEY before saving secrets');
+  $('#mfaSetupForm').hidden = Boolean(data.method) || !data.enrollment_available || Boolean(state.enrollmentChallenge);
+  $('#mfaManageForm').hidden = !data.method;
+  $('#mfaManageEmail').hidden = data.method !== 'email';
+  $('#mfaMethod option[value="email"]').disabled = !data.email_available;
+  if (!data.email_available && !data.method) {
+    $('#mfaStatus').textContent += `. ${t('Email verification is unavailable; ask an administrator to configure SMTP')}`;
+  }
+}
+
+async function submitMfaLogin(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  $('#mfaLoginError').textContent = '';
+  try {
+    const data = await mfaPost('/verify', {
+      challenge_token: state.loginChallenge?.challenge_token,
+      code: new FormData(form).get('code'),
+    });
+    state.loginChallenge = null;
+    form.reset();
+    await enterApp(data.user);
+  } catch (error) { $('#mfaLoginError').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function startMfaSetup(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  $('#mfaSecurityError').textContent = '';
+  try {
+    const data = await mfaPost('/setup', Object.fromEntries(new FormData(form)));
+    state.enrollmentChallenge = { challenge_token: data.challenge_token };
+    form.reset();
+    form.hidden = true;
+    $('#mfaConfirmForm').hidden = false;
+    $('#mfaAuthenticator').hidden = data.method !== 'totp';
+    $('#mfaSetupResend').hidden = data.method !== 'email';
+    $('#mfaEnrollmentNotice').textContent = data.warning || (data.method === 'email'
+      ? t('Enter the six-digit email code within 5 minutes to enable MFA.')
+      : t('Setup expires in 10 minutes. MFA starts only after you verify the code.'));
+    if (data.method === 'totp') {
+      $('#mfaQr').src = data.qr_code;
+      $('#mfaSecret').value = data.secret;
+    }
+    $('#mfaConfirmForm [name="code"]').focus();
+  } catch (error) { $('#mfaSecurityError').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+function showRecoveryCodes(data) {
+  state.user = data.user;
+  clearMfaSecrets();
+  if (data.recovery_codes) {
+    $('#mfaRecoveryCodes').textContent = data.recovery_codes.join('\n');
+    $('#mfaRecovery').hidden = false;
+  }
+}
+
+async function confirmMfaSetup(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector('[type="submit"]');
+  button.disabled = true;
+  $('#mfaSecurityError').textContent = '';
+  try {
+    const data = await mfaPost('/confirm', {
+      challenge_token: state.enrollmentChallenge?.challenge_token,
+      code: new FormData(form).get('code'),
+    });
+    showRecoveryCodes(data);
+    await loadMfa();
+  } catch (error) { $('#mfaSecurityError').textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function manageMfa(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const action = event.submitter?.value;
+  if (!['disable', 'recovery'].includes(action)) return;
+  const buttons = [...form.querySelectorAll('button')];
+  buttons.forEach(button => { button.disabled = true; });
+  $('#mfaSecurityError').textContent = '';
+  try {
+    const data = await mfaPost(`/${action}`, {
+      ...Object.fromEntries(new FormData(form)),
+      challenge_token: state.managementChallenge?.challenge_token,
+    });
+    showRecoveryCodes(data);
+    await loadMfa();
+    toast(t('Account security updated'));
+  } catch (error) { $('#mfaSecurityError').textContent = error.message; }
+  finally { buttons.forEach(button => { button.disabled = false; }); }
+}
+
+async function resendMfa(slot, button) {
+  const errorElement = slot === 'loginChallenge' ? $('#mfaLoginError') : $('#mfaSecurityError');
+  button.disabled = true;
+  try {
+    const data = await mfaPost('/resend', { challenge_token: state[slot]?.challenge_token });
+    state[slot] = data;
+    errorElement.textContent = data.warning || t('Verification email sent');
+  } catch (error) { errorElement.textContent = error.message; }
+  finally { button.disabled = false; }
+}
+
+async function sendManagementEmail(event) {
+  const button = event.currentTarget;
+  const password = $('#mfaManageForm [name="password"]');
+  if (!password.reportValidity()) return;
+  button.disabled = true;
+  try {
+    const data = await mfaPost('/email', { password: password.value });
+    state.managementChallenge = data;
+    $('#mfaSecurityError').textContent = data.warning || t('Verification email sent');
+  } catch (error) { $('#mfaSecurityError').textContent = error.message; }
+  finally { button.disabled = false; }
 }
 
 async function logout() {
@@ -646,6 +828,32 @@ async function initialize() {
 }
 
 $('#authForm').addEventListener('submit', submitAuth);
+$('#mfaLoginForm').addEventListener('submit', submitMfaLogin);
+$('#mfaLoginBack').addEventListener('click', () => showAuth());
+$('#mfaLoginResend').addEventListener('click', event => resendMfa('loginChallenge', event.currentTarget));
+$('#mfaSetupResend').addEventListener('click', event => resendMfa('enrollmentChallenge', event.currentTarget));
+$('#mfaMethod').addEventListener('change', updateMfaMethod);
+$('#mfaSetupForm').addEventListener('submit', startMfaSetup);
+$('#mfaConfirmForm').addEventListener('submit', confirmMfaSetup);
+$('#mfaManageForm').addEventListener('submit', manageMfa);
+$('#mfaManageEmail').addEventListener('click', sendManagementEmail);
+$('#mfaSetupCancel').addEventListener('click', () => {
+  clearMfaSecrets();
+  loadMfa().catch(error => { $('#mfaSecurityError').textContent = error.message; });
+});
+$('#mfaSavedRecovery').addEventListener('click', () => {
+  $('#mfaRecoveryCodes').textContent = '';
+  $('#mfaRecovery').hidden = true;
+});
+$('#mfaDownloadRecovery').addEventListener('click', () => {
+  const content = `Subtitle Translator — ${state.user.username}\n\n${$('#mfaRecoveryCodes').textContent}\n`;
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'subtitle-translator-recovery-codes.txt';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+});
 $('#authSwitchButton').addEventListener('click', () => {
   $('#authForm').reset();
   showAuth(false, state.authMode === 'register' ? 'login' : 'register');

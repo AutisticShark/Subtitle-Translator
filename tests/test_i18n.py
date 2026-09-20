@@ -40,7 +40,9 @@ class InternationalizationTests(unittest.TestCase):
         project_root = Path(__file__).resolve().parents[1]
         source_strings = set()
 
-        tree = ast.parse((project_root / "webapp.py").read_text("utf-8"))
+        tree = ast.parse("\n".join(
+            path.read_text("utf-8") for path in project_root.glob("*.py")
+        ))
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                     and node.func.id == "tr" and node.args
