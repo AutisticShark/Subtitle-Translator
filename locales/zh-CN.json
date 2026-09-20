@@ -301,7 +301,7 @@
     "Email address": "电子邮箱地址",
     "Email could not be sent. Retry later or use a recovery code.": "无法发送邮件。请稍后重试或使用恢复码。",
     "Email verification code": "电子邮件验证码",
-    "Email verification is unavailable; ask an administrator to configure SMTP": "电子邮件验证尚不可用，请管理员配置 SMTP",
+    "Email verification is unavailable; ask an administrator to configure email delivery": "电子邮件验证尚不可用，请管理员配置邮件发送服务",
     "Enter a new code from your authenticator app, or a recovery code.": "请输入身份验证器应用生成的新验证码，或输入恢复码。",
     "Enter a valid email address": "请输入有效的电子邮箱地址",
     "Enter the code sent to your email, or a recovery code.": "请输入发送至您邮箱的验证码，或输入恢复码。",

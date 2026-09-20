@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-import smtplib
+import re
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
@@ -15,6 +15,7 @@ from sqlalchemy import delete, insert, select, update
 # This harness sets DATA_DIR before importing the application, never using real data.
 from test_webapp import webapp
 import mfa as mfa_module
+import email_delivery
 from database import mfa_accounts, mfa_challenges, users
 
 
@@ -275,7 +276,7 @@ def test_email_outage_preserves_recovery_and_never_bypasses_mfa(account, monkeyp
     sent = allow_email(monkeypatch)
     recovery = enroll_email(client, sent)
     clear_cooldown(user_id)
-    monkeypatch.setattr(mfa_module, "send_email_code", Mock(side_effect=smtplib.SMTPException("offline")))
+    monkeypatch.setattr(mfa_module, "send_email_code", Mock(side_effect=email_delivery.EmailDeliveryError("offline")))
     guest, challenge = login_challenge(payload)
     assert challenge["email_sent"] is False
     assert guest.get("/api/auth/me").status_code == 401
@@ -321,7 +322,8 @@ def test_smtp_requires_tls_and_does_not_send_without_it(monkeypatch):
     factory = Mock()
     smtp = factory.return_value.__enter__ = Mock(return_value=Mock())
     factory.return_value.__exit__ = Mock(return_value=False)
-    monkeypatch.setattr(mfa_module.smtplib, "SMTP", factory)
+    smtp.return_value.send_message.return_value = {}
+    monkeypatch.setattr(email_delivery.smtplib, "SMTP", factory)
     mfa_module.send_email_code("user@example.com", "123456")
     calls = smtp.return_value.method_calls
     assert [call[0] for call in calls] == ["starttls", "login", "send_message"]
@@ -329,6 +331,34 @@ def test_smtp_requires_tls_and_does_not_send_without_it(monkeypatch):
     with pytest.raises(RuntimeError):
         mfa_module.send_email_code("user@example.com", "123456")
     assert factory.call_count == 1
+
+
+@pytest.mark.parametrize("provider,adapter", [
+    ("smtp", email_delivery.SMTPProvider), ("ses", email_delivery.SESProvider),
+    ("aliyun", email_delivery.AliyunProvider), ("resend", email_delivery.ResendProvider),
+])
+def test_shared_email_service_enrollment_and_provider_outage_recovery(account, monkeypatch, provider, adapter):
+    client, user_id, payload = account
+    for name, value in {
+        "EMAIL_PROVIDER": provider, "EMAIL_FROM": "Mail <sender@example.com>",
+        "SMTP_HOST": "smtp.example.com", "AWS_SES_REGION": "us-east-1",
+        "ALIYUN_ACCESS_KEY_ID": "test-id", "ALIYUN_ACCESS_KEY_SECRET": "test-secret",
+        "RESEND_API_KEY": "private-key",
+    }.items():
+        monkeypatch.setenv(name, value)
+    sent = []
+    monkeypatch.setattr(adapter, "send", lambda self, message: sent.append((
+        message.to, re.search(r"\b\d{6}\b", message.text).group(),
+    )))
+    assert client.get("/api/auth/mfa").json["email_available"]
+    recovery = enroll_email(client, sent)
+    clear_cooldown(user_id)
+    monkeypatch.setattr(adapter, "send", Mock(side_effect=TimeoutError("private-key and verification code")))
+    login_client, challenge = login_challenge(payload)
+    assert challenge["email_sent"] is False
+    assert "private-key" not in json.dumps(challenge)
+    assert login_client.get("/api/jobs").status_code == 401
+    assert verify(login_client, challenge, recovery[0]).status_code == 200
 
 
 def test_enrollment_rejects_missing_keys_and_smtp_and_unsafe_addresses(account, monkeypatch):

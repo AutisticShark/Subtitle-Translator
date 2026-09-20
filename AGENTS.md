@@ -7,6 +7,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 - `srt_translate.py` contains the translation pipeline, provider clients (including Google Cloud Translation - Basic v2), retry/throttling behavior, segmentation, tag masking, cue rebuilding, wrapping, and the SRT-only CLI.
 - `subtitle_formats.py` adapts SRT, VTT, ASS, and SSA files to and from the shared cue model. Preserve format-specific headers, timings, settings, dialogue fields, newline style, BOM state, and inline tags.
 - `webapp.py` is the Flask API, authentication/authorization layer, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time.
+- `email_delivery.py` owns the shared email provider registry and SMTP, SES, Aliyun DirectMail, and Resend transports. `mfa.py` composes verification messages and owns their authorization, SQL challenges, and send limits.
 - `database.py` defines the portable SQLAlchemy schema, SQLite legacy migration, and URL normalization for SQLite, PostgreSQL, MariaDB, and MySQL.
 - `static/app.js` and `templates/index.html` implement the browser UI.
 - `i18n.py` and `locales/*.json` provide request-locale negotiation and web/API message catalogs. English source strings are the fallback.
@@ -48,6 +49,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 16. Treat CLI sidecar caches as untrusted input. Load them through a file handle, accept only the expected 24-character lowercase hexadecimal hash keys with string values, and stream JSON back to the already-selected file handle. Do not feed serialized cache content to `Path.write_text`; besides obscuring the data/path boundary, Sonar rule `pythonsecurity:S2083` can treat that content as a path-injection flow.
 17. Keep the direct `python webapp.py` development server bound to a loopback address. Network-facing container access belongs to the production Gunicorn command in `Dockerfile`; do not expose Flask's development server on every interface.
 18. Redis is a disposable read cache. Every settings or job mutation must bump its `cache_revisions` marker in the same SQL transaction, including ownership changes and startup recovery. Cache raw locale-neutral rows, scope job keys by account/admin view, and keep authentication, quotas, mutations, and download authorization in SQL. Never make Redis invalidation or availability a prerequisite for correctness.
+19. Send transactional email through `email_delivery.send_email`, keeping credentials deployment-only and provider responses private. Preserve legacy SMTP selection when `EMAIL_PROVIDER` is blank, require TLS, and never automatically retry or switch providers after an ambiguous send failure. Provider additions need offline transport tests plus `.env.example`, Compose, and documentation updates. Keep MFA limits and challenge consumption in SQL regardless of the selected transport.
 
 ## Validation
 

@@ -301,7 +301,7 @@
     "Email address": "電子郵件地址",
     "Email could not be sent. Retry later or use a recovery code.": "無法寄送郵件。請稍後重試或使用復原碼。",
     "Email verification code": "電子郵件驗證碼",
-    "Email verification is unavailable; ask an administrator to configure SMTP": "電子郵件驗證尚未開放，請管理員設定 SMTP",
+    "Email verification is unavailable; ask an administrator to configure email delivery": "電子郵件驗證尚未開放，請管理員設定郵件傳送服務",
     "Enter a new code from your authenticator app, or a recovery code.": "請輸入驗證器應用程式產生的新驗證碼，或輸入復原碼。",
     "Enter a valid email address": "請輸入有效的電子郵件地址",
     "Enter the code sent to your email, or a recovery code.": "請輸入寄至您電子郵件的驗證碼，或輸入復原碼。",

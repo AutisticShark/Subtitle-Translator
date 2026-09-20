@@ -10,6 +10,7 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Background job queue, batch-level progress, manual cancellation, per-language downloads, ZIP bundles, and job deletion
 - Multi-user JWT login with administrator and user roles
 - Optional per-account MFA with authenticator apps, email codes, and single-use recovery codes
+- Extensible transactional email delivery through SMTP, AWS SES, Aliyun DirectMail, or Resend
 - Self-service user registration with administrator control
 - Server-verified Cloudflare Turnstile, Google reCAPTCHA v2, or hCaptcha protection for login, registration, and uploads
 - Localized web interface with browser-language detection and a persistent language selector
@@ -65,24 +66,25 @@ CAPTCHA can instead be bootstrapped with `CAPTCHA_PROVIDER`, `CAPTCHA_HOSTNAME`,
 Open **Account security** after signing in. Each account, including administrators, can opt into one second-factor method at a time:
 
 - **Authenticator app (recommended):** enter your current password, scan the locally generated QR code with Google Authenticator, Microsoft Authenticator, or another TOTP app, and enter its six-digit code. Manual setup keys are also provided. Uses standard SHA-1 TOTP with six digits and a 30-second period; the server accepts one adjacent time step for clock skew and rejects already-used steps. Keep the server and phone clocks synchronized.
-- **Email verification:** enter your password and an email address, then verify the six-digit code sent to that address. Email MFA becomes available when the deployment's SMTP settings are configured. Its protection depends on the security of the mailbox; use a separate mailbox password and enable MFA there too.
+- **Email verification:** enter your password and an email address, then verify the six-digit code sent to that address. Email MFA becomes available when an email delivery provider is configured. Its protection depends on the security of the mailbox; use a separate mailbox password and enable MFA there too.
 
 MFA remains disabled until enrollment is confirmed. Email codes and login challenges expire after **5 minutes**; pending authenticator enrollment expires after **10 minutes**. Codes are single-use. Email sends have a **60-second per-account cooldown** and a **10-per-hour per-account limit**, shared by enrollment, login, and account-security actions. Five failed password/code checks in MFA flows lock those flows for **15 minutes** and invalidate outstanding challenges. This failure budget persists across new login challenges, processes, and restarts. Existing password-login and CAPTCHA protections still apply.
 
-Enabling MFA shows **10 recovery codes once**, with a download button. Keep them outside the browser in a safe place. Each recovery code replaces the second factor once; it does not replace your password. Recovery works even if SMTP is down. You can replace recovery codes or disable MFA under **Account security**, using your password plus an unused current-factor or recovery code. To switch methods or change the MFA email address, disable the existing method with both factors, then enroll again. Changes invalidate other access JWTs and all outstanding challenges, and refresh the current session. Password resets by administrators do not remove MFA. There is no password-only or administrator API bypass for a lost second factor: retain recovery codes, especially for the final administrator.
+Enabling MFA shows **10 recovery codes once**, with a download button. Keep them outside the browser in a safe place. Each recovery code replaces the second factor once; it does not replace your password. Recovery works even if email delivery is down. You can replace recovery codes or disable MFA under **Account security**, using your password plus an unused current-factor or recovery code. To switch methods or change the MFA email address, disable the existing method with both factors, then enroll again. Changes invalidate other access JWTs and all outstanding challenges, and refresh the current session. Password resets by administrators do not remove MFA. There is no password-only or administrator API bypass for a lost second factor: retain recovery codes, especially for the final administrator.
 
-For email delivery, set these deployment environment variables (`.env` for Compose), then recreate the application container:
+Email delivery is selected with `EMAIL_PROVIDER` in the deployment environment (`.env` for Compose). Set `EMAIL_FROM` to your sender address, configure the selected provider, then recreate the application container. Credentials remain deployment-only and never appear in the settings API or browser.
 
-```dotenv
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_SECURITY=starttls
-SMTP_FROM=Subtitle Translator <noreply@example.com>
-SMTP_USERNAME=your-smtp-user
-SMTP_PASSWORD=your-smtp-password
-```
+| `EMAIL_PROVIDER` | Required provider configuration |
+| --- | --- |
+| `smtp` | `SMTP_HOST`; optional authentication with `SMTP_USERNAME` / `SMTP_PASSWORD` |
+| `ses` | `AWS_SES_REGION` and AWS SDK credentials or an IAM role |
+| `aliyun` | `ALIYUN_DM_REGION`, `ALIYUN_ACCESS_KEY_ID`, `ALIYUN_ACCESS_KEY_SECRET` |
+| `resend` | `RESEND_API_KEY` |
+| `none` | Explicitly disables email delivery |
 
-`SMTP_SECURITY` accepts `starttls` or `ssl` (use port `465` for implicit TLS). Certificate validation is enabled and plaintext SMTP is not supported. Authentication is optional when your TLS relay does not require a username. SMTP credentials are deployment-only and never returned through the settings API. Authenticator MFA needs no SMTP or external QR service. Existing deployments gain the MFA tables automatically; existing accounts keep password-only login until they enroll. MFA reads, locking, and counters use SQL directly, independently of Redis. Back up the database and stable encryption key together: authenticator secrets use the existing `enc:v1:` Fernet encryption. OTP codes use keyed hashes and recovery codes use hashes; neither is stored in plaintext.
+Existing `SMTP_HOST` / `SMTP_FROM` deployments continue to work with a blank or unset `EMAIL_PROVIDER`. `EMAIL_FROM` takes precedence over `SMTP_FROM` for SMTP. SMTP requires certificate-verified `starttls` or `ssl`; a blank `SMTP_PORT` selects 587 or 465 respectively. The other providers use their HTTPS APIs. See [Email delivery configuration and provider extensions](docs/email-delivery.md) for examples, cloud permissions, and the adapter contract.
+
+Authenticator MFA needs no email provider or external QR service. Existing deployments gain the MFA tables automatically; existing accounts keep password-only login until they enroll. MFA reads, locking, and counters use SQL directly, independently of Redis. Back up the database and stable encryption key together: authenticator secrets use the existing `enc:v1:` Fernet encryption. OTP codes use keyed hashes and recovery codes use hashes; neither is stored in plaintext.
 
 **API login with MFA:** `POST /api/auth/login` returns `mfa_required: true`, `method`, `challenge_token`, and `expires_in` after a correct password, with no access token or new login cookie. Submit `{"challenge_token": "...", "code": "..."}` to `POST /api/auth/mfa/verify`. Successful verification returns the normal user response and access cookie, or `access_token` if the original login requested header transport. Challenge JWTs use a separate signing key and audience and cannot authorize application APIs. `POST /api/auth/mfa/resend` accepts an email challenge and returns a replacement challenge token; use the new token because the old token/code pair is invalidated. A delivery failure returns `email_sent: false` and a warning while allowing recovery-code verification. A new password login supersedes the previous login challenge, so use resend while remaining on the verification screen.
 

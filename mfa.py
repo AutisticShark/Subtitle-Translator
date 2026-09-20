@@ -6,12 +6,8 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import re
 import secrets
-import smtplib
-import ssl
-from email.message import EmailMessage
 
 import jwt as pyjwt
 import pyotp
@@ -26,38 +22,14 @@ from sqlalchemy import delete, insert, select, update
 
 from database import connection, mfa_accounts, mfa_challenges, transaction, users
 from i18n import translate as tr
-
-
-def email_available():
-    return bool(os.environ.get("SMTP_HOST") and os.environ.get("SMTP_FROM"))
+from email_delivery import EmailDeliveryError, email_available, send_email
 
 
 def send_email_code(address, code):
-    """TLS is mandatory; SMTP credentials never enter API responses or SQL."""
-    if not email_available():
-        raise RuntimeError("SMTP is not configured")
-    message = EmailMessage()
-    message["From"] = os.environ["SMTP_FROM"]
-    message["To"] = address
-    message["Subject"] = tr("Your Subtitle Translator verification code")
-    message.set_content(tr(
+    send_email(address, tr("Your Subtitle Translator verification code"), tr(
         "Your verification code is {code}. It expires in 5 minutes. If you did not request it, ignore this email.",
         code=code,
     ))
-    mode = os.environ.get("SMTP_SECURITY", "starttls").lower()
-    if mode not in {"starttls", "ssl"}:
-        raise RuntimeError("SMTP_SECURITY must be starttls or ssl")
-    port = int(os.environ.get("SMTP_PORT") or ("465" if mode == "ssl" else "587"))
-    context = ssl.create_default_context()
-    factory = smtplib.SMTP_SSL if mode == "ssl" else smtplib.SMTP
-    kwargs = {"context": context} if mode == "ssl" else {}
-    with factory(os.environ["SMTP_HOST"], port, timeout=10, **kwargs) as smtp:
-        if mode == "starttls":
-            smtp.starttls(context=context)
-        username = os.environ.get("SMTP_USERNAME", "")
-        if username:
-            smtp.login(username, os.environ.get("SMTP_PASSWORD", ""))
-        smtp.send_message(message)
 
 
 def mask_email(address):
@@ -219,8 +191,8 @@ class MFA:
             try:
                 send_email_code(email, code)
                 result["email_sent"] = True
-            except (OSError, smtplib.SMTPException, ValueError, RuntimeError):
-                # Do not log SMTP exception bodies: they may contain credentials or mail content.
+            except EmailDeliveryError:
+                # Delivery errors are sanitized; keep provider responses and codes private.
                 result["email_sent"] = False
                 result["warning"] = tr("Email could not be sent. Retry later or use a recovery code.")
         return jsonify(result)
@@ -332,7 +304,7 @@ class MFA:
             return self.error(tr("Configure JWT_SECRET_KEY before saving secrets"), 503)
         if method == "email":
             if not email_available():
-                return self.error(tr("Email verification is unavailable; ask an administrator to configure SMTP"), 503)
+                return self.error(tr("Email verification is unavailable; ask an administrator to configure email delivery"), 503)
             if not isinstance(email, str) or len(email) > 254 or not re.fullmatch(
                 r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}", email,
             ) or len(email.partition("@")[0]) > 64:
@@ -420,7 +392,7 @@ class MFA:
             if not self.password_valid(user, payload.get("password")):
                 return self.failed(db, account)
             if account.method != "email" or not email_available():
-                return self.error(tr("Email verification is unavailable; ask an administrator to configure SMTP"), 503)
+                return self.error(tr("Email verification is unavailable; ask an administrator to configure email delivery"), 503)
             error = self.email_limit(db, account)
             if error:
                 return error
@@ -470,7 +442,7 @@ class MFA:
             if challenge is None or challenge.method != "email":
                 return self.error()
             if not email_available():
-                return self.error(tr("Email verification is unavailable; ask an administrator to configure SMTP"), 503)
+                return self.error(tr("Email verification is unavailable; ask an administrator to configure email delivery"), 503)
             error = self.email_limit(db, account)
             if error:
                 return error

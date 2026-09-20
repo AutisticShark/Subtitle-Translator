@@ -427,7 +427,7 @@ async function loadMfa() {
   $('#mfaManageEmail').hidden = data.method !== 'email';
   $('#mfaMethod option[value="email"]').disabled = !data.email_available;
   if (!data.email_available && !data.method) {
-    $('#mfaStatus').textContent += `. ${t('Email verification is unavailable; ask an administrator to configure SMTP')}`;
+    $('#mfaStatus').textContent += `. ${t('Email verification is unavailable; ask an administrator to configure email delivery')}`;
   }
 }
 
