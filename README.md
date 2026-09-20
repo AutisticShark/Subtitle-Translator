@@ -100,6 +100,12 @@ Signed-in users can choose **System theme**, **Light**, or **Dark** from the app
 
 The Settings portal also controls translation-submission rate limits. Regular-user and administrator limits apply independently to each account, while the panel-wide limit covers all accounts. The shared window is configurable from 1 minute to 7 days; `0` disables an individual limit. Each uploaded subtitle counts as one job, and a multi-file request is accepted or rejected as a unit. Counters are stored in the application database so limits remain effective across restarts and multiple web workers.
 
+Administrators can also set **daily, weekly, and monthly translation limits** in **Settings → Submission rate limits**, separately for each regular-user account, each administrator account, and the whole panel. These limits apply together with the configurable submission window; every applicable limit must allow the complete upload. All new limits default to `0` (unlimited).
+
+Calendar periods use **UTC**: daily limits reset at midnight, weekly limits reset on Monday at midnight, and monthly limits reset on the first day of the next calendar month (not after 30 days). Each accepted subtitle file consumes one job regardless of its number of target languages. Failed, canceled, and deleted jobs still count. Rejected uploads consume no quota. Counters begin when this version is installed; older jobs are not backfilled. Usage is recorded even while a limit is unlimited, and saving or changing settings never clears calendar usage. Changing the existing configurable-window settings starts fresh counters for that window only.
+
+The settings API exposes `user_daily_job_limit`, `user_weekly_job_limit`, `user_monthly_job_limit`, and the equivalent `admin_` and `panel_` keys. Values must be whole numbers from 0 to 100,000 for account limits or 0 to 1,000,000 for panel limits. Exceeded limits return HTTP 429 with `scope`, `period`, `limit`, `used`, `requested`, `reset_at`, and a `Retry-After` header. If several limits are exceeded, the response describes the one with the latest reset. A batch larger than the limit must be reduced before retrying.
+
 ### Database backends
 
 SQLite remains the zero-configuration default at `/app/data/app.db`. Set `DATABASE_URL` for another backend:

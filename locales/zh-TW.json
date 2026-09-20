@@ -8,6 +8,11 @@
     "zh-MO"
   ],
   "messages": {
+    "Daily": "每日",
+    "Weekly": "每週",
+    "Monthly": "每月",
+    "Calendar limits apply alongside the submission window. Resets use UTC: midnight daily, Monday weekly, and the first day of each month. Saving settings preserves calendar usage.": "日曆期間限制與提交時段限制同時生效。重設時間以 UTC 為準：每日午夜、每週一及每月第一天。儲存設定會保留日曆期間的使用量。",
+    "{label} {period} translation limit of {limit} jobs exceeded. Resets at {reset} (UTC).": "已超過{label}{period}翻譯限制（{limit} 個工作）。將於 {reset}（UTC）重設。",
     "Subtitle Translator": "字幕翻譯器",
     "Private workspace": "私人工作區",
     "Context-aware translations, timing intact": "理解上下文，完整保留時間軸",

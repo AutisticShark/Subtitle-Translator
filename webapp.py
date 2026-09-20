@@ -124,10 +124,17 @@ DEFAULTS = {
     "recaptcha_site_key": os.environ.get("RECAPTCHA_SITE_KEY", "").strip(),
     "hcaptcha_site_key": os.environ.get("HCAPTCHA_SITE_KEY", "").strip(),
 }
-RATE_LIMIT_KEYS = {
+CALENDAR_PERIODS = ("daily", "weekly", "monthly")
+CALENDAR_LIMIT_KEYS = {
+    f"{scope}_{period}_job_limit"
+    for scope in ("user", "admin", "panel") for period in CALENDAR_PERIODS
+}
+DEFAULTS.update({key: "0" for key in CALENDAR_LIMIT_KEYS})
+WINDOW_LIMIT_KEYS = {
     "rate_limit_window_minutes", "user_job_limit", "admin_job_limit",
     "panel_job_limit",
 }
+RATE_LIMIT_KEYS = WINDOW_LIMIT_KEYS | CALENDAR_LIMIT_KEYS
 SECRET_KEYS = {
     "anthropic_api_key", "openai_api_key", "deepl_api_key", "google_api_key",
     "turnstile_secret_key", "recaptcha_secret_key", "hcaptcha_secret_key",
@@ -602,26 +609,43 @@ def verify_captcha(action: str, token: Any):
     return None
 
 
+def calendar_quota_window(period: str, timestamp: datetime) -> tuple[datetime, datetime]:
+    start = timestamp.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "daily":
+        return start, start + timedelta(days=1)
+    if period == "weekly":
+        start -= timedelta(days=start.weekday())
+        return start, start + timedelta(days=7)
+    if period == "monthly":
+        start = start.replace(day=1)
+        return start, (start + timedelta(days=32)).replace(day=1)
+    raise ValueError("Unknown quota period")
+
+
 def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
     """Atomically consume job quota or describe the exceeded limit."""
-    timestamp_datetime = now_datetime()
-    timestamp = timestamp_datetime.isoformat(timespec="seconds")
-
     # Every job submission and rate-setting update takes this database row lock first.
     # It serializes the panel counter across application workers and database backends.
     db.execute(update(settings_table).where(
         settings_table.c.name == "panel_job_limit"
     ).values(updated_at=settings_table.c.updated_at))
+    # Read time after acquiring the lock, including when waiting across a reset.
+    timestamp_datetime = now_datetime()
+    timestamp = timestamp_datetime.isoformat(timespec="seconds")
     stored = dict(db.execute(select(
         settings_table.c.name, settings_table.c.value
     ).where(settings_table.c.name.in_(RATE_LIMIT_KEYS))).all())
     limits = {key: int(stored.get(key, DEFAULTS[key])) for key in RATE_LIMIT_KEYS}
     window = timedelta(minutes=limits["rate_limit_window_minutes"])
     account_scope = f"user:{user.id}"
+    scopes = ["panel", account_scope] + [
+        f"{scope}:{period}" for period in CALENDAR_PERIODS
+        for scope in ("panel", account_scope)
+    ]
     rows = {
         row.scope: row
         for row in db.execute(select(rate_limit_buckets).where(
-            rate_limit_buckets.c.scope.in_(("panel", account_scope))
+            rate_limit_buckets.c.scope.in_(scopes)
         )).all()
     }
 
@@ -635,18 +659,29 @@ def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
     panel_started, panel_used = bucket("panel")
     account_started, account_used = bucket(account_scope)
     account_key = "admin_job_limit" if user.role == "admin" else "user_job_limit"
-    checks = (
-        (user.role, limits[account_key], account_started, account_used),
-        ("panel", limits["panel_job_limit"], panel_started, panel_used),
-    )
-    for scope, limit, started, used in checks:
+    checks = [
+        (user.role, limits[account_key], account_started, account_used,
+         account_started + window, "window", account_scope),
+        ("panel", limits["panel_job_limit"], panel_started, panel_used,
+         panel_started + window, "window", "panel"),
+    ]
+    for period in CALENDAR_PERIODS:
+        started, reset = calendar_quota_window(period, timestamp_datetime)
+        for scope, bucket_scope in ((user.role, account_scope), ("panel", "panel")):
+            bucket_key = f"{bucket_scope}:{period}"
+            row = rows.get(bucket_key)
+            used = int(row.used) if row and parse_timestamp(row.window_started_at) == started else 0
+            checks.append((scope, limits[f"{scope}_{period}_job_limit"],
+                           started, used, reset, period, bucket_key))
+    exceeded = []
+    for scope, limit, started, used, reset, period, bucket_key in checks:
         if limit and used + amount > limit:
-            retry_after = max(1, math.ceil((started + window - timestamp_datetime).total_seconds()))
+            retry_after = max(1, math.ceil((reset - timestamp_datetime).total_seconds()))
             label = tr("Administrator") if scope == "admin" else (
                 tr("Regular-user") if scope == "user" else tr("Panel-wide")
             )
-            return {
-                "error": tr(
+            if period == "window":
+                error = tr(
                     "{label} rate limit of {limit} translation job{job_plural} per "
                     "{minutes} minute{minute_plural} exceeded",
                     label=label, limit=limit, job_plural="s" if limit != 1 else "",
@@ -654,16 +689,29 @@ def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
                     minute_plural=(
                         "s" if limits["rate_limit_window_minutes"] != 1 else ""
                     ),
-                ),
+                )
+            else:
+                period_label = {"daily": tr("Daily"), "weekly": tr("Weekly"),
+                                "monthly": tr("Monthly")}[period]
+                error = tr(
+                    "{label} {period} translation limit of {limit} jobs exceeded. Resets at {reset} (UTC).",
+                    label=label, period=period_label, limit=limit,
+                    reset=reset.strftime("%Y-%m-%d %H:%M"),
+                )
+            exceeded.append({
+                "error": error,
                 "scope": scope,
                 "limit": limit,
                 "retry_after": retry_after,
-            }
+                "period": period,
+                "used": used,
+                "requested": amount,
+                "reset_at": reset.isoformat(timespec="seconds"),
+            })
+    if exceeded:
+        return max(exceeded, key=lambda item: item["retry_after"])
 
-    for scope, started, used in (
-        ("panel", panel_started, panel_used),
-        (account_scope, account_started, account_used),
-    ):
+    for _role, _limit, started, used, _reset, _period, scope in checks:
         values = {
             "window_started_at": started.isoformat(timespec="seconds"),
             "used": used + amount,
@@ -1219,7 +1267,10 @@ def delete_user(user_id: str):
             return jsonify(error=tr("Cancel or finish this user's active jobs first")), 409
         db.execute(update(jobs).where(jobs.c.user_id == user_id).values(user_id=None))
         db.execute(delete(rate_limit_buckets).where(
-            rate_limit_buckets.c.scope == f"user:{user_id}"
+            rate_limit_buckets.c.scope.in_([
+                f"user:{user_id}",
+                *(f"user:{user_id}:{period}" for period in CALENDAR_PERIODS),
+            ])
         ))
         db.execute(delete(users).where(users.c.id == user_id))
         bump_cache_revision(db, "jobs")
@@ -1282,6 +1333,8 @@ def save_settings():
         "user_job_limit": (0, 100000),
         "admin_job_limit": (0, 100000),
         "panel_job_limit": (0, 1000000),
+        **{key: (0, 1000000 if key.startswith("panel_") else 100000)
+           for key in CALENDAR_LIMIT_KEYS},
     }
     try:
         for key, (minimum, maximum) in numeric.items():
@@ -1311,10 +1364,18 @@ def save_settings():
         return jsonify(error=str(exc)), 400
     timestamp = now()
     with db_lock, transaction(engine) as db:
+        changed_window = False
         if RATE_LIMIT_KEYS & payload.keys():
             db.execute(update(settings_table).where(
                 settings_table.c.name == "panel_job_limit"
             ).values(updated_at=settings_table.c.updated_at))
+            previous = dict(db.execute(select(
+                settings_table.c.name, settings_table.c.value,
+            ).where(settings_table.c.name.in_(WINDOW_LIMIT_KEYS))).all())
+            changed_window = any(
+                str(payload[key]).strip() != previous.get(key, DEFAULTS[key])
+                for key in WINDOW_LIMIT_KEYS & payload.keys()
+            )
         for key, value in payload.items():
             clean_value = str(value).strip()
             if key in SECRET_KEYS and not clean_value:
@@ -1330,8 +1391,13 @@ def save_settings():
                 db.execute(insert(settings_table).values(
                     name=key, value=clean_value, updated_at=timestamp
                 ))
-        if RATE_LIMIT_KEYS & payload.keys():
-            db.execute(delete(rate_limit_buckets))
+        if changed_window:
+            # Calendar usage survives all settings edits, including disabling limits.
+            db.execute(delete(rate_limit_buckets).where(
+                ~rate_limit_buckets.c.scope.like("%:daily"),
+                ~rate_limit_buckets.c.scope.like("%:weekly"),
+                ~rate_limit_buckets.c.scope.like("%:monthly"),
+            ))
         bump_cache_revision(db, "settings")
     return jsonify(read_settings())
 

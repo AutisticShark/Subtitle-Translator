@@ -141,6 +141,7 @@ class WebApplicationTests(unittest.TestCase):
             "user_job_limit": 0,
             "admin_job_limit": 0,
             "panel_job_limit": 0,
+            **{key: 0 for key in webapp.CALENDAR_LIMIT_KEYS},
             "registration_enabled": "1",
             "captcha_provider": "none",
             "captcha_on_login": "1",
@@ -154,6 +155,8 @@ class WebApplicationTests(unittest.TestCase):
         self.client.put("/api/settings", json={
             "captcha_provider": "none", "registration_enabled": "1",
         })
+        with webapp.transaction(webapp.engine) as db:
+            db.execute(webapp.delete(webapp.rate_limit_buckets))
         super().tearDown()
 
     def insert_job(self, job_id, *, status="completed", outputs=None, filename="sample.srt"):
@@ -882,6 +885,160 @@ class WebApplicationTests(unittest.TestCase):
         with patch.object(webapp, "now_datetime", return_value=started + webapp.timedelta(seconds=61)):
             with webapp.transaction(webapp.engine) as db:
                 self.assertIsNone(webapp.consume_job_quota(db, admin, 1))
+
+    def test_calendar_limit_settings_validation_and_portal(self):
+        values = {key: index + 1 for index, key in enumerate(sorted(webapp.CALENDAR_LIMIT_KEYS))}
+        response = self.client.put("/api/settings", json=values)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        page = self.client.get("/").data
+        for key, value in values.items():
+            self.assertEqual(response.get_json()[key], str(value))
+            self.assertIn(f'name="{key}"'.encode(), page)
+        for key in values:
+            for invalid in (-1, "1.5", True, None, 1000001):
+                response = self.client.put("/api/settings", json={key: invalid})
+                self.assertEqual(response.status_code, 400, (key, invalid, response.get_json()))
+
+    def test_calendar_windows_and_exact_resets(self):
+        from types import SimpleNamespace
+
+        user = SimpleNamespace(id="calendar-test", role="user")
+        cases = (
+            ("daily", "2026-09-20T23:59:59+00:00", "2026-09-21T00:00:00+00:00"),
+            ("weekly", "2026-09-20T23:59:59+00:00", "2026-09-21T00:00:00+00:00"),
+            ("monthly", "2028-02-29T23:59:59+00:00", "2028-03-01T00:00:00+00:00"),
+            ("monthly", "2026-12-31T23:59:59+00:00", "2027-01-01T00:00:00+00:00"),
+        )
+        for period, before, after in cases:
+            with self.subTest(period=period, before=before):
+                self.client.put("/api/settings", json={
+                    **{key: 0 for key in webapp.CALENDAR_LIMIT_KEYS},
+                    f"user_{period}_job_limit": 1,
+                })
+                with patch.object(webapp, "now_datetime", return_value=webapp.datetime.fromisoformat(before)):
+                    with webapp.transaction(webapp.engine) as db:
+                        self.assertIsNone(webapp.consume_job_quota(db, user, 1))
+                    with webapp.transaction(webapp.engine) as db:
+                        error = webapp.consume_job_quota(db, user, 1)
+                    self.assertEqual(error["period"], period)
+                    self.assertEqual(error["reset_at"], after)
+                    self.assertEqual(error["retry_after"], 1)
+                with patch.object(webapp, "now_datetime", return_value=webapp.datetime.fromisoformat(after)):
+                    with webapp.transaction(webapp.engine) as db:
+                        self.assertIsNone(webapp.consume_job_quota(db, user, 1))
+                with webapp.transaction(webapp.engine) as db:
+                    db.execute(webapp.delete(webapp.rate_limit_buckets))
+        start, reset = webapp.calendar_quota_window(
+            "weekly", webapp.datetime.fromisoformat("2026-01-01T12:00:00+08:00"),
+        )
+        self.assertEqual(start.isoformat(), "2025-12-29T00:00:00+00:00")
+        self.assertEqual(reset.isoformat(), "2026-01-05T00:00:00+00:00")
+
+    def test_calendar_quota_preserves_usage_across_settings_and_job_deletion(self):
+        self.enable_cache()
+        job_ids = []
+        self.addCleanup(self._remove_rate_limit_test_data, job_ids)
+        with patch.object(webapp.executor, "submit"):
+            response = self.client.post("/api/jobs", data=self._job_payload("one.srt", "two.srt"))
+        self.assertEqual(response.status_code, 202, response.get_json())
+        job_ids.extend(response.get_json()["jobs"])
+        for job_id in job_ids:
+            webapp.update_job(job_id, status="failed")
+            self.assertEqual(self.client.delete(f"/api/jobs/{job_id}").status_code, 200)
+        settings = {"admin_monthly_job_limit": 2, "rate_limit_window_minutes": 5}
+        for payload in (settings, settings, {"admin_monthly_job_limit": 0}, settings):
+            self.assertEqual(self.client.put("/api/settings", json=payload).status_code, 200)
+        # Database startup/recovery must retain calendar counters too.
+        webapp.initialize_database(webapp.engine, webapp.DEFAULTS, webapp.now())
+        response = self.client.post("/api/jobs?lang=zh-TW", data=self._job_payload("three.srt"))
+        self.assertEqual(response.status_code, 429, response.get_json())
+        self.assertEqual(response.get_json()["period"], "monthly")
+        self.assertEqual(response.get_json()["used"], 2)
+        self.assertIn("每月", response.get_json()["error"])
+        self.assertEqual(int(response.headers["Retry-After"]), response.get_json()["retry_after"])
+
+    def test_calendar_limits_are_layered_and_rejection_does_not_consume_any_bucket(self):
+        from types import SimpleNamespace
+
+        regular = SimpleNamespace(id="calendar-regular", role="user")
+        other = SimpleNamespace(id="calendar-other", role="user")
+        admin = SimpleNamespace(id="calendar-admin", role="admin")
+        self.client.put("/api/settings", json={
+            "user_daily_job_limit": 1, "admin_daily_job_limit": 2,
+            "panel_monthly_job_limit": 4,
+        })
+        def consume(user, amount):
+            with webapp.transaction(webapp.engine) as db:
+                return webapp.consume_job_quota(db, user, amount)
+        self.assertIsNone(consume(regular, 1))
+        self.assertEqual(consume(regular, 1)["scope"], "user")
+        self.assertIsNone(consume(other, 1))
+        with webapp.connection(webapp.engine) as db:
+            before = db.execute(webapp.select(webapp.rate_limit_buckets)).all()
+        self.assertEqual(consume(admin, 3)["period"], "monthly")
+        with webapp.connection(webapp.engine) as db:
+            self.assertEqual(db.execute(webapp.select(webapp.rate_limit_buckets)).all(), before)
+        self.assertIsNone(consume(admin, 2))
+        self.assertEqual(consume(other, 1)["scope"], "panel")
+        # Changing role cannot discard the account's accumulated usage.
+        self.client.put("/api/settings", json={"panel_monthly_job_limit": 0})
+        admin.role = "user"
+        self.assertEqual(consume(admin, 1)["used"], 2)
+
+    def test_calendar_panel_quota_serializes_independent_database_connections(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+
+        self.client.put("/api/settings", json={"panel_daily_job_limit": 1})
+        barrier = threading.Barrier(2)
+        def submit(index):
+            barrier.wait(timeout=10)
+            # No process-local db_lock: the SQL row lock must serialize these.
+            with webapp.transaction(webapp.engine) as db:
+                return webapp.consume_job_quota(db, SimpleNamespace(id=f"race-{index}", role="user"), 1)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, range(2)))
+        self.assertEqual(sum(result is None for result in results), 1)
+        self.assertEqual(next(result for result in results if result)["scope"], "panel")
+
+    def test_calendar_multifile_rejection_is_atomic_and_cleans_staged_files(self):
+        self.client.put("/api/settings", json={"admin_weekly_job_limit": 2})
+        job_ids = []
+        self.addCleanup(self._remove_rate_limit_test_data, job_ids)
+        with patch.object(webapp.executor, "submit") as submit:
+            accepted = self.client.post("/api/jobs", data=self._job_payload("one.srt"))
+            self.assertEqual(accepted.status_code, 202, accepted.get_json())
+            job_ids.extend(accepted.get_json()["jobs"])
+            folders = set(webapp.JOBS_DIR.iterdir())
+            with webapp.connection(webapp.engine) as db:
+                counters = db.execute(webapp.select(webapp.rate_limit_buckets)).all()
+                job_count = db.scalar(webapp.select(webapp.func.count()).select_from(webapp.jobs))
+            rejected = self.client.post("/api/jobs", data=self._job_payload("two.srt", "three.srt"))
+            self.assertEqual(rejected.status_code, 429, rejected.get_json())
+            self.assertEqual(rejected.get_json()["period"], "weekly")
+            self.assertEqual(rejected.get_json()["requested"], 2)
+            self.assertEqual(set(webapp.JOBS_DIR.iterdir()), folders)
+            with webapp.connection(webapp.engine) as db:
+                self.assertEqual(db.execute(webapp.select(webapp.rate_limit_buckets)).all(), counters)
+                self.assertEqual(db.scalar(webapp.select(webapp.func.count()).select_from(webapp.jobs)), job_count)
+            self.assertEqual(submit.call_count, 1)
+            last = self.client.post("/api/jobs", data=self._job_payload("last.srt"))
+            self.assertEqual(last.status_code, 202, last.get_json())
+            job_ids.extend(last.get_json()["jobs"])
+
+    def test_calendar_quota_rolls_back_with_failed_job_transaction(self):
+        from types import SimpleNamespace
+
+        with webapp.connection(webapp.engine) as db:
+            before = db.execute(webapp.select(webapp.rate_limit_buckets)).all()
+        with self.assertRaisesRegex(RuntimeError, "job insert failed"):
+            with webapp.transaction(webapp.engine) as db:
+                self.assertIsNone(webapp.consume_job_quota(
+                    db, SimpleNamespace(id="rollback-user", role="user"), 1,
+                ))
+                raise RuntimeError("job insert failed")
+        with webapp.connection(webapp.engine) as db:
+            self.assertEqual(db.execute(webapp.select(webapp.rate_limit_buckets)).all(), before)
 
     def test_active_job_cannot_be_deleted(self):
         job_id = "active-delete-test"

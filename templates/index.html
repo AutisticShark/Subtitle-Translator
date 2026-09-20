@@ -310,6 +310,25 @@
           <label>{{ tr('Administrator jobs') }}<input type="number" name="admin_job_limit" min="0" max="100000" step="1"></label>
           <label>{{ tr('Panel-wide jobs') }}<input type="number" name="panel_job_limit" min="0" max="1000000" step="1"></label>
         </div>
+        <p class="settings-intro">{{ tr('Calendar limits apply alongside the submission window. Resets use UTC: midnight daily, Monday weekly, and the first day of each month. Saving settings preserves calendar usage.') }}</p>
+        <h3>{{ tr('Daily') }}</h3>
+        <div class="settings-group compact-grid">
+          <label>{{ tr('Regular user jobs') }}<input type="number" name="user_daily_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Administrator jobs') }}<input type="number" name="admin_daily_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Panel-wide jobs') }}<input type="number" name="panel_daily_job_limit" min="0" max="1000000" step="1"></label>
+        </div>
+        <h3>{{ tr('Weekly') }}</h3>
+        <div class="settings-group compact-grid">
+          <label>{{ tr('Regular user jobs') }}<input type="number" name="user_weekly_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Administrator jobs') }}<input type="number" name="admin_weekly_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Panel-wide jobs') }}<input type="number" name="panel_weekly_job_limit" min="0" max="1000000" step="1"></label>
+        </div>
+        <h3>{{ tr('Monthly') }}</h3>
+        <div class="settings-group compact-grid">
+          <label>{{ tr('Regular user jobs') }}<input type="number" name="user_monthly_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Administrator jobs') }}<input type="number" name="admin_monthly_job_limit" min="0" max="100000" step="1"></label>
+          <label>{{ tr('Panel-wide jobs') }}<input type="number" name="panel_monthly_job_limit" min="0" max="1000000" step="1"></label>
+        </div>
       </details>
       <div class="dialog-actions"><span id="settingsMessage"></span><button class="primary" type="submit">{{ tr('Save settings') }}</button></div>
     </form>
