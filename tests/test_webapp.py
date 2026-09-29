@@ -1190,16 +1190,24 @@ class WebApplicationTests(unittest.TestCase):
         def failing_provider(_texts, _source, _target):
             raise TranslationError("cannot translate")
 
+        real_translate = webapp.translate_segments
+
+        def translate_without_backoff(*args, **kwargs):
+            # Positional index 5 is `retries`; one attempt means no backoff sleeps.
+            # Do not patch time.sleep: it is process-wide and would also disable
+            # this test's own polling and any other thread's sleeps.
+            return real_translate(*args[:5], 1, *args[6:], **kwargs)
+
         source = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
-        with patch.object(webapp, "make_echo", return_value=failing_provider), \
-                patch("srt_translate.time.sleep"):
+        with patch.object(webapp, "provider_for", return_value=failing_provider),                 patch.object(webapp, "translate_segments", side_effect=translate_without_backoff):
             response = self.client.post("/api/jobs", data={
                 "provider": "echo",
                 "target_languages": "es",
                 "files": (io.BytesIO(source), "warn.srt"),
             }, content_type="multipart/form-data")
             job_id = response.get_json()["jobs"][0]
-            for _ in range(200):
+            job = None
+            for _ in range(500):
                 job = self.client.get(f"/api/jobs/{job_id}").get_json()
                 if job["status"] in {"completed", "failed"}:
                     break
