@@ -1,6 +1,6 @@
 # Subtitle Translator
 
-A self-hosted web app and command-line tool for translating subtitle files with LLM APIs, DeepL, or Google Cloud Translation while preserving timings, dialogue structure, positioning, and inline styling.
+A self-hosted web app for translating subtitle files with LLM APIs, DeepL, or Google Cloud Translation while preserving timings, dialogue structure, positioning, and inline styling.
 
 ## Highlights
 
@@ -21,7 +21,6 @@ A self-hosted web app and command-line tool for translating subtitle files with 
 - Optional Redis cache for settings and frequently polled job lists/details, with SQL fallback
 - Context-aware batching, shared rate-limit backoff, retries, resumable per-job cache, tag masking, and subtitle-aware line wrapping
 - Docker health check, persistent named volume, CSRF-protected HttpOnly auth cookies, and bearer-token API support
-- The original CLI remains available
 
 ## Start with Docker Compose
 
@@ -168,24 +167,9 @@ The app listens on `http://localhost:8000` and creates `data/` on first start. S
 | Google Cloud Translation | API key | Uses Cloud Translation - Basic (v2) with the standard NMT model |
 | Echo | None | Offline pipeline test; available in the web app only with `FLASK_DEBUG=1` |
 
-The language list is shared by the CLI and web app. DeepL and Google Cloud Translation must support the selected target; the LLM providers can use every target shown in the UI. For Google, enter a supported source language code (such as `en`) or a known language name; otherwise the API automatically detects the source language. Echo remains available to the CLI for offline pipeline checks without enabling web debug mode.
+DeepL and Google Cloud Translation must support the selected target; the LLM providers can use every target shown in the UI. For Google, enter a supported source language code (such as `en`) or a known language name; otherwise the API automatically detects the source language.
 
 For Google Cloud Translation, enable the Cloud Translation API in a Google Cloud project and create an API key. Save it in the web Settings screen or set `GOOGLE_API_KEY`. The integration uses the API-key-compatible Basic v2 endpoint; it does not require a service-account credential file.
-
-## CLI
-
-Existing usage is preserved, with OpenAI-compatible support added:
-
-```bash
-python srt_translate.py episode.srt --provider anthropic --langs zh-TW,ja
-python srt_translate.py episode.srt --provider deepl --langs de
-python srt_translate.py episode.srt --provider google --langs zh-TW --api-key @~/.google-key
-python srt_translate.py episode.srt --provider openai --model gpt-5-mini \
-  --base-url https://api.openai.com/v1
-python srt_translate.py episode.srt --provider echo
-```
-
-The CLI currently writes SRT. Use the web app for VTT, ASS, and SSA.
 
 ## Development and tests
 

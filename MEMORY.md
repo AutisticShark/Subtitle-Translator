@@ -46,18 +46,18 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 
 - Evidence: the expanded SRT writer tests on 2026-08-29 found that `write_srt(..., crlf=True)` emitted `\r\r\n` in this Windows workspace.
 - Mistake: `write_srt` assembled `\r\n` separators, then used `Path.write_text` with its default platform newline handling, which translated the embedded `\n` a second time.
-- User-visible result: the SRT-only CLI could write malformed line endings when preserving a CRLF source on Windows.
+- User-visible result: the SRT-only CLI could write malformed line endings when preserving a CRLF source on Windows. (The CLI and `write_srt` were later removed; the lesson still applies to any code that assembles its own newline sequences, such as the web app's subtitle renderers.)
 - Fix: pass `newline=""` when writing the already-normalized SRT text.
 - Prevention: when code chooses the output newline sequence itself, disable platform newline translation and verify the raw output bytes in a focused test.
 
 ## Durable project context
 
-- The application is a self-hosted Flask web UI plus a Python CLI for translating subtitles.
-- Supported web formats are SRT, VTT, ASS, and SSA. The CLI currently writes SRT only.
+- The application is a self-hosted Flask web UI for translating subtitles. The original command-line interface was removed (decision by the project owner, 2026-09-29); `srt_translate.py` remains as the translation-engine library the web app imports.
+- Supported formats are SRT, VTT, ASS, and SSA.
 - Providers are Anthropic, OpenAI-compatible APIs, DeepL, Google Cloud Translation - Basic v2, and offline Echo.
 - Runtime settings, job records, uploads, outputs, and resumable caches live below `DATA_DIR` (the Docker volume maps it to `/app/data`).
 - The settings API treats secrets as write-only. Preserve that security property.
-- Echo is the safe, deterministic provider for the CLI and offline tests. The web UI and API expose and accept Echo only while Flask debug mode is enabled; normal instances must reject crafted Echo job requests server-side as well as hiding the option.
+- Echo is the safe, deterministic provider for offline tests. The web UI and API expose and accept Echo only while Flask debug mode is enabled; normal instances must reject crafted Echo job requests server-side as well as hiding the option.
 - Docker publishing always targets GHCR. Docker Hub is optional and requires `DOCKERHUB_IMAGE`, `DOCKERHUB_USERNAME`, and `DOCKERHUB_TOKEN` together.
 
 ## Web interface localization
@@ -77,7 +77,7 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 ## Google Cloud Translation adapter
 
 - The Google provider uses the API-key-compatible Cloud Translation - Basic v2 endpoint and the standard NMT model; it does not require a service-account file.
-- Google accepts at most 128 `q` strings in one request. The web batch-size maximum remains 100, while the provider also rejects oversized batches explicitly for CLI callers.
+- Google accepts at most 128 `q` strings in one request. The web batch-size maximum remains 100, while the provider also rejects oversized batches explicitly for any direct caller.
 - A recognized source language name or BCP-47 code is sent as `source`; other source labels are omitted so Google can auto-detect them.
 - Google returns HTML-escaped `translatedText` values. Unescape every value and require the returned translation count to equal the input count before rebuilding subtitle cues.
 - `google_api_key` is write-only through the settings API and may be bootstrapped with `GOOGLE_API_KEY`, matching the existing provider-secret precedence rules.
@@ -133,7 +133,7 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 
 ## Translation-cache I/O boundary
 
-- The CLI sidecar cache is untrusted because a user can edit it between runs. Load it through `json.load` and retain only the expected mapping of 24-character lowercase hexadecimal content hashes to translated strings.
+- The removed CLI used an editable sidecar cache, which had to be treated as untrusted input: load it through `json.load` and retain only the expected mapping of 24-character lowercase hexadecimal content hashes to translated strings. Apply the same rule if a file-backed cache is ever reintroduced.
 - Keep path selection separate from cache serialization: open the already-selected sidecar path first, then stream the cache with `json.dump`. Passing `json.dumps(cache)` to `Path.write_text` caused Sonar rule `pythonsecurity:S2083` to trace untrusted cache content into an I/O path sink even though the value was intended as file content.
 
 ## Development server network boundary

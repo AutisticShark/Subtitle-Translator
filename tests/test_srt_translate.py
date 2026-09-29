@@ -1,9 +1,5 @@
 import hashlib
-import io
-import json
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
 from srt_translate import (
@@ -15,21 +11,15 @@ from srt_translate import (
     TranslationError,
     _parse_retry_after,
     display_width,
-    load_translation_cache,
-    main,
     mask_tags,
-    output_path,
     parse_numbered,
     parse_srt,
     rebuild_cues,
-    resolve_key,
-    save_translation_cache,
     segment_cue,
     translate_segments,
     unmask_tags,
     wrap_cjk,
     wrap_latin,
-    write_srt,
 )
 
 
@@ -50,18 +40,6 @@ class SrtParsingTests(unittest.TestCase):
         self.assertEqual(cues[0].lines, ["First line", "", "continued"])
         self.assertEqual(cues[1].index, 9)
         self.assertEqual(cues[1].start, "00:00:03.000")
-
-    def test_write_srt_can_preserve_bom_crlf_and_renumber(self):
-        cues = [Cue(7, "00:00:01,000", "00:00:02,000", " position:10%", ["Hi"])]
-        with tempfile.TemporaryDirectory() as temp_dir:
-            destination = Path(temp_dir) / "out.srt"
-            write_srt(cues, destination, bom=True, crlf=True, renumber=True)
-            raw = destination.read_bytes()
-
-        self.assertTrue(raw.startswith(b"\xef\xbb\xbf1\r\n"))
-        self.assertIn(b"00:00:01,000 --> 00:00:02,000 position:10%\r\n", raw)
-        self.assertTrue(raw.endswith(b"\r\n"))
-
 
 class SegmentationAndWrappingTests(unittest.TestCase):
     def test_masks_and_restores_inline_tags(self):
@@ -207,66 +185,6 @@ class TranslationDriverTests(unittest.TestCase):
                 lambda *_args: ["Hola"],
                 cancel_callback=lambda: True,
             )
-
-
-class CliTests(unittest.TestCase):
-    def test_output_path_replaces_english_suffix(self):
-        self.assertEqual(
-            output_path(Path("episode.en.srt"), "zh-TW", Path("translated")),
-            Path("translated/episode.zh.tw.srt"),
-        )
-
-    def test_translation_cache_rejects_unexpected_untrusted_entries(self):
-        valid_key = "a" * 24
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_path = Path(temp_dir) / "input.srt.xlate-cache.json"
-            with cache_path.open("w", encoding="utf-8") as cache_file:
-                json.dump({
-                    valid_key: "Hola",
-                    "../outside.json": "not a cache key",
-                    "b" * 24: ["not", "text"],
-                }, cache_file)
-
-            self.assertEqual(load_translation_cache(cache_path), {valid_key: "Hola"})
-
-    def test_translation_cache_treats_path_like_values_as_json_data(self):
-        cache = {"a" * 24: "../../outside.json"}
-        with tempfile.TemporaryDirectory() as temp_dir:
-            cache_path = Path(temp_dir) / "input.srt.xlate-cache.json"
-
-            save_translation_cache(cache_path, cache)
-
-            with cache_path.open("r", encoding="utf-8") as cache_file:
-                self.assertEqual(json.load(cache_file), cache)
-            self.assertEqual(set(Path(temp_dir).iterdir()), {cache_path})
-
-    def test_resolve_key_supports_file_stdin_and_environment(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            key_file = Path(temp_dir) / "key.txt"
-            key_file.write_text("\nfile-secret\n", "utf-8")
-            self.assertEqual(resolve_key(f"@{key_file}", "UNUSED_KEY", "Test"), "file-secret")
-
-        with patch("srt_translate.sys.stdin", io.StringIO("\nstdin-secret\n")):
-            self.assertEqual(resolve_key("-", "UNUSED_KEY", "Test"), "stdin-secret")
-        with patch.dict("os.environ", {"TEST_PROVIDER_KEY": " env-secret "}):
-            self.assertEqual(resolve_key(None, "TEST_PROVIDER_KEY", "Test"), "env-secret")
-
-    def test_echo_cli_translates_srt_without_credentials(self):
-        source_bytes = b"1\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n\r\n"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            source = Path(temp_dir) / "episode.en.srt"
-            source.write_bytes(source_bytes)
-
-            result = main([
-                str(source), "--provider", "echo", "--langs", "es", "--quiet",
-            ])
-
-            output = Path(temp_dir) / "episode.es.srt"
-            self.assertEqual(result, 0)
-            self.assertTrue(output.exists())
-            self.assertIn("[es] Hello", output.read_text("utf-8"))
-            self.assertIn(b"\r\n", output.read_bytes())
-            self.assertTrue(source.with_suffix(".srt.xlate-cache.json").exists())
 
 
 if __name__ == "__main__":

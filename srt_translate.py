@@ -1,51 +1,32 @@
-#!/usr/bin/env python3
 """
-srt_translate.py — translate SubRip (.srt) subtitles into Chinese (or any target
-language) while preserving cue numbering, timing, speaker dashes and inline markup.
+Subtitle translation engine used by the web app: SubRip (.srt) parsing, tag masking,
+segmentation, provider clients, batched translation, cue rebuilding, and wrapping.
 
 Design notes
 ------------
-* zh-TW and zh-CN are translated as INDEPENDENT passes by default. Running OpenCC
-  over a simplified translation gives you correct glyphs and wrong vocabulary
-  (软件/軟體, 视频/影片, 网络/網路, 打印/列印...). Use --zh-tw-mode=opencc only if
-  you explicitly want the cheap path.
 * Cues are sent in batches with surrounding context so the model can resolve
   pronouns and continuation lines across cue boundaries.
 * Inline markup (<i>, <b>, <font ...>, {\\an8}, ASS overrides) is masked with
   sentinels before translation and restored after, so it can't be "helpfully"
   reworded away.
-* Results are cached to a sidecar .json keyed by content hash. Re-runs are free
-  and interrupted runs resume.
-
-Usage
------
-    python srt_translate.py input.srt --api-key sk-...     # writes .zh.tw.srt + .zh.cn.srt
-    python srt_translate.py input.srt --api-key @~/.anthropic-key
-    pass anthropic/key | python srt_translate.py input.srt --api-key -
-    export ANTHROPIC_API_KEY=sk-...; python srt_translate.py input.srt
-    python srt_translate.py *.srt --workers 8 --langs zh-TW
-    python srt_translate.py input.srt --provider deepl --api-key @~/.deepl-key
-    python srt_translate.py input.srt --provider google --api-key @~/.google-key
-    python srt_translate.py input.srt --provider echo      # offline dry run
+* Translations are cached by content hash so interrupted jobs resume without
+  repeating completed batches.
 """
 
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import hashlib
 import html
 import json
-import os
 import random
 import re
 import sys
 import threading
 import time
 import unicodedata
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from typing import Callable
 
 # --------------------------------------------------------------------------- #
 # Language table
@@ -182,21 +163,6 @@ def parse_srt(raw: str) -> list[Cue]:
         )
 
     return cues
-
-
-def write_srt(cues: Sequence[Cue], path: Path, *, bom: bool = False,
-              crlf: bool = False, renumber: bool = False) -> None:
-    eol = "\r\n" if crlf else "\n"
-    out: list[str] = []
-    for n, c in enumerate(cues, 1):
-        out.append(str(n if renumber else c.index))
-        out.append(f"{c.start} --> {c.end}{c.rest}")
-        out.extend(c.lines if c.lines else [""])
-        out.append("")
-    text = eol.join(out)
-    if not text.endswith(eol):
-        text += eol
-    path.write_text(("\ufeff" if bom else "") + text, encoding="utf-8", newline="")
 
 
 # --------------------------------------------------------------------------- #
@@ -880,249 +846,3 @@ def rebuild_cues(
         new.append(Cue(cue.index, cue.start, cue.end, cue.rest, lines))
 
     return new
-
-
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
-
-def output_path(src: Path, tgt_key: str, outdir: Path | None) -> Path:
-    stem = src.name
-    if stem.lower().endswith(".srt"):
-        stem = stem[:-4]
-    # Strip an existing language suffix so .en.srt -> .zh.tw.srt, not .en.zh.tw.srt
-    stem = re.sub(r"\.(en|eng|english)$", "", stem, flags=re.I)
-    name = f"{stem}{LANGS[tgt_key]['suffix']}.srt"
-    return (outdir or src.parent) / name
-
-
-_CACHE_KEY_RE = re.compile(r"[0-9a-f]{24}")
-
-
-def load_translation_cache(cache_path: Path) -> dict[str, str]:
-    """Load only the hash-to-text entries expected in a translation cache."""
-    try:
-        with cache_path.open("r", encoding="utf-8") as cache_file:
-            payload = json.load(cache_file)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-
-    if not isinstance(payload, dict):
-        return {}
-    return {
-        key: value
-        for key, value in payload.items()
-        if isinstance(key, str)
-        and _CACHE_KEY_RE.fullmatch(key)
-        and isinstance(value, str)
-    }
-
-
-def save_translation_cache(cache_path: Path, cache: dict[str, str]) -> None:
-    """Write cache data to an already-selected sidecar file."""
-    with cache_path.open("w", encoding="utf-8", newline="") as cache_file:
-        json.dump(cache, cache_file, ensure_ascii=False)
-
-
-def process(path: Path, args, provider, throttle: Throttle) -> None:
-    raw = path.read_bytes()
-    bom = raw.startswith(b"\xef\xbb\xbf")
-    crlf = b"\r\n" in raw[:4000] if not args.lf else False
-    text = raw.decode(args.encoding, errors="replace")
-
-    cues = parse_srt(text)
-    if not cues:
-        print(f"!! {path.name}: no cues parsed", file=sys.stderr)
-        return
-    print(f"{path.name}: {len(cues)} cues", file=sys.stderr)
-
-    segs: list[Segment] = []
-    for ci, cue in enumerate(cues):
-        segs.extend(segment_cue(cue, ci))
-
-    cache_path = path.with_suffix(path.suffix + ".xlate-cache.json")
-    cache = load_translation_cache(cache_path) if not args.no_cache else {}
-
-    for tgt_key in args.langs:
-        dest = output_path(path, tgt_key, args.outdir)
-        if dest.exists() and not args.force:
-            print(f"  skip {dest.name} (exists; --force to overwrite)", file=sys.stderr)
-            continue
-
-        out = translate_segments(
-            segs, provider, tgt_key, args.source_lang,
-            args.batch_size, args.retries, args.rate_limit_retries,
-            throttle, cache, args.workers, args.quiet,
-        )
-        new_cues = rebuild_cues(cues, segs, out, tgt_key, args.width, args.max_lines)
-
-        if args.outdir:
-            args.outdir.mkdir(parents=True, exist_ok=True)
-        write_srt(new_cues, dest, bom=bom, crlf=crlf, renumber=args.renumber)
-        print(f"  -> {dest}", file=sys.stderr)
-
-        if not args.no_cache:
-            save_translation_cache(cache_path, cache)
-
-    if args.zh_tw_mode == "opencc" and "zh-CN" in args.langs and "zh-TW" not in args.langs:
-        convert_opencc(output_path(path, "zh-CN", args.outdir),
-                       output_path(path, "zh-TW", args.outdir))
-
-
-def convert_opencc(src: Path, dest: Path) -> None:
-    try:
-        import opencc  # type: ignore
-    except ImportError:
-        print("!! --zh-tw-mode=opencc needs: pip install opencc-python-reimplemented",
-              file=sys.stderr)
-        return
-    conv = opencc.OpenCC("s2twp")  # s2twp includes Taiwan phrase substitution
-    cues = parse_srt(src.read_text("utf-8"))
-    for c in cues:
-        c.lines = [conv.convert(l) for l in c.lines]
-    write_srt(cues, dest)
-    print(f"  -> {dest} (via OpenCC s2twp)", file=sys.stderr)
-
-
-def resolve_key(cli_value: str | None, env_name: str, label: str) -> str:
-    """Resolve an API key from --api-key, then $ENV.
-
-    --api-key accepts:
-      sk-xxxx          literal value
-      @/path/to/file   read from a file (first non-empty line)
-      -                read from stdin
-    A literal on the command line is visible in shell history and to anyone who
-    can run `ps` on the box, so @file or the env var is safer for anything
-    long-lived. Nothing stops you using the literal for a one-off.
-    """
-    v = cli_value
-    if v:
-        v = v.strip()
-        if v == "-":
-            v = ""
-            for line in sys.stdin:
-                if line.strip():
-                    v = line.strip()
-                    break
-            if not v:
-                raise SystemExit(f"error: no {label} key read from stdin")
-        elif v.startswith("@"):
-            path = Path(os.path.expanduser(v[1:]))
-            if not path.is_file():
-                raise SystemExit(f"error: key file not found: {path}")
-            v = next((l.strip() for l in path.read_text("utf-8").splitlines()
-                      if l.strip()), "")
-            if not v:
-                raise SystemExit(f"error: key file is empty: {path}")
-        return v
-
-    v = os.environ.get(env_name, "").strip()
-    if not v:
-        raise SystemExit(
-            f"error: no {label} key. Pass --api-key (value, @file, or - for "
-            f"stdin) or set ${env_name}."
-        )
-    return v
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    p = argparse.ArgumentParser(
-        description="Translate .srt subtitles, preserving timing and structure.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument("files", nargs="+", type=Path)
-    p.add_argument("--langs", default="zh-TW,zh-CN",
-                   help="comma-separated targets (default: zh-TW,zh-CN)")
-    p.add_argument("--source-lang", default="English")
-    p.add_argument("--provider",
-                   choices=["anthropic", "openai", "deepl", "google", "echo"],
-                   default="anthropic")
-    p.add_argument("--model", default="claude-sonnet-4-6",
-                   help="model id for LLM providers")
-    p.add_argument("--base-url", default="https://api.openai.com/v1",
-                   help="base URL for --provider=openai")
-    p.add_argument("--zh-tw-mode", choices=["native", "opencc"], default="native",
-                   help="native = separate translation pass (default, better); "
-                        "opencc = convert from the zh-CN output (cheap, worse)")
-    p.add_argument("--batch-size", type=int, default=20)
-    p.add_argument("--workers", type=int, default=4)
-    p.add_argument("--retries", type=int, default=4,
-                   help="attempts for genuine errors (5xx, network)")
-    p.add_argument("--rate-limit-retries", type=int, default=10,
-                   help="separate, larger budget for 429/529 backoff")
-    p.add_argument("--rpm", type=float, default=0,
-                   help="client-side cap on requests/min across all workers "
-                        "(0 = unthrottled until the API pushes back)")
-    p.add_argument("--width", type=float, default=16,
-                   help="max line width in full-width chars (default 16)")
-    p.add_argument("--max-lines", type=int, default=2)
-    p.add_argument("--encoding", default="utf-8")
-    p.add_argument("--outdir", type=Path)
-    p.add_argument("--renumber", action="store_true",
-                   help="renumber cues 1..N instead of keeping source indices")
-    p.add_argument("--lf", action="store_true", help="force LF endings")
-    p.add_argument("--force", action="store_true", help="overwrite existing outputs")
-    p.add_argument("--no-cache", action="store_true")
-    p.add_argument("--api-key", metavar="KEY",
-                   help="API key for the chosen provider. Accepts a literal "
-                        "value, @/path/to/keyfile, or - to read from stdin. "
-                        "Falls back to $ANTHROPIC_API_KEY / $OPENAI_API_KEY / "
-                        "$DEEPL_API_KEY / $GOOGLE_API_KEY.")
-    p.add_argument("--quiet", action="store_true")
-    args = p.parse_args(argv)
-
-    args.langs = [l.strip() for l in args.langs.split(",") if l.strip()]
-    for l in args.langs:
-        if l not in LANGS:
-            p.error(f"unknown language {l!r}; known: {', '.join(LANGS)}")
-
-    throttle = Throttle(rpm=args.rpm)
-
-    if args.provider == "anthropic":
-        provider = make_anthropic(
-            args.model,
-            resolve_key(args.api_key, "ANTHROPIC_API_KEY", "Anthropic"),
-            throttle,
-        )
-    elif args.provider == "openai":
-        provider = make_openai(
-            args.model,
-            resolve_key(args.api_key, "OPENAI_API_KEY", "OpenAI-compatible"),
-            throttle,
-            args.base_url,
-        )
-    elif args.provider == "deepl":
-        provider = make_deepl(
-            resolve_key(args.api_key, "DEEPL_API_KEY", "DeepL"), throttle
-        )
-    elif args.provider == "google":
-        provider = make_google(
-            resolve_key(args.api_key, "GOOGLE_API_KEY", "Google Cloud Translation"),
-            throttle,
-        )
-    else:
-        provider = make_echo()
-
-    files = [f for f in args.files if f.is_file()]
-    if not files:
-        p.error("no readable input files")
-
-    for f in files:
-        try:
-            process(f, args, provider, throttle)
-        except KeyboardInterrupt:
-            print("\ninterrupted (cache saved; re-run to resume)", file=sys.stderr)
-            return 130
-        except FatalTranslationError as e:
-            print(f"\n!! aborting: {e}", file=sys.stderr)
-            print("   check the provider settings, then re-run "
-                  "(finished work is cached).", file=sys.stderr)
-            return 2
-        except Exception as e:
-            print(f"!! {f.name}: {type(e).__name__}: {e}", file=sys.stderr)
-
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

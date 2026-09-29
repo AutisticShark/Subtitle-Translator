@@ -2,7 +2,7 @@
 
 Subtitle Translator includes a shared transactional email service in `email_delivery.py`. MFA enrollment, login codes, resends, and account management codes all use this service. Other application features can reuse it without depending on MFA or Flask.
 
-Configuration belongs to the deployment environment, as in the previous SMTP implementation. It is not saved in SQL, Redis, or the administrator settings API. Only email availability is exposed to the account security screen. The translation CLI does not send email.
+Configuration belongs to the deployment environment, as in the previous SMTP implementation. It is not saved in SQL, Redis, or the administrator settings API. Only email availability is exposed to the account security screen.
 
 ## Choose a provider
 
