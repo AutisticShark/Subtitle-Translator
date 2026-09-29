@@ -8,6 +8,8 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
+import urllib.request
 from unittest.mock import Mock, patch
 
 
@@ -274,7 +276,7 @@ class WebApplicationTests(unittest.TestCase):
             "/api/auth/register", json=payload,
         ).status_code, 400)
         with patch.object(
-            webapp.urllib.request, "urlopen",
+            urllib.request, "urlopen",
             return_value=io.BytesIO(json.dumps({
                 "success": True, "hostname": "localhost",
             }).encode()),
@@ -334,7 +336,7 @@ class WebApplicationTests(unittest.TestCase):
                 if provider == "turnstile":
                     verification["action"] = "login"
                 with patch.object(
-                    webapp.urllib.request, "urlopen",
+                    urllib.request, "urlopen",
                     return_value=io.BytesIO(json.dumps(verification).encode()),
                 ) as urlopen:
                     accepted = webapp.app.test_client().post("/api/auth/login", json={
@@ -345,7 +347,7 @@ class WebApplicationTests(unittest.TestCase):
                 self.assertEqual(accepted.status_code, 200, accepted.get_json())
                 verification_request = urlopen.call_args.args[0]
                 self.assertEqual(verification_request.full_url, endpoint)
-                form = webapp.urllib.parse.parse_qs(verification_request.data.decode())
+                form = urllib.parse.parse_qs(verification_request.data.decode())
                 self.assertEqual(form["secret"], [f"{provider}-secret"])
                 self.assertEqual(form["response"], ["fresh-token"])
                 if provider == "hcaptcha":
@@ -367,7 +369,7 @@ class WebApplicationTests(unittest.TestCase):
             "captcha_token": "token",
         }
         with patch.object(
-            webapp.urllib.request, "urlopen", side_effect=urllib.error.URLError("offline"),
+            urllib.request, "urlopen", side_effect=urllib.error.URLError("offline"),
         ):
             self.assertEqual(
                 webapp.app.test_client().post("/api/auth/login", json=payload).status_code,
@@ -379,7 +381,7 @@ class WebApplicationTests(unittest.TestCase):
             {"success": False, "error-codes": ["timeout-or-duplicate"]},
         ):
             with self.subTest(result=result), patch.object(
-                webapp.urllib.request, "urlopen",
+                urllib.request, "urlopen",
                 return_value=io.BytesIO(json.dumps(result).encode()),
             ):
                 self.assertEqual(
@@ -408,7 +410,7 @@ class WebApplicationTests(unittest.TestCase):
 
         verification = {"success": True, "hostname": "localhost", "action": "upload"}
         with patch.object(
-            webapp.urllib.request, "urlopen",
+            urllib.request, "urlopen",
             return_value=io.BytesIO(json.dumps(verification).encode()),
         ), patch.object(webapp.executor, "submit") as submit:
             accepted = self.client.post("/api/jobs", data={

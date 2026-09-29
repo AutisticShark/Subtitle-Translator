@@ -12,9 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import threading
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +51,7 @@ from srt_translate import (
     make_deepl, make_echo, make_google, make_openai, rebuild_cues, segment_cue,
     translate_segments,
 )
+import captcha
 import quotas
 from settings_schema import (
     BOOLEAN_SETTINGS, CALENDAR_LIMIT_KEYS, CALENDAR_PERIODS, CAPTCHA_ACTION_SETTINGS,
@@ -133,11 +132,6 @@ PROVIDER_LABELS = {
     "google": "Google Cloud Translation", "echo": "Echo (offline test)",
 }
 PUBLIC_PROVIDERS = ("anthropic", "openai", "deepl", "google")
-CAPTCHA_VERIFY_URLS = {
-    "turnstile": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-    "recaptcha": "https://www.google.com/recaptcha/api/siteverify",
-    "hcaptcha": "https://api.hcaptcha.com/siteverify",
-}
 if DEFAULTS["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}:
     raise RuntimeError("CAPTCHA_PROVIDER must be none, turnstile, recaptcha, or hcaptcha")
 for _boolean_setting in BOOLEAN_SETTINGS:
@@ -581,54 +575,18 @@ def verify_captcha(action: str, token: Any):
     if not captcha_required(action, settings):
         return None
     provider = settings["captcha_provider"]
-    site_key = settings.get(f"{provider}_site_key", "").strip()
-    secret_key = settings.get(f"{provider}_secret_key", "").strip()
-    if not site_key or not secret_key:
-        LOGGER.error("CAPTCHA provider %s is active but is missing a site or secret key", provider)
-        return jsonify(error=tr("CAPTCHA is temporarily unavailable")), 503
-    if not isinstance(token, str) or not token.strip():
-        return jsonify(error=tr("Complete the CAPTCHA challenge")), 400
-    token = token.strip()
-    if len(token) > 8192:
-        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
-    form = {
-        "secret": secret_key,
-        "response": token,
-    }
-    if request.remote_addr:
-        form["remoteip"] = request.remote_addr
-    if provider == "hcaptcha":
-        form["sitekey"] = site_key
-    verification_request = urllib.request.Request(
-        CAPTCHA_VERIFY_URLS[provider],
-        data=urllib.parse.urlencode(form).encode("ascii"),
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "User-Agent": "Subtitle-Translator CAPTCHA verifier",
-        },
-        method="POST",
+    failure = captcha.verify_token(
+        provider=provider, action=action, token=token,
+        site_key=settings.get(f"{provider}_site_key", ""),
+        secret_key=settings.get(f"{provider}_secret_key", ""),
+        configured_hostname=settings.get("captcha_hostname", ""),
+        request_hostname=urllib.parse.urlsplit(request.url_root).hostname or "",
+        remote_addr=request.remote_addr,
     )
-    try:
-        with urllib.request.urlopen(verification_request, timeout=8) as response:
-            result = json.loads(response.read(65537))
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, ValueError) as exc:
-        LOGGER.warning("%s CAPTCHA verification service error: %s", provider, type(exc).__name__)
-        return jsonify(error=tr("CAPTCHA is temporarily unavailable")), 503
-    if not isinstance(result, dict) or result.get("success") is not True:
-        error_codes = result.get("error-codes", []) if isinstance(result, dict) else []
-        LOGGER.info("%s CAPTCHA rejected a token: %s", provider, error_codes)
-        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
-    expected_hostname = settings.get("captcha_hostname", "").strip().lower().rstrip(".")
-    if not expected_hostname:
-        expected_hostname = (urllib.parse.urlsplit(request.url_root).hostname or "").lower().rstrip(".")
-    actual_hostname = str(result.get("hostname", "")).lower().rstrip(".")
-    if expected_hostname and actual_hostname != expected_hostname:
-        LOGGER.warning("%s CAPTCHA returned an unexpected hostname", provider)
-        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
-    if provider == "turnstile" and result.get("action") != action:
-        LOGGER.warning("Turnstile CAPTCHA returned an unexpected action")
-        return jsonify(error=tr("CAPTCHA verification failed; please try again")), 400
-    return None
+    if failure is None:
+        return None
+    message, status = failure
+    return jsonify(error=message), status
 
 
 def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
