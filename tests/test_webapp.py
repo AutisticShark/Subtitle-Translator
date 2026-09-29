@@ -20,6 +20,7 @@ os.environ["ADMIN_USERNAME"] = "admin"
 os.environ["ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 
 import webapp  # noqa: E402  (environment must be configured before import)
+import quotas  # noqa: E402
 from srt_translate import TranslationError  # noqa: E402
 
 # Close SQLite before the temporary data directory is deleted at interpreter exit;
@@ -938,7 +939,7 @@ class WebApplicationTests(unittest.TestCase):
                         self.assertIsNone(webapp.consume_job_quota(db, user, 1))
                 with webapp.transaction(webapp.engine) as db:
                     db.execute(webapp.delete(webapp.rate_limit_buckets))
-        start, reset = webapp.calendar_quota_window(
+        start, reset = quotas.calendar_quota_window(
             "weekly", webapp.datetime.fromisoformat("2026-01-01T12:00:00+08:00"),
         )
         self.assertEqual(start.isoformat(), "2025-12-29T00:00:00+00:00")

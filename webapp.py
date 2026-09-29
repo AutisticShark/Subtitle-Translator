@@ -6,7 +6,6 @@ import base64
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import secrets
@@ -54,7 +53,14 @@ from srt_translate import (
     make_deepl, make_echo, make_google, make_openai, rebuild_cues, segment_cue,
     translate_segments,
 )
+import quotas
+from settings_schema import (
+    BOOLEAN_SETTINGS, CALENDAR_LIMIT_KEYS, CALENDAR_PERIODS, CAPTCHA_ACTION_SETTINGS,
+    CAPTCHA_PROVIDERS, RATE_LIMIT_KEYS, WINDOW_LIMIT_KEYS, validate_choice_and_flag_settings,
+    validate_numeric_settings,
+)
 from subtitle_formats import SUPPORTED_EXTENSIONS, load_subtitle, translated_filename
+from timeutil import parse_timestamp
 
 
 LOGGER = logging.getLogger(__name__)
@@ -89,16 +95,6 @@ def now() -> str:
     return now_datetime().isoformat(timespec="seconds")
 
 
-def parse_timestamp(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=parsed.tzinfo or timezone.utc)
-
-
 DEFAULTS = {
     "default_provider": "anthropic",
     "anthropic_model": "claude-sonnet-4-6",
@@ -125,17 +121,7 @@ DEFAULTS = {
     "recaptcha_site_key": os.environ.get("RECAPTCHA_SITE_KEY", "").strip(),
     "hcaptcha_site_key": os.environ.get("HCAPTCHA_SITE_KEY", "").strip(),
 }
-CALENDAR_PERIODS = ("daily", "weekly", "monthly")
-CALENDAR_LIMIT_KEYS = {
-    f"{scope}_{period}_job_limit"
-    for scope in ("user", "admin", "panel") for period in CALENDAR_PERIODS
-}
 DEFAULTS.update({key: "0" for key in CALENDAR_LIMIT_KEYS})
-WINDOW_LIMIT_KEYS = {
-    "rate_limit_window_minutes", "user_job_limit", "admin_job_limit",
-    "panel_job_limit",
-}
-RATE_LIMIT_KEYS = WINDOW_LIMIT_KEYS | CALENDAR_LIMIT_KEYS
 SECRET_KEYS = {
     "anthropic_api_key", "openai_api_key", "deepl_api_key", "google_api_key",
     "turnstile_secret_key", "recaptcha_secret_key", "hcaptcha_secret_key",
@@ -147,12 +133,6 @@ PROVIDER_LABELS = {
     "google": "Google Cloud Translation", "echo": "Echo (offline test)",
 }
 PUBLIC_PROVIDERS = ("anthropic", "openai", "deepl", "google")
-CAPTCHA_PROVIDERS = ("turnstile", "recaptcha", "hcaptcha")
-CAPTCHA_ACTION_SETTINGS = {
-    "login": "captcha_on_login",
-    "register": "captcha_on_register",
-    "upload": "captcha_on_upload",
-}
 CAPTCHA_VERIFY_URLS = {
     "turnstile": "https://challenges.cloudflare.com/turnstile/v0/siteverify",
     "recaptcha": "https://www.google.com/recaptcha/api/siteverify",
@@ -160,9 +140,7 @@ CAPTCHA_VERIFY_URLS = {
 }
 if DEFAULTS["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}:
     raise RuntimeError("CAPTCHA_PROVIDER must be none, turnstile, recaptcha, or hcaptcha")
-for _boolean_setting in {
-    "registration_enabled", *CAPTCHA_ACTION_SETTINGS.values(),
-}:
+for _boolean_setting in BOOLEAN_SETTINGS:
     if DEFAULTS[_boolean_setting] not in {"0", "1"}:
         raise RuntimeError(f"{_boolean_setting.upper()} must be 0 or 1")
 
@@ -653,121 +631,9 @@ def verify_captcha(action: str, token: Any):
     return None
 
 
-def calendar_quota_window(period: str, timestamp: datetime) -> tuple[datetime, datetime]:
-    start = timestamp.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    if period == "daily":
-        return start, start + timedelta(days=1)
-    if period == "weekly":
-        start -= timedelta(days=start.weekday())
-        return start, start + timedelta(days=7)
-    if period == "monthly":
-        start = start.replace(day=1)
-        return start, (start + timedelta(days=32)).replace(day=1)
-    raise ValueError("Unknown quota period")
-
-
 def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
-    """Atomically consume job quota or describe the exceeded limit."""
-    # Every job submission and rate-setting update takes this database row lock first.
-    # It serializes the panel counter across application workers and database backends.
-    db.execute(update(settings_table).where(
-        settings_table.c.name == "panel_job_limit"
-    ).values(updated_at=settings_table.c.updated_at))
-    # Read time after acquiring the lock, including when waiting across a reset.
-    timestamp_datetime = now_datetime()
-    timestamp = timestamp_datetime.isoformat(timespec="seconds")
-    stored = dict(db.execute(select(
-        settings_table.c.name, settings_table.c.value
-    ).where(settings_table.c.name.in_(RATE_LIMIT_KEYS))).all())
-    limits = {key: int(stored.get(key, DEFAULTS[key])) for key in RATE_LIMIT_KEYS}
-    window = timedelta(minutes=limits["rate_limit_window_minutes"])
-    account_scope = f"user:{user.id}"
-    scopes = ["panel", account_scope] + [
-        f"{scope}:{period}" for period in CALENDAR_PERIODS
-        for scope in ("panel", account_scope)
-    ]
-    rows = {
-        row.scope: row
-        for row in db.execute(select(rate_limit_buckets).where(
-            rate_limit_buckets.c.scope.in_(scopes)
-        )).all()
-    }
-
-    def bucket(scope: str) -> tuple[datetime, int]:
-        row = rows.get(scope)
-        started = parse_timestamp(row.window_started_at) if row else None
-        if started is None or timestamp_datetime >= started + window:
-            return timestamp_datetime, 0
-        return started, int(row.used)
-
-    panel_started, panel_used = bucket("panel")
-    account_started, account_used = bucket(account_scope)
-    account_key = "admin_job_limit" if user.role == "admin" else "user_job_limit"
-    checks = [
-        (user.role, limits[account_key], account_started, account_used,
-         account_started + window, "window", account_scope),
-        ("panel", limits["panel_job_limit"], panel_started, panel_used,
-         panel_started + window, "window", "panel"),
-    ]
-    for period in CALENDAR_PERIODS:
-        started, reset = calendar_quota_window(period, timestamp_datetime)
-        for scope, bucket_scope in ((user.role, account_scope), ("panel", "panel")):
-            bucket_key = f"{bucket_scope}:{period}"
-            row = rows.get(bucket_key)
-            used = int(row.used) if row and parse_timestamp(row.window_started_at) == started else 0
-            checks.append((scope, limits[f"{scope}_{period}_job_limit"],
-                           started, used, reset, period, bucket_key))
-    exceeded = []
-    for scope, limit, _started, used, reset, period, _bucket_key in checks:
-        if limit and used + amount > limit:
-            retry_after = max(1, math.ceil((reset - timestamp_datetime).total_seconds()))
-            label = tr("Administrator") if scope == "admin" else (
-                tr("Regular-user") if scope == "user" else tr("Panel-wide")
-            )
-            if period == "window":
-                error = tr(
-                    "{label} rate limit of {limit} translation job{job_plural} per "
-                    "{minutes} minute{minute_plural} exceeded",
-                    label=label, limit=limit, job_plural="s" if limit != 1 else "",
-                    minutes=limits["rate_limit_window_minutes"],
-                    minute_plural=(
-                        "s" if limits["rate_limit_window_minutes"] != 1 else ""
-                    ),
-                )
-            else:
-                period_label = {"daily": tr("Daily"), "weekly": tr("Weekly"),
-                                "monthly": tr("Monthly")}[period]
-                error = tr(
-                    "{label} {period} translation limit of {limit} jobs exceeded. Resets at {reset} (UTC).",
-                    label=label, period=period_label, limit=limit,
-                    reset=reset.strftime("%Y-%m-%d %H:%M"),
-                )
-            exceeded.append({
-                "error": error,
-                "scope": scope,
-                "limit": limit,
-                "retry_after": retry_after,
-                "period": period,
-                "used": used,
-                "requested": amount,
-                "reset_at": reset.isoformat(timespec="seconds"),
-            })
-    if exceeded:
-        return max(exceeded, key=lambda item: item["retry_after"])
-
-    for _role, _limit, started, used, _reset, _period, scope in checks:
-        values = {
-            "window_started_at": started.isoformat(timespec="seconds"),
-            "used": used + amount,
-            "updated_at": timestamp,
-        }
-        if scope in rows:
-            db.execute(update(rate_limit_buckets).where(
-                rate_limit_buckets.c.scope == scope
-            ).values(**values))
-        else:
-            db.execute(insert(rate_limit_buckets).values(scope=scope, **values))
-    return None
+    """Atomically consume job quota or describe the exceeded limit (see ``quotas``)."""
+    return quotas.consume_job_quota(db, user, amount, defaults=DEFAULTS, clock=now_datetime)
 
 
 def localized_job_stage(stage: str) -> str:
@@ -1345,23 +1211,9 @@ def save_settings():
     unknown = set(payload) - ALL_SETTING_KEYS
     if unknown:
         return jsonify(error=tr("Unknown settings: {settings}", settings=', '.join(sorted(unknown)))), 400
-    if payload.get("default_provider") and payload["default_provider"] not in available_providers():
-        return jsonify(error=tr("Invalid default provider")), 400
-    if ("captcha_provider" in payload
-            and payload["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}):
-        return jsonify(error=tr("Invalid CAPTCHA provider")), 400
-    for key in {"registration_enabled", *CAPTCHA_ACTION_SETTINGS.values()}:
-        if key in payload and str(payload[key]).strip() not in {"0", "1"}:
-            return jsonify(error=tr("{key} must be enabled or disabled", key=key)), 400
-    if "captcha_hostname" in payload:
-        hostname = str(payload["captcha_hostname"]).strip().lower().rstrip(".")
-        if hostname and not re.fullmatch(
-            r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*"
-            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?",
-            hostname,
-        ):
-            return jsonify(error=tr("CAPTCHA hostname must be a hostname without a scheme or port")), 400
-        payload["captcha_hostname"] = hostname
+    error = validate_choice_and_flag_settings(payload, available_providers())
+    if error:
+        return jsonify(error=error), 400
     if any(key in payload and str(payload[key]).strip() for key in SECRET_KEYS):
         if not configured_jwt_secret and not os.environ.get("API_KEY_ENCRYPTION_KEY"):
             return jsonify(error=tr("Configure JWT_SECRET_KEY before saving secrets")), 503
@@ -1381,42 +1233,9 @@ def save_settings():
             return jsonify(error=tr(
                 "Configure the selected CAPTCHA site key and secret key before enabling protection"
             )), 400
-    numeric = {"rpm": (0, 10000), "width": (4, 80)}
-    integer_numeric = {
-        "batch_size": (1, 100), "workers": (1, 16), "max_lines": (1, 5),
-        "rate_limit_window_minutes": (1, 10080),
-        "user_job_limit": (0, 100000),
-        "admin_job_limit": (0, 100000),
-        "panel_job_limit": (0, 1000000),
-        **{key: (0, 1000000 if key.startswith("panel_") else 100000)
-           for key in CALENDAR_LIMIT_KEYS},
-    }
-    try:
-        for key, (minimum, maximum) in numeric.items():
-            if key in payload and not minimum <= float(payload[key]) <= maximum:
-                raise ValueError(tr(
-                    "{key} must be between {minimum} and {maximum}",
-                    key=key, minimum=minimum, maximum=maximum,
-                ))
-        for key, (minimum, maximum) in integer_numeric.items():
-            if key not in payload:
-                continue
-            try:
-                value = int(str(payload[key]).strip())
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    tr(
-                        "{key} must be a whole number between {minimum} and {maximum}",
-                        key=key, minimum=minimum, maximum=maximum,
-                    )
-                ) from exc
-            if str(value) != str(payload[key]).strip() or not minimum <= value <= maximum:
-                raise ValueError(tr(
-                    "{key} must be a whole number between {minimum} and {maximum}",
-                    key=key, minimum=minimum, maximum=maximum,
-                ))
-    except (TypeError, ValueError) as exc:
-        return jsonify(error=str(exc)), 400
+    error = validate_numeric_settings(payload)
+    if error:
+        return jsonify(error=error), 400
     timestamp = now()
     with db_lock, transaction(engine) as db:
         changed_window = False
