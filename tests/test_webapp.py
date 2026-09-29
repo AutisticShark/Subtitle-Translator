@@ -1,3 +1,4 @@
+import atexit
 import io
 import json
 import os
@@ -20,6 +21,10 @@ os.environ["ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 
 import webapp  # noqa: E402  (environment must be configured before import)
 from srt_translate import TranslationError  # noqa: E402
+
+# Close SQLite before the temporary data directory is deleted at interpreter exit;
+# Windows cannot remove an open database file. atexit runs last-registered first.
+atexit.register(webapp.engine.dispose)
 
 
 class WebApplicationTests(unittest.TestCase):
@@ -1390,6 +1395,59 @@ class WebApplicationTests(unittest.TestCase):
     def tearDownClass(cls):
         webapp.engine.dispose()
         super().tearDownClass()
+
+
+class ProxyTrustAndLoginCounterTests(unittest.TestCase):
+    def test_forwarded_headers_are_ignored_unless_proxies_are_trusted(self):
+        from flask import Flask, request
+
+        def build(proxy_count):
+            flask_app = Flask(__name__)
+
+            @flask_app.get("/who")
+            def who():
+                return request.remote_addr
+
+            webapp.configure_proxy_trust(flask_app, proxy_count)
+            return flask_app.test_client()
+
+        headers = {"X-Forwarded-For": "203.0.113.7"}
+        self.assertNotEqual(build(0).get("/who", headers=headers).get_data(as_text=True),
+                            "203.0.113.7")
+        self.assertEqual(build(1).get("/who", headers=headers).get_data(as_text=True),
+                         "203.0.113.7")
+        with self.assertRaises(RuntimeError):
+            build(11)
+
+    def test_concurrent_failed_logins_all_count_toward_the_lockout(self):
+        webapp.app.config.update(TESTING=True, DEBUG=True, JWT_COOKIE_CSRF_PROTECT=False)
+        admin = webapp.app.test_client()
+        admin.post("/api/auth/login", json={
+            "username": "admin", "password": "correct-horse-battery-staple",
+        })
+        created = admin.post("/api/users", json={
+            "username": "race-target", "password": "race-target-password", "role": "user",
+        })
+        self.assertEqual(created.status_code, 201, created.get_json())
+        webapp.login_attempts.clear()
+
+        barrier = threading.Barrier(webapp.LOGIN_FAILURE_LIMIT)
+
+        def guess():
+            barrier.wait()
+            webapp.record_account_login_failure(created.get_json()["user"]["id"])
+
+        threads = [threading.Thread(target=guess) for _ in range(webapp.LOGIN_FAILURE_LIMIT)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        response = webapp.app.test_client().post("/api/auth/login", json={
+            "username": "race-target", "password": "race-target-password",
+        })
+        self.assertEqual(response.status_code, 401, "account should be locked")
+        webapp.login_attempts.clear()
 
 
 if __name__ == "__main__":

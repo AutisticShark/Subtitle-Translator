@@ -35,6 +35,7 @@ from flask_jwt_extended import (
 )
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
 from database import (
@@ -216,6 +217,27 @@ app.config.update(
     JWT_SESSION_COOKIE=False,
 )
 jwt = JWTManager(app)
+
+
+def configure_proxy_trust(flask_app: Flask, proxy_count: int) -> None:
+    """Trust exactly ``proxy_count`` reverse proxies for client address, scheme, and host.
+
+    Without this, every visitor behind a proxy shares the proxy's address, which
+    makes the per-address login and registration limits global.
+    """
+    if proxy_count < 0 or proxy_count > 10:
+        raise RuntimeError("TRUSTED_PROXY_COUNT must be between 0 and 10")
+    if proxy_count:
+        flask_app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
+            flask_app.wsgi_app, x_for=proxy_count, x_proto=proxy_count,
+            x_host=proxy_count,
+        )
+
+
+try:
+    configure_proxy_trust(app, int(os.environ.get("TRUSTED_PROXY_COUNT", "0") or "0"))
+except ValueError:
+    raise RuntimeError("TRUSTED_PROXY_COUNT must be a whole number") from None
 executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JOB_WORKERS", "2"))))
 db_lock = threading.RLock()
 cancel_events_lock = threading.Lock()
@@ -306,6 +328,28 @@ def issue_token(user_row: Any) -> str:
         additional_claims={"role": values["role"], "ver": values["token_version"]},
         fresh=True,
     )
+
+
+def record_account_login_failure(user_id: str) -> None:
+    """Count a failed password attempt atomically and lock the account at the limit.
+
+    The increment is a single SQL UPDATE, which takes the row write lock, so
+    parallel guesses cannot read the same old count and under-count failures.
+    """
+    with transaction(engine) as db:
+        db.execute(update(users).where(users.c.id == user_id).values(
+            failed_login_count=users.c.failed_login_count + 1, updated_at=now(),
+        ))
+        failures = db.scalar(select(users.c.failed_login_count).where(
+            users.c.id == user_id
+        ))
+        if failures is not None and failures >= LOGIN_FAILURE_LIMIT:
+            db.execute(update(users).where(users.c.id == user_id).values(
+                locked_until=(now_datetime() + timedelta(
+                    minutes=LOGIN_LOCK_MINUTES
+                )).isoformat(timespec="seconds"),
+                failed_login_count=0,
+            ))
 
 
 def bootstrap_admin() -> None:
@@ -1059,17 +1103,7 @@ def login():
     if user is None or not valid_input or not verified or not user.active or locked:
         record_login_failure(remote_address)
         if user is not None and user.active and not locked:
-            failures = user.failed_login_count + 1
-            values: dict[str, Any] = {"failed_login_count": failures, "updated_at": now()}
-            if failures >= LOGIN_FAILURE_LIMIT:
-                values.update(
-                    locked_until=(now_datetime() + timedelta(
-                        minutes=LOGIN_LOCK_MINUTES
-                    )).isoformat(timespec="seconds"),
-                    failed_login_count=0,
-                )
-            with transaction(engine) as db:
-                db.execute(update(users).where(users.c.id == user.id).values(**values))
+            record_account_login_failure(user.id)
         return jsonify(error=tr("Invalid username or password")), 401
     values = {"failed_login_count": 0, "locked_until": None, "updated_at": now()}
     if password_hasher.check_needs_rehash(user.password_hash):

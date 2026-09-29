@@ -52,6 +52,8 @@ Set a strong, stable `JWT_SECRET_KEY`; Compose refuses to start without it. Prov
 
 Set `JWT_COOKIE_SECURE=1` whenever the app is served over HTTPS. Plain `http://localhost` needs `0`. For any network deployment, terminate TLS at the app or a trusted reverse proxy; secure cookies and JWT authentication do not encrypt HTTP traffic.
 
+If the app runs behind a reverse proxy, set `TRUSTED_PROXY_COUNT` to the exact number of proxies that append to `X-Forwarded-For` (default `0`, meaning forwarded headers are ignored). Without it every visitor appears to come from the proxy's address, so the per-address login (30 failures per 15 minutes) and registration (10 attempts per 15 minutes) limits would apply to everyone at once. Never set it higher than the real proxy count, or clients can spoof their address.
+
 Administrators can manage provider settings, create/disable/promote/delete users, reset passwords, unlock accounts, and select **All users** when inspecting or deleting jobs. Regular users can operate only their own jobs. The final active administrator cannot be deleted, disabled, or demoted.
 
 Self-registration is enabled by default and creates regular-user accounts only. An administrator can disable it under **Settings → Registration and CAPTCHA**. The initial setup flow remains separate: the first account must be the administrator created by the one-time setup screen or `ADMIN_PASSWORD` bootstrap.

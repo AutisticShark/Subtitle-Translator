@@ -50,6 +50,7 @@ This file applies to the entire repository. Read `MEMORY.md` before making chang
 17. Keep the direct `python webapp.py` development server bound to a loopback address. Network-facing container access belongs to the production Gunicorn command in `Dockerfile`; do not expose Flask's development server on every interface.
 18. Redis is a disposable read cache. Every settings or job mutation must bump its `cache_revisions` marker in the same SQL transaction, including ownership changes and startup recovery. Cache raw locale-neutral rows, scope job keys by account/admin view, and keep authentication, quotas, mutations, and download authorization in SQL. Never make Redis invalidation or availability a prerequisite for correctness.
 19. Send transactional email through `email_delivery.send_email`, keeping credentials deployment-only and provider responses private. Preserve legacy SMTP selection when `EMAIL_PROVIDER` is blank, require TLS, and never automatically retry or switch providers after an ambiguous send failure. Provider additions need offline transport tests plus `.env.example`, Compose, and documentation updates. Keep MFA limits and challenge consumption in SQL regardless of the selected transport.
+20. Per-address limits and CAPTCHA `remoteip` use `request.remote_addr`. Behind a reverse proxy that is the proxy's address unless `TRUSTED_PROXY_COUNT` is set to the exact proxy count (Werkzeug `ProxyFix`). Increment failed-login counters with a single SQL UPDATE, never read-modify-write, so parallel guesses cannot under-count.
 
 ## Validation
 
