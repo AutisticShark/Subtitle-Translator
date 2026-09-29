@@ -302,6 +302,14 @@ def issue_token(user_row: Any) -> str:
     )
 
 
+def insert_user(db, user_id: str, username: str, password: str, role: str, timestamp: str) -> None:
+    db.execute(insert(users).values(
+        id=user_id, username=username, password_hash=password_hasher.hash(password),
+        role=role, active=True, token_version=0, failed_login_count=0,
+        locked_until=None, created_at=timestamp, updated_at=timestamp,
+    ))
+
+
 def record_account_login_failure(user_id: str) -> None:
     """Count a failed password attempt atomically and lock the account at the limit.
 
@@ -341,11 +349,7 @@ def bootstrap_admin() -> None:
             db.execute(insert(settings_table).values(
                 name="_auth_setup_complete", value="1", updated_at=timestamp
             ))
-            db.execute(insert(users).values(
-                id=user_id, username=username, password_hash=password_hasher.hash(password),
-                role="admin", active=True, token_version=0, failed_login_count=0,
-                locked_until=None, created_at=timestamp, updated_at=timestamp,
-            ))
+            insert_user(db, user_id, username, password, "admin", timestamp)
             db.execute(update(jobs).where(jobs.c.user_id.is_(None)).values(user_id=user_id))
             bump_cache_revision(db, "jobs")
     except IntegrityError:
@@ -880,11 +884,7 @@ def setup_first_admin():
             db.execute(insert(settings_table).values(
                 name="_auth_setup_complete", value="1", updated_at=timestamp
             ))
-            db.execute(insert(users).values(
-                id=user_id, username=username, password_hash=password_hasher.hash(password),
-                role="admin", active=True, token_version=0, failed_login_count=0,
-                locked_until=None, created_at=timestamp, updated_at=timestamp,
-            ))
+            insert_user(db, user_id, username, password, "admin", timestamp)
             db.execute(update(jobs).where(jobs.c.user_id.is_(None)).values(user_id=user_id))
             bump_cache_revision(db, "jobs")
     except IntegrityError:
@@ -972,11 +972,7 @@ def register():
     timestamp = now()
     try:
         with transaction(engine) as db:
-            db.execute(insert(users).values(
-                id=user_id, username=username, password_hash=password_hasher.hash(password),
-                role="user", active=True, token_version=0, failed_login_count=0,
-                locked_until=None, created_at=timestamp, updated_at=timestamp,
-            ))
+            insert_user(db, user_id, username, password, "user", timestamp)
     except IntegrityError:
         return jsonify(error=tr("Username already exists")), 409
     with connection(engine) as db:
@@ -1063,11 +1059,7 @@ def create_user():
     timestamp = now()
     try:
         with transaction(engine) as db:
-            db.execute(insert(users).values(
-                id=user_id, username=username, password_hash=password_hasher.hash(password),
-                role=role, active=True, token_version=0, failed_login_count=0,
-                locked_until=None, created_at=timestamp, updated_at=timestamp,
-            ))
+            insert_user(db, user_id, username, password, role, timestamp)
     except IntegrityError:
         return jsonify(error=tr("Username already exists")), 409
     with connection(engine) as db:
