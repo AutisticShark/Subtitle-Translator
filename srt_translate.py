@@ -664,7 +664,13 @@ def translate_segments(
     quiet: bool,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_callback: Callable[[], bool] | None = None,
+    fallback_callback: Callable[[int], None] | None = None,
 ) -> list[str]:
+    """Translate segments in batches.
+
+    ``fallback_callback`` receives the number of segments in each finished batch
+    that could not be translated and were passed through as source text.
+    """
     results: list[str | None] = [None] * len(segs)
 
     def check_canceled() -> None:
@@ -743,10 +749,10 @@ def translate_segments(
                     min(2.0 ** soft, 30.0) + random.uniform(0, 1)
                 )
 
-    def run(batch: list[int]) -> tuple[list[int], list[str]]:
+    def run(batch: list[int]) -> tuple[list[int], list[str], set[int]]:
         texts = [segs[i].text for i in batch]
         try:
-            return batch, call_with_retry(texts, f"batch of {len(texts)}")
+            return batch, call_with_retry(texts, f"batch of {len(texts)}"), set()
         except FatalTranslationError:
             raise
         except RateLimitError:
@@ -757,19 +763,19 @@ def translate_segments(
             # sink nineteen good ones. Never do this for rate limits: it turns
             # one rejected request into twenty while already over quota.
             out = []
-            for t in texts:
+            passed_through: set[int] = set()
+            for position, t in enumerate(texts):
                 try:
-                    out.append(call_with_retry([t], "single line"))
+                    out.append(call_with_retry([t], "single line")[0])
                 except FatalTranslationError:
                     raise
                 except TranslationError:
                     out.append(t)  # last resort: source passes through
-                else:
-                    out[-1] = out[-1][0]
+                    passed_through.add(position)
             if not quiet:
                 print(f"\r  batch fell back to per-line ({last}){' ' * 12}",
                       file=sys.stderr)
-            return batch, out
+            return batch, out, passed_through
 
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
     completed_normally = False
@@ -782,13 +788,17 @@ def translate_segments(
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
             for future in finished:
-                batch, out = future.result()
-                for i, translated in zip(batch, out):
+                batch, out, passed_through = future.result()
+                for position, (i, translated) in enumerate(zip(batch, out)):
                     results[i] = translated
+                    if position in passed_through:
+                        continue  # never cache untranslated source text
                     key = hashlib.sha256(
                         f"{tgt_key}\u0000{segs[i].text}".encode()
                     ).hexdigest()[:24]
                     cache[key] = translated
+                if passed_through and fallback_callback:
+                    fallback_callback(len(passed_through))
                 done += len(batch)
                 if progress_callback:
                     progress_callback(cached + done, len(segs))

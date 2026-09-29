@@ -172,6 +172,23 @@ class TranslationDriverTests(unittest.TestCase):
 
         self.assertEqual(result, ["GOOD", "bad"])
 
+    def test_pass_through_lines_are_reported_and_never_cached(self):
+        def provider(texts, _source, _target):
+            if len(texts) > 1 or texts == ["bad"]:
+                raise TranslationError("cannot translate")
+            return [texts[0].upper()]
+
+        segments = [Segment(0, "good", [], False), Segment(1, "bad", [], False)]
+        reported = []
+        cache = {}
+
+        self._translate(
+            segments, provider, cache=cache, fallback_callback=reported.append,
+        )
+
+        self.assertEqual(reported, [1])
+        self.assertEqual(list(cache.values()), ["GOOD"])
+
     @patch("srt_translate.time.sleep")
     def test_exhausted_rate_limit_aborts_without_per_line_fallback(self, _sleep):
         calls = []

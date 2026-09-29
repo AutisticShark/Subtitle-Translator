@@ -163,6 +163,7 @@
     "Translating to {language}": "正在翻譯為{language}",
     "Translating to {language} ({done}/{total} segments)": "正在翻譯為{language}（{done}/{total} 個片段）",
     "Ready to download": "可供下載",
+    "Left untranslated: {count} of {total} segments": "有 {count} / {total} 個片段未能翻譯，已保留原文",
     "Canceled": "已取消",
     "Translation failed": "翻譯失敗",
     "Cancel {filename}?": "要取消 {filename} 嗎？",

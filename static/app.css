@@ -206,6 +206,7 @@ h2 { font: 500 32px/1.1 Georgia, serif; margin: 7px 0 0; letter-spacing: -.03em;
 .language-downloads a { color: var(--muted); text-decoration: none; }
 .language-downloads a:hover { color: var(--accent); }
 .job-error { color: var(--danger); font-size: 12px; margin-top: 5px; }
+.job-warning { color: var(--warning, #b45309); font-size: 12px; margin-top: 5px; }
 dialog { width: min(680px, calc(100% - 30px)); max-height: calc(100vh - 40px); color: var(--text); background: var(--dialog-bg); border: 1px solid var(--line); border-radius: 18px; padding: 0; box-shadow: 0 30px 100px var(--dialog-shadow); }
 dialog::backdrop { background: var(--dialog-backdrop); backdrop-filter: blur(6px); }
 dialog form { padding: 26px; }

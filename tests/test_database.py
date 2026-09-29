@@ -163,3 +163,25 @@ def test_existing_users_gain_a_system_theme_preference():
             assert theme == "system"
         finally:
             engine.dispose()
+
+
+def test_startup_adds_job_warning_column_to_existing_databases(tmp_path):
+    path = tmp_path / "old.db"
+    with closing(sqlite3.connect(path)) as legacy:
+        legacy.execute(
+            "CREATE TABLE jobs (id VARCHAR(32) PRIMARY KEY, user_id VARCHAR(32), "
+            "filename TEXT NOT NULL, stored_name TEXT NOT NULL, status VARCHAR(24) NOT NULL, "
+            "progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL DEFAULT '', "
+            "options TEXT NOT NULL, outputs TEXT NOT NULL DEFAULT '[]', error TEXT, "
+            "created_at VARCHAR(40) NOT NULL, updated_at VARCHAR(40) NOT NULL)"
+        )
+        legacy.commit()
+
+    engine = create_database_engine(path)
+    try:
+        initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")
+        initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")  # idempotent
+        with engine.connect() as db:
+            assert "warning" in db.execute(select(jobs)).keys()
+    finally:
+        engine.dispose()

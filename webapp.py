@@ -748,12 +748,23 @@ def localized_job_stage(stage: str) -> str:
     return stage
 
 
+def localized_job_warning(warning: str | None) -> str | None:
+    if not warning:
+        return None
+    parsed = re.fullmatch(r"Left untranslated: (\d+) of (\d+) segments", warning)
+    if parsed:
+        return tr("Left untranslated: {count} of {total} segments",
+                  count=parsed.group(1), total=parsed.group(2))
+    return warning
+
+
 def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
     source = dict(row._mapping if hasattr(row, "_mapping") else row)
     result = {key: source.get(key) for key in jobs.c.keys()}
     result["options"] = json.loads(result["options"])
     result["outputs"] = json.loads(result["outputs"])
     result["stage"] = localized_job_stage(result.get("stage") or "")
+    result["warning"] = localized_job_warning(result.get("warning"))
     result.pop("stored_name", None)
     result.pop("user_id", None)
     if include_owner:
@@ -856,6 +867,7 @@ def run_job(job_id: str) -> None:
         except (OSError, json.JSONDecodeError):
             cache = {}
         outputs = []
+        untranslated = 0
         for index, language in enumerate(targets):
             start_pct = 5 + round(index / len(targets) * 90)
             update_job(job_id, progress=start_pct,
@@ -871,10 +883,15 @@ def run_job(job_id: str) -> None:
                            f"({done}/{total} segments)"),
                 )
 
+            def count_untranslated(count: int) -> None:
+                nonlocal untranslated
+                untranslated += count
+
             translated = translate_segments(
                 segments, provider, language, options["source_language"],
                 int(options["batch_size"]), 4, 10, throttle, cache,
                 int(options["workers"]), True, report_progress, cancel_event.is_set,
+                count_untranslated,
             )
             check_canceled()
             cues = rebuild_cues(
@@ -890,6 +907,10 @@ def run_job(job_id: str) -> None:
         if not update_job_if_status(
             job_id, {"processing"}, status="completed", progress=100,
             stage="Ready to download", outputs=json.dumps(outputs), error=None,
+            warning=(
+                f"Left untranslated: {untranslated} of "
+                f"{len(segments) * len(targets)} segments"
+            ) if untranslated else None,
         ):
             raise TranslationCanceled("Translation canceled")
     except TranslationCanceled:

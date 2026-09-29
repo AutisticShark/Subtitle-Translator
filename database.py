@@ -121,6 +121,7 @@ jobs = Table(
     Column("options", Text, nullable=False),
     Column("outputs", Text, nullable=False, default="[]", server_default=text("'[]'")),
     Column("error", Text),
+    Column("warning", Text),
     Column("created_at", String(40), nullable=False),
     Column("updated_at", String(40), nullable=False),
 )
@@ -235,6 +236,23 @@ def _migrate_user_theme(engine: Engine) -> None:
                 raise
 
 
+def _migrate_job_warning(engine: Engine) -> None:
+    """Add the non-fatal job warning column to databases created by older releases."""
+    inspector = inspect(engine)
+    if not inspector.has_table("jobs"):
+        return
+    if "warning" in {column["name"] for column in inspector.get_columns("jobs")}:
+        return
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE jobs ADD COLUMN warning TEXT"))
+    except SQLAlchemyError:
+        # Another startup worker may have completed the same migration.
+        refreshed = {column["name"] for column in inspect(engine).get_columns("jobs")}
+        if "warning" not in refreshed:
+            raise
+
+
 def initialize_database(
     engine: Engine,
     defaults: dict[str, str],
@@ -243,6 +261,7 @@ def initialize_database(
     _migrate_legacy_sqlite(engine)
     metadata.create_all(engine)
     _migrate_user_theme(engine)
+    _migrate_job_warning(engine)
     with engine.begin() as connection:
         existing_revisions = set(connection.execute(select(cache_revisions.c.name)).scalars())
         for name in ("settings", "jobs"):

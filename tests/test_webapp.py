@@ -19,6 +19,7 @@ os.environ["ADMIN_USERNAME"] = "admin"
 os.environ["ADMIN_PASSWORD"] = "correct-horse-battery-staple"
 
 import webapp  # noqa: E402  (environment must be configured before import)
+from srt_translate import TranslationError  # noqa: E402
 
 
 class WebApplicationTests(unittest.TestCase):
@@ -1176,6 +1177,30 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(deleted.get_json(), {"deleted": job_id})
         self.assertFalse(job_folder.exists())
         self.assertEqual(self.client.get(f"/api/jobs/{job_id}").status_code, 404)
+
+    def test_completed_job_reports_segments_left_untranslated(self):
+        def failing_provider(_texts, _source, _target):
+            raise TranslationError("cannot translate")
+
+        source = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+        with patch.object(webapp, "make_echo", return_value=failing_provider), \
+                patch("srt_translate.time.sleep"):
+            response = self.client.post("/api/jobs", data={
+                "provider": "echo",
+                "target_languages": "es",
+                "files": (io.BytesIO(source), "warn.srt"),
+            }, content_type="multipart/form-data")
+            job_id = response.get_json()["jobs"][0]
+            for _ in range(200):
+                job = self.client.get(f"/api/jobs/{job_id}").get_json()
+                if job["status"] in {"completed", "failed"}:
+                    break
+                time.sleep(0.02)
+
+        self.assertEqual(job["status"], "completed", job.get("error"))
+        self.assertEqual(job["warning"], "Left untranslated: 1 of 1 segments")
+        zh = self.client.get(f"/api/jobs/{job_id}?lang=zh-CN").get_json()
+        self.assertNotEqual(zh["warning"], job["warning"])
 
     def test_malformed_subtitle_job_fails_with_useful_error(self):
         response = self.client.post("/api/jobs", data={

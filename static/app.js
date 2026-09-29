@@ -678,7 +678,8 @@ function renderJobs() {
       <div class="job-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(targetNames)}${owner}</div></div>
       <div><div class="progress-track"><div class="progress-bar" style="width:${Number(job.progress)}%"></div></div>
       <div class="job-meta">${escapeHtml(job.stage || job.status)} · ${Number(job.progress)}%</div>
-      ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}</div>
+      ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}
+      ${job.warning ? `<div class="job-warning">${escapeHtml(job.warning)}</div>` : ''}</div>
       <div class="job-actions">${primaryAction}${cancelAction}${deleteAction}</div></article>`;
   }).join('');
 }
