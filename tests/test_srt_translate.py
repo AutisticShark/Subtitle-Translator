@@ -6,6 +6,7 @@ from srt_translate import (
     Cue,
     FatalTranslationError,
     Segment,
+    RateLimitError,
     Throttle,
     TranslationCanceled,
     TranslationError,
@@ -170,6 +171,23 @@ class TranslationDriverTests(unittest.TestCase):
         result = self._translate(segments, provider)
 
         self.assertEqual(result, ["GOOD", "bad"])
+
+    @patch("srt_translate.time.sleep")
+    def test_exhausted_rate_limit_aborts_without_per_line_fallback(self, _sleep):
+        calls = []
+
+        def provider(texts, _source, _target):
+            calls.append(texts)
+            raise RateLimitError("429", retry_after=0)
+
+        segments = [Segment(i, f"line {i}", [], False) for i in range(5)]
+
+        with self.assertRaises(RateLimitError):
+            self._translate(segments, provider)
+
+        # One batch attempt plus its single rate-limit retry; no per-line requests.
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(len(texts) == 5 for texts in calls))
 
     def test_fatal_failure_aborts_without_per_line_fallback(self):
         def provider(_texts, _source, _target):

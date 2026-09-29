@@ -717,8 +717,11 @@ def translate_segments(
             except RateLimitError as e:
                 limited += 1
                 if limited > rate_retries:
-                    raise TranslationError(
-                        f"rate limited {limited}x, giving up on {label}"
+                    # Stay a RateLimitError so run() aborts instead of retrying
+                    # every line individually while already over quota.
+                    raise RateLimitError(
+                        f"rate limited {limited}x, giving up on {label}",
+                        e.retry_after,
                     ) from None
                 # Prefer the server's own number; otherwise exponential with
                 # jitter so parallel workers don't resynchronise on retry.

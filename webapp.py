@@ -1326,9 +1326,9 @@ def save_settings():
             return jsonify(error=tr(
                 "Configure the selected CAPTCHA site key and secret key before enabling protection"
             )), 400
-    numeric = {"batch_size": (1, 100), "workers": (1, 16), "rpm": (0, 10000),
-               "width": (4, 80), "max_lines": (1, 5)}
+    numeric = {"rpm": (0, 10000), "width": (4, 80)}
     integer_numeric = {
+        "batch_size": (1, 100), "workers": (1, 16), "max_lines": (1, 5),
         "rate_limit_window_minutes": (1, 10080),
         "user_job_limit": (0, 100000),
         "admin_job_limit": (0, 100000),
