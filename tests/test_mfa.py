@@ -241,7 +241,7 @@ def test_disable_and_regeneration_require_both_factors_and_invalidate_sessions(a
 def test_email_verification_resend_hashing_and_management(account, monkeypatch):
     client, user_id, payload = account
     sent = allow_email(monkeypatch)
-    recovery = enroll_email(client, sent)
+    enroll_email(client, sent)
     assert sent[0][0] == "owner@example.com"
     assert client.get("/api/auth/mfa").json["email"] == "o***@example.com"
     clear_cooldown(user_id)

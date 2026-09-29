@@ -718,7 +718,7 @@ def consume_job_quota(db, user: Any, amount: int) -> dict[str, Any] | None:
             checks.append((scope, limits[f"{scope}_{period}_job_limit"],
                            started, used, reset, period, bucket_key))
     exceeded = []
-    for scope, limit, started, used, reset, period, bucket_key in checks:
+    for scope, limit, _started, used, reset, period, _bucket_key in checks:
         if limit and used + amount > limit:
             retry_after = max(1, math.ceil((reset - timestamp_datetime).total_seconds()))
             label = tr("Administrator") if scope == "admin" else (

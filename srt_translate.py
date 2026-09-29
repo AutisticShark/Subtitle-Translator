@@ -203,8 +203,8 @@ def unmask_tags(s: str, tags: list[str]) -> str:
 
 
 def segment_cue(cue: Cue, cue_i: int) -> list[Segment]:
-    stripped = [l for l in cue.lines if l.strip()]
-    dash_lines = [l for l in stripped if DASH_RE.match(l)]
+    stripped = [line for line in cue.lines if line.strip()]
+    dash_lines = [line for line in stripped if DASH_RE.match(line)]
 
     # Two or more dashed lines => speaker pair; keep the lines distinct.
     if len(dash_lines) >= 2:
@@ -216,7 +216,7 @@ def segment_cue(cue: Cue, cue_i: int) -> list[Segment]:
         return segs
 
     # Otherwise the cue is one sentence fragment possibly wrapped over lines.
-    joined = " ".join(l.strip() for l in stripped)
+    joined = " ".join(line.strip() for line in stripped)
     lead = DASH_RE.match(joined)
     dashed = bool(lead)
     if lead:
@@ -284,7 +284,7 @@ def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
     if cur:
         lines.append(cur)
 
-    return [l.strip() for l in lines if l.strip()]
+    return [line.strip() for line in lines if line.strip()]
 
 
 def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
@@ -741,7 +741,7 @@ def translate_segments(
                           f"{waited:.0f}s (attempt {limited}/{rate_retries})"
                           f"{' ' * 12}", file=sys.stderr, flush=True)
                 interruptible_sleep(min(waited, 120.0))
-            except TranslationError as e:
+            except TranslationError:
                 soft += 1
                 if soft >= retries:
                     raise
@@ -789,7 +789,7 @@ def translate_segments(
             )
             for future in finished:
                 batch, out, passed_through = future.result()
-                for position, (i, translated) in enumerate(zip(batch, out)):
+                for position, (i, translated) in enumerate(zip(batch, out, strict=True)):
                     results[i] = translated
                     if position in passed_through:
                         continue  # never cache untranslated source text
@@ -825,7 +825,7 @@ def rebuild_cues(
     width: float, max_lines: int,
 ) -> list[Cue]:
     by_cue: dict[int, list[tuple[Segment, str]]] = {}
-    for s, t in zip(segs, out):
+    for s, t in zip(segs, out, strict=True):
         by_cue.setdefault(s.cue_i, []).append((s, t))
 
     cjk = tgt_key in CJK_LANGS

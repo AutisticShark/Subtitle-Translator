@@ -60,6 +60,8 @@ Run the narrowest relevant checks while iterating, then run the full offline sui
 python -m pytest -q
 ```
 
+CI also runs `python -m ruff check .` (configuration in `pyproject.toml`, version pinned in `requirements-dev.txt`); run it before handoff.
+
 Use the module form in this Windows workspace. The standalone `pytest` launcher has resolved imports through the stale sibling path `D:\Dev\SRT-Translate` and produced false `ModuleNotFoundError` collection failures.
 
 For web-job tests, wait for a terminal job state and include `job["error"]` in failure output. For CI edits, verify these cases separately:

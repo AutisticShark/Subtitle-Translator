@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
-from srt_translate import Cue, TIMING_RE, parse_srt
+from srt_translate import Cue, parse_srt
 
 
 SUPPORTED_EXTENSIONS = {".srt", ".vtt", ".ass", ".ssa"}
@@ -194,7 +194,7 @@ def _parse_ass(text: str, fmt: str, newline: str, bom: bool) -> SubtitleDocument
 
 def _render_ass(doc: SubtitleDocument) -> str:
     lines = list(doc.metadata["lines"])
-    for cue, record in zip(doc.cues, doc.metadata["records"]):
+    for cue, record in zip(doc.cues, doc.metadata["records"], strict=True):
         values = list(record["values"])
         # ASS uses literal \N for an explicit subtitle line break.
         values[record["text_index"]] = "\\N".join(cue.lines)
