@@ -12,7 +12,6 @@ import secrets
 import shutil
 import sqlite3
 import threading
-import urllib.parse
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -584,7 +583,6 @@ def verify_captcha(action: str, token: Any):
         site_key=settings.get(f"{provider}_site_key", ""),
         secret_key=settings.get(f"{provider}_secret_key", ""),
         configured_hostname=settings.get("captcha_hostname", ""),
-        request_hostname=urllib.parse.urlsplit(request.url_root).hostname or "",
         remote_addr=request.remote_addr,
     )
     if failure is None:
