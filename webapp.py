@@ -1316,19 +1316,43 @@ def create_jobs():
     return jsonify(jobs=created), 202
 
 
+JOB_LIST_MAX_OFFSET = 1_000_000
+
+
+def bounded_int_arg(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read an integer query argument, falling back on garbage and clamping to bounds."""
+    return min(max(request.args.get(name, default, type=int), minimum), maximum)
+
+
 @app.get("/api/jobs")
 @jwt_required()
 def list_jobs():
     user = current_user_row()
-    limit = min(max(request.args.get("limit", 50, type=int), 1), 200)
+    limit = bounded_int_arg("limit", 50, 1, 200)
+    offset = bounded_int_arg("offset", 0, 0, JOB_LIST_MAX_OFFSET)
     show_all = user.role == "admin" and request.args.get("all") == "1"
+    scope = "all" if show_all else user.id
+    # The id tie-breaker keeps pages stable for jobs created by one multi-file upload.
     statement = select(jobs, users.c.username.label("owner")).outerjoin(
         users, jobs.c.user_id == users.c.id
-    ).order_by(jobs.c.created_at.desc()).limit(limit)
+    ).order_by(jobs.c.created_at.desc(), jobs.c.id.desc()).limit(limit).offset(offset)
+    count_statement = select(
+        jobs.c.status, func.count().label("count"),
+    ).group_by(jobs.c.status)
     if not show_all:
         statement = statement.where(jobs.c.user_id == user.id)
-    rows = cached_rows("jobs", f"list:{'all' if show_all else user.id}:{limit}", statement)
-    return jsonify(jobs=[job_dict(row, include_owner=show_all) for row in rows])
+        count_statement = count_statement.where(jobs.c.user_id == user.id)
+    rows = cached_rows("jobs", f"list:{scope}:{limit}:{offset}", statement)
+    counts = {
+        str(row["status"]): int(row["count"])
+        for row in cached_rows("jobs", f"counts:{scope}", count_statement)
+    }
+    total = sum(counts.values())
+    return jsonify(
+        jobs=[job_dict(row, include_owner=show_all) for row in rows],
+        total=total, counts=counts, offset=offset, limit=limit,
+        has_more=offset + len(rows) < total,
+    )
 
 
 @app.get("/api/jobs/<job_id>")
