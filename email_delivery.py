@@ -108,13 +108,25 @@ class SMTPProvider:
         context = ssl.create_default_context()
         factory = smtplib.SMTP_SSL if self.security == "ssl" else smtplib.SMTP
         kwargs = {"context": context} if self.security == "ssl" else {}
-        with factory(self.host, self.port, timeout=TIMEOUT, **kwargs) as smtp:
-            if self.security == "starttls":
-                smtp.starttls(context=context)
-            if self.username:
-                smtp.login(self.username, self.password)
-            if smtp.send_message(mime):
-                raise EmailDeliveryError("Email delivery failed")
+        accepted = False
+        try:
+            with factory(self.host, self.port, timeout=TIMEOUT, **kwargs) as smtp:
+                if self.security == "starttls":
+                    smtp.starttls(context=context)
+                if self.username:
+                    smtp.login(self.username, self.password)
+                refused = smtp.send_message(mime)
+                accepted = True
+        except (smtplib.SMTPException, OSError):
+            # Once send_message returns, the server has accepted the message. A
+            # failed QUIT on leaving the context (for example a 421 reply or a
+            # dropped connection) must not report that acceptance as a failure,
+            # which would invite a duplicate send. SMTP.__exit__ always closes
+            # the socket, even when QUIT fails.
+            if not accepted:
+                raise
+        if refused:
+            raise EmailDeliveryError("Email delivery failed")
 
 
 class SESProvider:
