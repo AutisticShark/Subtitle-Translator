@@ -1,6 +1,7 @@
 """Regression tests for translation-engine and subtitle-format fixes."""
 
 import datetime
+import hashlib
 import http.server
 import threading
 import time
@@ -8,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from srt_translate import (
+    Cue,
     FatalTranslationError,
     RateLimitError,
     Segment,
@@ -16,12 +18,18 @@ from srt_translate import (
     _parse_rate_limit_reset,
     _post_json,
     make_deepl,
+    make_echo,
+    mask_tags,
+    needs_translation,
     parse_numbered,
     parse_srt,
+    placeholders_match,
     rebuild_cues,
     segment_cue,
     translate_segments,
+    wrap_latin,
 )
+from subtitle_formats import parse_subtitle
 
 CUE = ("00:00:01,000", "00:00:02,000", "")
 
@@ -68,6 +76,37 @@ ASS_HEADER = (
 
 def ass_line(text):
     return f"Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{text}\n"
+
+
+class EmptySegmentTests(unittest.TestCase):
+    def test_empty_segments_are_not_sent_and_pass_through(self):
+        source = (ASS_HEADER + ass_line("") + ass_line("Hello") + ass_line("{\\an8}")).encode()
+        document = parse_subtitle(source, ".ass")
+        provider, calls = recording_provider()
+        reported = []
+        segments = segments_for(document.cues)
+
+        output = run_translation(segments, provider, fallback_callback=reported.append)
+        rendered = document.clone_with_cues(
+            rebuild_cues(document.cues, segments, output, "es", 40, 2)
+        ).render()
+
+        self.assertEqual(calls, [["Hello"]])
+        self.assertEqual(reported, [])
+        self.assertIn(ass_line("").rstrip("\n"), rendered)
+        self.assertIn(ass_line("T:Hello").rstrip("\n"), rendered)
+        self.assertIn(ass_line("{\\an8}").rstrip("\n"), rendered)
+
+    def test_srt_cue_without_text_is_not_sent(self):
+        source = (b"1\n00:00:01,000 --> 00:00:02,000\n\n"
+                  b"2\n00:00:03,000 --> 00:00:04,000\nHi\n")
+        document = parse_subtitle(source, ".srt")
+        provider, calls = recording_provider()
+
+        rendered = translate_document(document, provider)
+
+        self.assertEqual(calls, [["Hi"]])
+        self.assertEqual(rendered, document.render().replace("Hi", "T:Hi"))
 
 
 class _LoopbackHandler(http.server.BaseHTTPRequestHandler):
@@ -154,6 +193,124 @@ class PostJsonErrorTests(unittest.TestCase):
         self.assertEqual(caught.exception.retry_after, 360.0)
 
 
+class TagSafeWrappingTests(unittest.TestCase):
+    def rebuild_single(self, line, language="es", width=5, translated=None, dialect=""):
+        cue = Cue(1, *CUE, [line], dialect)
+        segments = segment_cue(cue, 0)
+        output = [translated or segment.text for segment in segments]
+        return rebuild_cues([cue], segments, output, language, width, 4)[0].lines
+
+    def assert_tags_intact(self, lines, *tags):
+        for line in lines:
+            self.assertEqual(line.count("<"), line.count(">"), lines)
+            self.assertEqual(line.count("{"), line.count("}"), lines)
+        joined = "".join(lines)
+        for tag in tags:
+            self.assertIn(tag, joined)
+
+    def test_latin_wrap_never_splits_a_font_tag(self):
+        lines = self.rebuild_single('<font color="#ff0000">Hello there my friend</font>')
+
+        self.assertGreater(len(lines), 1)
+        self.assert_tags_intact(lines, '<font color="#ff0000">', "</font>")
+        self.assertTrue(lines[0].startswith('<font color="#ff0000">Hello'))
+
+    def test_latin_wrap_never_splits_an_ass_override_with_spaces(self):
+        lines = self.rebuild_single("{\\fnArial Black}Hello there my friend", dialect="ass")
+
+        self.assert_tags_intact(lines, "{\\fnArial Black}")
+        self.assertTrue(lines[0].startswith("{\\fnArial Black}Hello"))
+
+    def test_cjk_wrap_never_splits_an_ass_override(self):
+        lines = self.rebuild_single(
+            "{\\pos(100,200)}Hello", language="zh-TW", width=3,
+            translated="⟦0⟧你好世界你好世界", dialect="ass",
+        )
+
+        self.assertGreater(len(lines), 1)
+        self.assert_tags_intact(lines, "{\\pos(100,200)}")
+        self.assertTrue(lines[0].startswith("{\\pos(100,200)}你"))
+
+    def test_tag_between_spaces_never_forms_its_own_line(self):
+        lines = self.rebuild_single("aaaa <i> bbbb cccc</i>", width=3)
+
+        for line in lines:
+            self.assertNotIn(line, {"<i>", "</i>"})
+        self.assertEqual(" ".join(lines), "aaaa <i> bbbb cccc</i>")
+
+
+class SpeakerDashTests(unittest.TestCase):
+    def test_dash_inside_leading_tags_is_detected_and_restored(self):
+        cue = Cue(1, *CUE, ["<i>- Where?</i>", "<i>- Home.</i>"])
+
+        segments = segment_cue(cue, 0)
+
+        self.assertEqual([segment.text for segment in segments],
+                         ["⟦0⟧Where?⟦1⟧", "⟦0⟧Home.⟦1⟧"])
+        rebuilt = rebuild_cues([cue], segments, ["⟦0⟧¿Dónde?⟦1⟧", "⟦0⟧A casa.⟦1⟧"],
+                               "es", 20, 2)
+        self.assertEqual(rebuilt[0].lines, ["<i>- ¿Dónde?</i>", "<i>- A casa.</i>"])
+
+    def test_dash_after_ass_override_is_detected(self):
+        cue = Cue(1, *CUE, ["{\\an8}- Hi", "- Bye"], "ass")
+
+        segments = segment_cue(cue, 0)
+
+        self.assertEqual(len(segments), 2)
+        rebuilt = rebuild_cues([cue], segments, ["⟦0⟧Hola", "Adiós"], "es", 20, 2)
+        self.assertEqual(rebuilt[0].lines, ["{\\an8}- Hola", "- Adiós"])
+
+    def test_undashed_continuation_joins_the_previous_speaker(self):
+        cue = Cue(1, *CUE, ["- Where are you going", "right now?", "- Home."])
+
+        segments = segment_cue(cue, 0)
+
+        self.assertEqual([segment.text for segment in segments],
+                         ["Where are you going right now?", "Home."])
+        self.assertTrue(all(segment.dashed for segment in segments))
+        rebuilt = rebuild_cues([cue], segments, ["¿Adónde vas ahora?", "A casa."],
+                               "es", 20, 2)
+        self.assertEqual(rebuilt[0].lines, ["- ¿Adónde vas ahora?", "- A casa."])
+
+    def test_minus_sign_before_a_digit_is_not_a_dash(self):
+        cue = Cue(1, *CUE, ["-10 degrees outside"])
+
+        segments = segment_cue(cue, 0)
+
+        self.assertFalse(segments[0].dashed)
+        self.assertEqual(segments[0].text, "-10 degrees outside")
+        rebuilt = rebuild_cues([cue], segments, [segments[0].text], "es", 40, 2)
+        self.assertEqual(rebuilt[0].lines, ["-10 degrees outside"])
+        speakers = segment_cue(Cue(1, *CUE, ["-10 degrees?", "- Yes."]), 0)
+        self.assertEqual(len(speakers), 1)
+
+
+class AssDrawingTests(unittest.TestCase):
+    DRAWING = "{\\p1}m 0 0 l 100 0 100 100 0 100{\\p0}"
+
+    def test_drawing_is_never_sent_or_wrapped(self):
+        source = (ASS_HEADER + ass_line(self.DRAWING)
+                  + ass_line(self.DRAWING + "Hello there my good friend")).encode()
+        document = parse_subtitle(source, ".ass")
+        provider, calls = recording_provider()
+
+        rendered = translate_document(document, provider, width=5, max_lines=4)
+
+        sent = [text for batch in calls for text in batch]
+        self.assertEqual(len(sent), 1)
+        self.assertNotIn("m 0 0", sent[0])
+        self.assertIn(ass_line(self.DRAWING).rstrip("\n"), rendered)
+        # The text after the drawing is wrapped; the drawing itself is not.
+        self.assertIn("T:" + self.DRAWING + "Hello\\N", rendered)
+
+    def test_unterminated_drawing_runs_to_the_end(self):
+        masked, tags = mask_tags("{\\p2}m 0 0 l 1 1", ass=True)
+
+        self.assertEqual(masked, "⟦0⟧")
+        self.assertEqual(tags, ["{\\p2}m 0 0 l 1 1"])
+        self.assertFalse(needs_translation(Segment(0, masked, tags, False)))
+
+
 class SrtParsingTests(unittest.TestCase):
     def test_srt_without_blank_separator_starts_a_new_cue(self):
         cues = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nHello\n"
@@ -162,6 +319,85 @@ class SrtParsingTests(unittest.TestCase):
 
         self.assertEqual([cue.lines for cue in cues], [["Hello"], ["World"], ["Again"]])
         self.assertEqual([cue.index for cue in cues], [1, 2, 3])
+
+
+class MaskingTests(unittest.TestCase):
+    def test_vtt_karaoke_timestamps_are_masked(self):
+        masked, tags = mask_tags("<c>Never <00:00:01.500>gonna</c>")
+
+        self.assertEqual(masked, "⟦0⟧Never ⟦1⟧gonna⟦2⟧")
+        self.assertEqual(tags[1], "<00:00:01.500>")
+
+    def test_ass_hard_space_and_soft_break_are_masked_only_for_ass(self):
+        self.assertEqual(mask_tags("a\\hb\\nc", ass=True), ("a⟦0⟧b⟦1⟧c", ["\\h", "\\n"]))
+        self.assertEqual(mask_tags("C:\\new\\home"), ("C:\\new\\home", []))
+
+
+class PlaceholderValidationTests(unittest.TestCase):
+    def test_placeholder_multiset_must_match(self):
+        source = "⟦0⟧Hello⟦1⟧ world"
+        self.assertTrue(placeholders_match(source, "mundo ⟦0⟧Hola⟦ 1 ⟧"))
+        self.assertFalse(placeholders_match(source, "⟦0⟧Hola mundo"))
+        self.assertFalse(placeholders_match(source, "⟦0⟧Hola⟦1⟧⟦1⟧ mundo"))
+        self.assertFalse(placeholders_match(source, "⟦0⟧Hola⟦1⟧ ⟦2⟧mundo"))
+        self.assertFalse(placeholders_match(source, "⟦0⟧Hola⟦1⟧ ⟦mundo"))
+
+    @patch("srt_translate.time.sleep")
+    def test_dropped_placeholder_is_retried_then_passed_through(self, _sleep):
+        calls = []
+
+        def provider(texts, _source, _target):
+            calls.append(list(texts))
+            return [text.replace("⟦1⟧", "") for text in texts]
+
+        segments = segments_for([Cue(1, *CUE, ["<i>Hello</i>"]), Cue(2, *CUE, ["Plain"])])
+        reported = []
+        cache = {}
+
+        output = run_translation(segments, provider, retries=2, cache=cache,
+                                 fallback_callback=reported.append)
+
+        self.assertEqual(output, ["⟦0⟧Hello⟦1⟧", "Plain"])
+        self.assertEqual(reported, [1])
+        self.assertEqual(list(cache.values()), ["Plain"])
+        self.assertIn([segments[0].text], calls)
+
+    def test_invalid_cached_translation_is_not_reused(self):
+        segment = segment_cue(Cue(1, *CUE, ["<i>Hello</i>"]), 0)[0]
+        key = hashlib.sha256(f"es\0{segment.text}".encode()).hexdigest()[:24]
+        provider, calls = recording_provider()
+
+        output = run_translation([segment], provider, cache={key: "⟦0⟧Hola"})
+
+        self.assertEqual(calls, [[segment.text]])
+        self.assertEqual(output, ["T:⟦0⟧Hello⟦1⟧"])
+
+    def test_wrong_translation_count_is_a_retryable_format_error(self):
+        def provider(texts, _source, _target):
+            return ["only one"] if len(texts) > 1 else [texts[0].upper()]
+
+        segments = [Segment(0, "a", [], False), Segment(1, "b", [], False)]
+
+        self.assertEqual(run_translation(segments, provider), ["A", "B"])
+
+    def test_literal_sentinels_in_source_round_trip(self):
+        line = "Press ⟦1⟧ then <i>go</i>"
+        cue = Cue(1, *CUE, [line])
+        segments = segment_cue(cue, 0)
+
+        self.assertEqual(segments[0].text.count("⟦"), 4)
+        output = run_translation(segments, make_echo())
+        rebuilt = rebuild_cues([cue], segments, output, "es", 40, 2)
+
+        self.assertEqual(rebuilt[0].lines, ["[es] " + line])
+
+    def test_rebuild_tolerates_unvalidated_output(self):
+        cue = Cue(1, *CUE, ["<i>Hello</i>"])
+        segments = segment_cue(cue, 0)
+
+        rebuilt = rebuild_cues([cue], segments, ["⟦0⟧Hola⟦0⟧ ⟦7⟧ ⟦"], "es", 40, 2)
+
+        self.assertEqual(rebuilt[0].lines, ["<i>Hola</i>"])
 
 
 class ParseNumberedTests(unittest.TestCase):
@@ -201,6 +437,17 @@ class PerLineFallbackRateLimitTests(unittest.TestCase):
             run_translation(segments, provider, rate_retries=0)
 
         self.assertEqual(len(calls), 2)
+
+
+class WrapLatinTests(unittest.TestCase):
+    def test_never_emits_an_empty_line(self):
+        text = "xxxxxxxx xxxxxxxx xxxxxxxx xxxxxxxx xx " + "x" * 40
+
+        for max_lines in range(1, 7):
+            lines = wrap_latin(text, 10, max_lines)
+            self.assertTrue(all(line.strip() for line in lines), (max_lines, lines))
+            self.assertLessEqual(len(lines), max_lines)
+            self.assertEqual(" ".join(lines), text)
 
 
 class DeeplValidationTests(unittest.TestCase):

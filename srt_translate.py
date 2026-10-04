@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass
 from typing import Callable
 
@@ -77,8 +78,11 @@ TIMING_RE = re.compile(
     r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})(?P<rest>.*)"
 )
 
-# <i> <b> <u> <font ...> </...>, ASS overrides {\an8}, and {y:i} legacy tags
-TAG_RE = re.compile(r"(</?[a-zA-Z][^>]*>|\{[^}]*\})")
+# <i> <b> <u> <font ...> </...>, WebVTT karaoke timestamps <00:00:01.000>,
+# ASS overrides {\an8}, and {y:i} legacy tags
+TAG_RE = re.compile(
+    r"(</?[a-zA-Z][^>]*>|<(?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3}>|\{[^}]*\})"
+)
 
 
 @dataclass
@@ -88,6 +92,9 @@ class Cue:
     end: str
     rest: str  # trailing position data on the timing line, e.g. "  X1:100 X2:500"
     lines: list[str]
+    # Markup dialect of the text. "ass" additionally masks the \h hard space
+    # and \n soft break escapes, which are plain text in the other formats.
+    dialect: str = ""
 
     @property
     def text(self) -> str:
@@ -177,28 +184,84 @@ def parse_srt(raw: str) -> list[Cue]:
 # Segmentation: split a cue into translatable segments
 # --------------------------------------------------------------------------- #
 
-DASH_RE = re.compile(r"^\s*[-–—]\s*(?=\S)")
+# A speaker dash, optionally preceded by masked tags (`<i>- Hi`, `{\an8}- Hi`).
+# A hyphen-minus directly followed by a digit is a minus sign (`-10 degrees`).
+DASH_RE = re.compile(
+    r"^(?P<lead>\s*(?:\u27e6\d+\u27e7\s*)*)(?:-(?!\d)|[\u2013\u2014])\s*(?=\S)"
+)
+
+SENTINEL_RE = re.compile(r"\u27e6\s*(\d+)\s*\u27e7")
+
+# Wrapping works on text whose placeholders are single characters from the
+# Supplementary Private Use Area-A: zero-width and impossible to split.
+_PH_BASE = 0xF0000
+_PH_CLASS = "\U000f0000-\U000ffffd"
+_PH_RE = re.compile(f"[{_PH_CLASS}]")
+_LEAD_PH_RE = re.compile(f"^[\\s{_PH_CLASS}]*")
+
+# Characters that must never reach a provider as text: the sentinel brackets
+# themselves and the internal placeholder range. They are masked as tags so
+# they round-trip byte-for-byte instead of being mistaken for placeholders.
+_RESERVED = f"[\u27e6\u27e7{_PH_CLASS}]"
+_MASK_RE = re.compile(TAG_RE.pattern[:-1] + "|" + _RESERVED + ")")
+# ASS additionally has the \h (hard space) and \n (soft line break) escapes.
+_MASK_ASS_RE = re.compile(TAG_RE.pattern[:-1] + r"|\\[hn]|" + _RESERVED + ")")
+_DRAWING_RE = re.compile(r"\\p(\d+)")
 
 
 @dataclass
 class Segment:
     """One translatable unit. A cue is one segment, unless it holds a
-    two-speaker dialogue pair, in which case each dashed line is its own."""
+    two-speaker dialogue pair, in which case each speaker is its own."""
     cue_i: int
     text: str          # masked, tags replaced by sentinels
     tags: list[str]    # sentinel payloads, in order
     dashed: bool
     trailing_ws: str = ""
+    # The dash followed leading tags (`<i>- Hi`) rather than preceding them.
+    dash_inside: bool = False
 
 
-def mask_tags(s: str) -> tuple[str, list[str]]:
+def mask_tags(s: str, ass: bool = False) -> tuple[str, list[str]]:
+    """Replace markup with numbered sentinels.
+
+    ASS vector drawings (the text after a ``\\p1`` override, up to and
+    including the ``\\p0`` override that ends it) are folded into one
+    placeholder: drawing commands are neither translatable nor wrappable.
+    """
+    pattern = _MASK_ASS_RE if ass else _MASK_RE
+    pieces: list[list] = []  # [is_tag, text]
+    drawing = False
+    pos = 0
+    for m in [*pattern.finditer(s), None]:
+        end = m.start() if m is not None else len(s)
+        if end > pos:
+            if drawing:
+                pieces[-1][1] += s[pos:end]
+            else:
+                pieces.append([False, s[pos:end]])
+        if m is None:
+            break
+        tag = m.group(0)
+        if drawing:
+            pieces[-1][1] += tag
+        else:
+            pieces.append([True, tag])
+        if tag.startswith("{"):
+            modes = _DRAWING_RE.findall(tag)
+            if modes:
+                drawing = int(modes[-1]) > 0
+        pos = m.end()
+
     tags: list[str] = []
-
-    def repl(m: re.Match) -> str:
-        tags.append(m.group(0))
-        return f"\u27e6{len(tags) - 1}\u27e7"
-
-    return TAG_RE.sub(repl, s), tags
+    out: list[str] = []
+    for is_tag, text in pieces:
+        if is_tag:
+            out.append(f"\u27e6{len(tags)}\u27e7")
+            tags.append(text)
+        else:
+            out.append(text)
+    return "".join(out), tags
 
 
 def unmask_tags(s: str, tags: list[str]) -> str:
@@ -207,30 +270,64 @@ def unmask_tags(s: str, tags: list[str]) -> str:
         return tags[k] if 0 <= k < len(tags) else ""
 
     # Tolerate the model adding spaces inside the sentinel
-    return re.sub(r"\u27e6\s*(\d+)\s*\u27e7", repl, s)
+    return SENTINEL_RE.sub(repl, s)
+
+
+def placeholders_match(source: str, translated: str) -> bool:
+    """True when ``translated`` holds exactly the source's placeholders.
+
+    Order may change (translation reorders words), but every placeholder must
+    appear as often as in the source and no stray sentinel bracket may remain;
+    otherwise restoring the tags would drop, duplicate, or invent markup.
+    """
+    expected = Counter(int(k) for k in SENTINEL_RE.findall(source))
+    got = Counter(int(k) for k in SENTINEL_RE.findall(translated))
+    if expected != got:
+        return False
+    rest = SENTINEL_RE.sub("", translated)
+    return "\u27e6" not in rest and "\u27e7" not in rest
+
+
+def needs_translation(seg: Segment) -> bool:
+    """Segments with no text besides markup are passed through unchanged."""
+    return bool(SENTINEL_RE.sub("", seg.text).strip())
+
+
+def _split_dash(line: str, ass: bool) -> tuple[bool, bool, str]:
+    """Detect a speaker dash on the masked line, so leading tags can't hide
+    it. Returns (dashed, dash_after_tags, raw line without the dash)."""
+    masked, tags = mask_tags(line, ass)
+    m = DASH_RE.match(masked)
+    if not m:
+        return False, False, line
+    lead = m.group("lead").strip()
+    return True, bool(lead), unmask_tags(lead + masked[m.end():], tags)
 
 
 def segment_cue(cue: Cue, cue_i: int) -> list[Segment]:
-    stripped = [line for line in cue.lines if line.strip()]
-    dash_lines = [line for line in stripped if DASH_RE.match(line)]
+    ass = cue.dialect == "ass"
+    stripped = [line.strip() for line in cue.lines if line.strip()]
+    parsed = [_split_dash(line, ass) for line in stripped]
 
-    # Two or more dashed lines => speaker pair; keep the lines distinct.
-    if len(dash_lines) >= 2:
+    # Two or more dashed lines => speaker pair; keep the speakers distinct.
+    # An undashed line continues the preceding speaker's sentence.
+    if sum(1 for dashed, _inside, _body in parsed if dashed) >= 2:
+        groups: list[tuple[bool, bool, list[str]]] = []
+        for dashed, inside, body in parsed:
+            if dashed or not groups:
+                groups.append((dashed, inside, [body.strip()]))
+            else:
+                groups[-1][2].append(body.strip())
         segs = []
-        for line in stripped:
-            body = DASH_RE.sub("", line)
-            masked, tags = mask_tags(body.strip())
-            segs.append(Segment(cue_i, masked, tags, dashed=True))
+        for dashed, inside, bodies in groups:
+            masked, tags = mask_tags(" ".join(bodies), ass)
+            segs.append(Segment(cue_i, masked, tags, dashed=dashed, dash_inside=inside))
         return segs
 
     # Otherwise the cue is one sentence fragment possibly wrapped over lines.
-    joined = " ".join(line.strip() for line in stripped)
-    lead = DASH_RE.match(joined)
-    dashed = bool(lead)
-    if lead:
-        joined = DASH_RE.sub("", joined)
-    masked, tags = mask_tags(joined)
-    return [Segment(cue_i, masked, tags, dashed=dashed)]
+    dashed, inside, joined = _split_dash(" ".join(stripped), ass)
+    masked, tags = mask_tags(joined.strip(), ass)
+    return [Segment(cue_i, masked, tags, dashed=dashed, dash_inside=inside)]
 
 
 # --------------------------------------------------------------------------- #
@@ -244,15 +341,27 @@ HAS_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]
 
 def display_width(s: str) -> float:
     """Full-width chars count 1, half-width count 0.5, so the limit is
-    expressed in 'full-width equivalents'."""
+    expressed in 'full-width equivalents'. Internal tag placeholders are
+    zero-width."""
     w = 0.0
     for ch in s:
+        if _is_placeholder(ch):
+            continue
         w += 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5
     return w
 
 
+def _is_placeholder(ch: str) -> bool:
+    return _PH_BASE <= ord(ch) <= 0xFFFFD
+
+
+def _visible_len(s: str) -> int:
+    return sum(1 for ch in s if not _is_placeholder(ch))
+
+
 def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
-    """Greedy wrap that won't orphan closing punctuation onto a new line."""
+    """Greedy wrap that won't orphan closing punctuation onto a new line.
+    Tag placeholders stay attached to the text before them."""
     s = s.strip()
     if not s or display_width(s) <= limit:
         return [s] if s else [""]
@@ -260,7 +369,8 @@ def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
     lines: list[str] = []
     cur = ""
     for ch in s:
-        if cur and display_width(cur + ch) > limit and ch not in CJK_PUNCT_NO_LEAD:
+        if cur and display_width(cur + ch) > limit and ch not in CJK_PUNCT_NO_LEAD \
+                and not _is_placeholder(ch):
             if cur and cur[-1] in CJK_PUNCT_NO_TRAIL:
                 cur, carry = cur[:-1], cur[-1]
             else:
@@ -280,7 +390,7 @@ def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
     lines, cur = [], ""
     for ch in s:
         if cur and display_width(cur) >= target and len(lines) < n_lines - 1 \
-                and ch not in CJK_PUNCT_NO_LEAD:
+                and ch not in CJK_PUNCT_NO_LEAD and not _is_placeholder(ch):
             if cur[-1] in CJK_PUNCT_NO_TRAIL:
                 cur, carry = cur[:-1], cur[-1]
             else:
@@ -295,14 +405,34 @@ def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
     return [line.strip() for line in lines if line.strip()]
 
 
+def _latin_words(s: str) -> list[str]:
+    """Split on whitespace, gluing placeholder-only words (a tag between two
+    spaces) to the next word, or to the previous one at the end, so a line
+    never consists of markup alone."""
+    words: list[str] = []
+    pending = ""
+    for w in s.split():
+        if not _visible_len(w):
+            pending = f"{pending} {w}" if pending else w
+            continue
+        words.append(f"{pending} {w}" if pending else w)
+        pending = ""
+    if pending:
+        if words:
+            words[-1] += " " + pending
+        else:
+            words.append(pending)
+    return words
+
+
 def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
-    words, lines, cur = s.split(), [], ""
+    words, lines, cur = _latin_words(s), [], ""
     for w in words:
-        if cur and len(cur) + 1 + len(w) > limit:
+        if cur and _visible_len(cur) + 1 + _visible_len(w) > limit:
             lines.append(cur)
             cur = w
         else:
-            cur = f"{cur} {w}".strip()
+            cur = f"{cur} {w}" if cur else w
     if cur:
         lines.append(cur)
     if not lines:
@@ -314,17 +444,19 @@ def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
 
     # The width is a preference, while max_lines is a hard subtitle-layout
     # constraint. Rebalance all words when the greedy pass needs too many lines.
+    # Long words can use up the words early; stop rather than emit empty lines.
     remaining = list(words)
     balanced: list[str] = []
-    while len(balanced) < max_lines - 1:
+    while remaining and len(balanced) < max_lines - 1:
         slots = max_lines - len(balanced)
-        remaining_width = sum(len(word) for word in remaining) + len(remaining) - 1
+        remaining_width = sum(_visible_len(word) for word in remaining) + len(remaining) - 1
         target = (remaining_width + slots - 1) // slots
         current = remaining.pop(0)
-        while remaining and len(current) + 1 + len(remaining[0]) <= target:
+        while remaining and _visible_len(current) + 1 + _visible_len(remaining[0]) <= target:
             current += " " + remaining.pop(0)
         balanced.append(current)
-    balanced.append(" ".join(remaining))
+    if remaining:
+        balanced.append(" ".join(remaining))
     return balanced
 
 
@@ -744,6 +876,27 @@ def parse_numbered(out: str, expected: int) -> list[str]:
 # Batch driver
 # --------------------------------------------------------------------------- #
 
+def _validate_output(texts: list[str], output: object) -> None:
+    """Reject provider output that can't be mapped back onto the input:
+    the wrong number of strings, or translations whose tag placeholders were
+    dropped, duplicated, or invented. Raised as a retryable format error so
+    the retry and per-line fallback path handles it."""
+    if not isinstance(output, list) or len(output) != len(texts):
+        count = len(output) if isinstance(output, list) else "no"
+        raise TranslationError(
+            f"provider returned {count} translations for {len(texts)} lines"
+        )
+    for position, (source, translated) in enumerate(zip(texts, output, strict=True)):
+        if not isinstance(translated, str):
+            raise TranslationError(
+                f"provider returned a non-text translation for line {position + 1}"
+            )
+        if not placeholders_match(source, translated):
+            raise TranslationError(
+                f"line {position + 1} lost or altered its markup placeholders"
+            )
+
+
 def translate_segments(
     segs: list[Segment],
     provider: Callable[[list[str], str, str], list[str]],
@@ -784,9 +937,14 @@ def translate_segments(
     check_canceled()
     todo: list[int] = []
     for i, s in enumerate(segs):
+        if not needs_translation(s):
+            # Empty text or markup only (e.g. an ASS drawing): nothing to send.
+            results[i] = s.text
+            continue
         key = hashlib.sha256(f"{tgt_key}\u0000{s.text}".encode()).hexdigest()[:24]
-        if key in cache:
-            results[i] = cache[key]
+        hit = cache.get(key)
+        if isinstance(hit, str) and placeholders_match(s.text, hit):
+            results[i] = hit
         else:
             todo.append(i)
 
@@ -811,6 +969,7 @@ def translate_segments(
             try:
                 output = provider(texts, src, tgt_key)
                 check_canceled()
+                _validate_output(texts, output)
                 return output
             except FatalTranslationError:
                 raise
@@ -915,6 +1074,46 @@ def translate_segments(
 # Reassembly
 # --------------------------------------------------------------------------- #
 
+def _to_wrap_form(t: str, tags: list[str]) -> str:
+    """Turn sentinels into single zero-width placeholder characters.
+
+    Defensive against output that bypassed validation (direct callers, old
+    caches): unknown or repeated placeholders and stray brackets are dropped,
+    and missing ones are appended so no tag is lost.
+    """
+    seen: set[int] = set()
+
+    def repl(m: re.Match) -> str:
+        k = int(m.group(1))
+        if 0 <= k < len(tags) and k not in seen:
+            seen.add(k)
+            return chr(_PH_BASE + k)
+        return ""
+
+    s = SENTINEL_RE.sub(repl, _PH_RE.sub("", t))
+    s = s.replace("⟦", "").replace("⟧", "").strip()
+    return s + "".join(chr(_PH_BASE + k) for k in range(len(tags)) if k not in seen)
+
+
+def _from_wrap_form(s: str, tags: list[str]) -> str:
+    def repl(m: re.Match) -> str:
+        k = ord(m.group(0)) - _PH_BASE
+        return tags[k] if 0 <= k < len(tags) else ""
+
+    return _PH_RE.sub(repl, s)
+
+
+def _with_dash(line: str, inside: bool) -> str:
+    """Restore a speaker dash, after the leading tags if it was there."""
+    if inside:
+        lead = _LEAD_PH_RE.match(line)
+        assert lead is not None
+        head = line[:lead.end()].strip()
+        if head:
+            return f"{head}- {line[lead.end():]}"
+    return f"- {line}"
+
+
 def rebuild_cues(
     cues: list[Cue], segs: list[Segment], out: list[str], tgt_key: str,
     width: float, max_lines: int,
@@ -928,7 +1127,9 @@ def rebuild_cues(
 
     for ci, cue in enumerate(cues):
         items = by_cue.get(ci, [])
-        if not items:
+        if not items or not any(needs_translation(s) for s, _t in items):
+            # Nothing was translated (empty cue, markup or drawing only):
+            # keep the original lines exactly, without re-wrapping.
             new.append(cue)
             continue
 
@@ -936,11 +1137,16 @@ def rebuild_cues(
             # Speaker pair: one line each, dash restored.
             lines = []
             for s, t in items:
-                t = unmask_tags(t, s.tags).strip()
-                lines.append(f"- {t}" if s.dashed else t)
+                line = _to_wrap_form(t, s.tags).strip()
+                if s.dashed:
+                    line = _with_dash(line, s.dash_inside)
+                lines.append(_from_wrap_form(line, s.tags).strip())
         else:
             s, t = items[0]
-            t = unmask_tags(t, s.tags).strip()
+            # Wrap with each tag as an unbreakable zero-width character, so a
+            # line break can never land inside `<font color="...">` or
+            # `{\fnArial Black}`; restore the tags afterwards.
+            t = _to_wrap_form(t, s.tags).strip()
             # A "CJK" target can still emit CJK-free lines (names, numbers,
             # untranslated codes). Wrapping those by character splits words in
             # half, so pick the wrapper from the actual output, not the target.
@@ -948,9 +1154,9 @@ def rebuild_cues(
             body = (wrap_cjk(t, width, max_lines) if use_cjk
                     else wrap_latin(t, int(width * 2), max_lines))
             if s.dashed and body:
-                body[0] = f"- {body[0]}"
-            lines = body
+                body[0] = _with_dash(body[0], s.dash_inside)
+            lines = [_from_wrap_form(line, s.tags) for line in body]
 
-        new.append(Cue(cue.index, cue.start, cue.end, cue.rest, lines))
+        new.append(Cue(cue.index, cue.start, cue.end, cue.rest, lines, cue.dialect))
 
     return new
