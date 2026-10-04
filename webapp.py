@@ -12,6 +12,7 @@ import secrets
 import shutil
 import sqlite3
 import threading
+import unicodedata
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -32,7 +33,6 @@ from flask_jwt_extended import (
 from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
-from werkzeug.utils import secure_filename
 
 from database import (
     bump_cache_revision, cache_revisions,
@@ -73,6 +73,23 @@ LOGIN_FAILURE_LIMIT = 5
 LOGIN_LOCK_MINUTES = 15
 LOGIN_RATE_LIMIT = 30
 REGISTER_RATE_LIMIT = 10
+ATTEMPT_PRUNE_SECONDS = 60
+MAX_TARGET_LANGUAGES = 20
+MAX_FILENAME_STEM_BYTES = 150
+FALLBACK_FILENAME_STEM = "subtitle"
+UNSAFE_FILENAME_CHARACTERS = frozenset('"\'<>:|?*\\/')
+WINDOWS_RESERVED_STEMS = frozenset({
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+})
+# Every DEFAULTS row is created at startup and never deleted, so locking this row
+# serializes changes that could remove the final active administrator.
+ADMIN_ROSTER_LOCK_SETTING = "registration_enabled"
+REVOKED_SESSION_PREFIX = "sid:"
+# Responses from these endpoints establish or end a session themselves; refreshing
+# the request's previous cookie would overwrite (or resurrect) that decision.
+NO_TOKEN_REFRESH_ENDPOINTS = {"logout", "login", "register", "setup_first_admin"}
 TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 ACTIVE_STATUSES = {"queued", "processing", "canceling"}
 ACCOUNT_THEMES = {"system", "light", "dark"}
@@ -1249,6 +1266,35 @@ def delete_key(provider: str):
     return jsonify(read_settings())
 
 
+def upload_display_name(raw_name: str) -> str | None:
+    """Return a Unicode-preserving, filesystem-safe name, or ``None`` if unsupported.
+
+    The extension is checked on the client's original name, so non-ASCII titles such
+    as ``字幕.srt`` are accepted. The result names translated outputs inside the job
+    folder, so it drops directories, separators, control/format characters, quotes,
+    angle brackets, and Windows-reserved characters, normalizes to NFC, removes
+    leading dots, avoids Windows device names, and caps the UTF-8 length. The
+    uploaded source itself is always stored under a fixed ``source.<ext>`` name.
+    """
+    name = unicodedata.normalize("NFC", raw_name)
+    name = re.split(r"[\\/]", name)[-1].strip()
+    stem, dot, extension = name.rpartition(".")
+    if not dot or f".{extension.lower()}" not in SUPPORTED_EXTENSIONS:
+        return None
+    characters = []
+    for character in stem:
+        category = unicodedata.category(character)
+        if category.startswith("C") or character in UNSAFE_FILENAME_CHARACTERS:
+            continue
+        characters.append(" " if category.startswith("Z") else character)
+    clean = re.sub(r" {2,}", " ", "".join(characters)).strip(" .")
+    clean = clean.encode("utf-8")[:MAX_FILENAME_STEM_BYTES].decode("utf-8", "ignore")
+    clean = clean.strip(" .") or FALLBACK_FILENAME_STEM
+    if clean.split(".", 1)[0].strip().lower() in WINDOWS_RESERVED_STEMS:
+        clean = "_" + clean
+    return f"{clean}.{extension}"
+
+
 @app.post("/api/jobs")
 @jwt_required()
 def create_jobs():
@@ -1261,19 +1307,24 @@ def create_jobs():
         return jsonify(error=tr("Select at least one subtitle file")), 400
     validated_files = []
     for upload in files:
-        original = secure_filename(upload.filename or "")
-        if not original or Path(original).suffix.lower() not in SUPPORTED_EXTENSIONS:
+        original = upload_display_name(upload.filename or "")
+        if original is None:
             return jsonify(error=tr("Unsupported file: {filename}", filename=upload.filename)), 400
         validated_files.append((upload, original))
     current_settings = read_settings()
     provider = request.form.get("provider", current_settings["default_provider"])
     if provider not in available_providers():
         return jsonify(error=tr("Invalid provider")), 400
-    targets = [value.strip() for value in request.form.get(
+    # Duplicates would translate the same language repeatedly into one output name.
+    targets = list(dict.fromkeys(value.strip() for value in request.form.get(
         "target_languages", current_settings["target_languages"]
-    ).split(",") if value.strip()]
+    ).split(",") if value.strip()))
     if not targets or any(language not in LANGS for language in targets):
         return jsonify(error=tr("Choose one or more valid target languages")), 400
+    if len(targets) > MAX_TARGET_LANGUAGES:
+        return jsonify(error=tr(
+            "Choose at most {maximum} target languages", maximum=MAX_TARGET_LANGUAGES,
+        )), 400
     options = {
         "provider": provider, "model": request.form.get("model", "").strip() or None,
         "source_language": request.form.get(

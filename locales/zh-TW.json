@@ -279,6 +279,7 @@
     "Unsupported file: {filename}": "不支援的檔案：{filename}",
     "Invalid provider": "服務商無效",
     "Choose one or more valid target languages": "請選擇一種或多種有效的目標語言",
+    "Choose at most {maximum} target languages": "最多只能選擇 {maximum} 種目標語言",
     "Job not found": "找不到工作",
     "Only an active job can be canceled": "只能取消進行中的工作",
     "Wait for the job to finish before deleting it": "請等工作結束後再刪除",
