@@ -5,6 +5,7 @@ const state = {
     captcha: { provider: 'none', site_key: '', protected_actions: [] },
   },
   captchaWidgets: { auth: null, upload: null }, captchaLoaders: {},
+  captchaRenders: { auth: 0, upload: 0 },
   currentView: 'dashboard',
   loginChallenge: null, enrollmentChallenge: null, managementChallenge: null,
   i18n: { locale: document.body.dataset.locale || 'en', messages: {}, languages: {} },
@@ -93,33 +94,48 @@ const captchaGlobalNames = {
   turnstile: 'turnstile', recaptcha: 'grecaptcha', hcaptcha: 'hcaptcha',
 };
 
+function captchaApi(provider) {
+  return window[captchaGlobalNames[provider]];
+}
+
+// reCAPTCHA's explicit-render api.js defines a grecaptcha stub before its main
+// script adds render(), so the global alone does not mean the SDK is usable.
+function captchaSdkReady(provider) {
+  return typeof captchaApi(provider)?.render === 'function';
+}
+
 function loadCaptchaSdk(provider) {
-  if (window[captchaGlobalNames[provider]]) return Promise.resolve();
+  if (captchaSdkReady(provider)) return Promise.resolve();
   if (state.captchaLoaders[provider]) return state.captchaLoaders[provider];
   state.captchaLoaders[provider] = new Promise((resolve, reject) => {
+    const fail = () => reject(new Error(t('Could not load CAPTCHA')));
+    let checks = 0;
+    const ready = () => {
+      if (captchaSdkReady(provider)) {
+        const sdk = captchaApi(provider);
+        if (provider === 'recaptcha' && typeof sdk.ready === 'function') sdk.ready(resolve);
+        else resolve();
+        return;
+      }
+      checks += 1;
+      if (checks >= 150) return fail();
+      setTimeout(ready, 100);
+    };
+    const src = captchaSdkUrls[provider];
+    if ([...document.scripts].some(script => script.src === src)) {
+      ready(); // A previous attempt already inserted the SDK; keep waiting for it.
+      return;
+    }
     const script = document.createElement('script');
-    script.src = captchaSdkUrls[provider];
+    script.src = src;
     script.async = true;
     script.defer = true;
-    script.addEventListener('error', () => reject(new Error(t('Could not load CAPTCHA'))));
-    script.addEventListener('load', () => {
-      let checks = 0;
-      const ready = () => {
-        if (window[captchaGlobalNames[provider]]) return resolve();
-        checks += 1;
-        if (checks >= 50) return reject(new Error(t('Could not load CAPTCHA')));
-        setTimeout(ready, 100);
-      };
-      ready();
-    });
+    script.addEventListener('error', () => { script.remove(); fail(); });
+    script.addEventListener('load', ready);
     document.head.append(script);
   });
   state.captchaLoaders[provider].catch(() => { delete state.captchaLoaders[provider]; });
   return state.captchaLoaders[provider];
-}
-
-function captchaApi(provider) {
-  return window[captchaGlobalNames[provider]];
 }
 
 function resetCaptcha(slot) {
@@ -143,6 +159,10 @@ function removeCaptcha(slot) {
 }
 
 async function renderCaptcha(slot, action) {
+  // Each call supersedes earlier ones for this slot, so only the newest renders.
+  const generation = state.captchaRenders[slot] + 1;
+  state.captchaRenders[slot] = generation;
+  const superseded = () => state.captchaRenders[slot] !== generation;
   const container = $(`#${slot}Captcha`);
   if (!captchaRequired(action)) {
     container.hidden = true;
@@ -153,6 +173,7 @@ async function renderCaptcha(slot, action) {
   const theme = resolvedTheme();
   container.hidden = false;
   if (!siteKey) {
+    removeCaptcha(slot);
     container.textContent = t('CAPTCHA is temporarily unavailable');
     return;
   }
@@ -163,7 +184,14 @@ async function renderCaptcha(slot, action) {
     return;
   }
   removeCaptcha(slot);
-  await loadCaptchaSdk(provider);
+  try {
+    await loadCaptchaSdk(provider);
+  } catch (error) {
+    if (superseded()) return;
+    throw error;
+  }
+  if (superseded()) return;
+  removeCaptcha(slot);
   const options = { sitekey: siteKey, theme };
   if (provider === 'turnstile') options.action = action;
   const id = captchaApi(provider).render(container, options);
