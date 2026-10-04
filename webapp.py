@@ -1181,6 +1181,12 @@ def save_settings():
             return jsonify(error=tr(
                 "Configure the selected CAPTCHA site key and secret key before enabling protection"
             )), 400
+    # Evaluated on the merged state because payloads are partial. Stored configurations
+    # that predate this rule keep working until an administrator saves settings again.
+    if captcha_provider != "none" and not combined.get("captcha_hostname"):
+        return jsonify(error=tr(
+            "Enter the expected CAPTCHA hostname before selecting a CAPTCHA provider"
+        )), 400
     error = validate_numeric_settings(payload)
     if error:
         return jsonify(error=error), 400

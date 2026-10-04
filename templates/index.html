@@ -279,7 +279,7 @@
         <div class="settings-group compact-grid">
           <label>{{ tr('Allow new user sign-up') }}<select name="registration_enabled"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
           <label>{{ tr('CAPTCHA provider') }}<select name="captcha_provider"><option value="none">{{ tr('Disabled') }}</option><option value="turnstile">Cloudflare Turnstile</option><option value="recaptcha">Google reCAPTCHA v2</option><option value="hcaptcha">hCaptcha</option></select></label>
-          <label class="wide">{{ tr('Expected hostname') }}<input name="captcha_hostname" placeholder="translate.example.com"><small>{{ tr('Leave blank to use the request hostname') }}</small></label>
+          <label class="wide">{{ tr('Expected hostname') }}<input name="captcha_hostname" placeholder="translate.example.com"><small>{{ tr('Required whenever a CAPTCHA provider is selected') }}</small></label>
           <label>{{ tr('Protect login') }}<select name="captcha_on_login"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
           <label>{{ tr('Protect registration') }}<select name="captcha_on_register"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>
           <label>{{ tr('Protect uploads') }}<select name="captcha_on_upload"><option value="1">{{ tr('Enabled') }}</option><option value="0">{{ tr('Disabled') }}</option></select></label>

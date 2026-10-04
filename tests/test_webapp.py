@@ -664,6 +664,7 @@ class WebApplicationTests(unittest.TestCase):
     def test_active_captcha_secret_cannot_be_removed_until_protection_is_disabled(self):
         configured = self.client.put("/api/settings", json={
             "captcha_provider": "hcaptcha",
+            "captcha_hostname": "localhost",
             "captcha_on_login": "1",
             "hcaptcha_site_key": "active-site-key",
             "hcaptcha_secret_key": "active-secret-key",

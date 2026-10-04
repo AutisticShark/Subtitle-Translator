@@ -54,6 +54,24 @@ _HOSTNAME_PATTERN = re.compile(
 )
 
 
+def is_scalar_setting(value: Any) -> bool:
+    """Return whether ``value`` is a JSON string or number (never a boolean or null)."""
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def validate_setting_types(payload: dict[str, Any]) -> str | None:
+    """Reject values that ``str()`` would silently store as text such as "True" or "None".
+
+    Every setting is persisted as the stripped ``str()`` of its JSON value, so only
+    strings and numbers have a meaningful stored form. Booleans, nulls, arrays, and
+    objects are rejected before any other rule inspects (or hashes) the value.
+    """
+    for key in sorted(payload):
+        if not is_scalar_setting(payload[key]):
+            return tr("{key} must be text or a number", key=key)
+    return None
+
+
 def validate_choice_and_flag_settings(
     payload: dict[str, Any], providers: Iterable[str],
 ) -> str | None:
@@ -62,10 +80,13 @@ def validate_choice_and_flag_settings(
     A valid ``captcha_hostname`` is normalized in place (trimmed, lowercased, without
     a trailing dot). Returns a translated error message, or ``None`` when valid.
     """
-    if payload.get("default_provider") and payload["default_provider"] not in providers:
+    error = validate_setting_types(payload)
+    if error:
+        return error
+    if payload.get("default_provider") and payload["default_provider"] not in tuple(providers):
         return tr("Invalid default provider")
     if ("captcha_provider" in payload
-            and payload["captcha_provider"] not in {"none", *CAPTCHA_PROVIDERS}):
+            and str(payload["captcha_provider"]).strip() not in {"none", *CAPTCHA_PROVIDERS}):
         return tr("Invalid CAPTCHA provider")
     for key in BOOLEAN_SETTINGS:
         if key in payload and str(payload[key]).strip() not in {"0", "1"}:
@@ -79,10 +100,20 @@ def validate_choice_and_flag_settings(
 
 
 def validate_numeric_settings(payload: dict[str, Any]) -> str | None:
-    """Validate numeric and integer bounds. Returns an error message or ``None``."""
+    """Validate numeric and integer bounds. Returns an error message or ``None``.
+
+    Each rule checks the exact stripped text that will be stored, so the worker's
+    later ``int()``/``float()`` conversion of that text is guaranteed to succeed.
+    """
+    error = validate_setting_types(
+        {key: value for key, value in payload.items()
+         if key in NUMBER_SETTINGS or key in INTEGER_SETTINGS}
+    )
+    if error:
+        return error
     try:
         for key, (minimum, maximum) in NUMBER_SETTINGS.items():
-            if key in payload and not minimum <= float(payload[key]) <= maximum:
+            if key in payload and not minimum <= float(str(payload[key]).strip()) <= maximum:
                 return tr(
                     "{key} must be between {minimum} and {maximum}",
                     key=key, minimum=minimum, maximum=maximum,
