@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ssl
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,7 +28,7 @@ from sqlalchemy import (
     true,
     update,
 )
-from sqlalchemy.engine import Connection, Engine, make_url
+from sqlalchemy.engine import URL, Connection, Engine, make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 
@@ -121,9 +122,11 @@ jobs = Table(
     Column("stored_name", Text, nullable=False),
     Column("status", String(24), nullable=False),
     Column("progress", Integer, nullable=False, default=0, server_default=text("0")),
-    Column("stage", Text, nullable=False, default="", server_default=text("''")),
+    # MySQL 8 rejects literal defaults on TEXT columns but accepts parenthesized
+    # expression defaults, which SQLite, PostgreSQL, and MariaDB also accept.
+    Column("stage", Text, nullable=False, default="", server_default=text("('')")),
     Column("options", Text, nullable=False),
-    Column("outputs", Text, nullable=False, default="[]", server_default=text("'[]'")),
+    Column("outputs", Text, nullable=False, default="[]", server_default=text("('[]')")),
     Column("error", Text),
     Column("warning", Text),
     Column("created_at", String(40), nullable=False),
@@ -181,13 +184,109 @@ def normalize_database_url(raw_url: str | None, sqlite_path: Path) -> str:
     return value
 
 
+def _tls_context(*, verify_certificate: bool, verify_hostname: bool,
+                 ca_file: str | None, cert_file: str | None,
+                 key_file: str | None) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=ca_file or None)
+    if verify_certificate:
+        context.check_hostname = verify_hostname
+    else:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    if cert_file:
+        context.load_cert_chain(cert_file, key_file or None)
+    return context
+
+
+def _pop_query(query: dict, *names: str) -> str | None:
+    """Remove every spelling of a query parameter and return its last value."""
+    found = None
+    for key in [key for key in query if key.lower() in names]:
+        value = query.pop(key)
+        found = value[-1] if isinstance(value, tuple) else value
+    return found
+
+
+# libpq ``sslmode`` and MySQL ``ssl-mode`` semantics, mapped to
+# (encrypt, verify certificate chain, verify hostname). The opportunistic
+# ``prefer``/``allow``/``PREFERRED`` modes silently fall back to plaintext in
+# libpq and the MySQL client; pg8000 and PyMySQL cannot do that, so they are
+# rejected rather than guessed.
+_POSTGRES_SSL_MODES = {
+    "disable": (False, False, False),
+    "require": (True, False, False),
+    "verify-ca": (True, True, False),
+    "verify-full": (True, True, True),
+}
+_MYSQL_SSL_MODES = {
+    "disabled": (False, False, False),
+    "required": (True, False, False),
+    "verify_ca": (True, True, False),
+    "verify_identity": (True, True, True),
+}
+
+
+def database_connect_options(database_url: str) -> tuple[URL, dict]:
+    """Translate libpq/MySQL-client TLS URL parameters for pg8000 and PyMySQL.
+
+    Neither pure-Python driver accepts ``sslmode``/``ssl-mode``; leaving them in
+    the URL makes every connection fail. They are converted to an ``ssl.SSLContext``
+    passed through ``connect_args`` (pg8000 ``ssl_context``, PyMySQL ``ssl``).
+    """
+    parsed = make_url(database_url)
+    connect_args: dict = {}
+    if parsed.get_backend_name() == "sqlite":
+        return parsed, {"check_same_thread": False, "timeout": 30}
+    query = dict(parsed.query)
+    driver = parsed.get_driver_name()
+    if parsed.get_backend_name() == "postgresql" and driver == "pg8000":
+        mode = _pop_query(query, "sslmode")
+        ca_file = _pop_query(query, "sslrootcert") if mode is not None else None
+        cert_file = _pop_query(query, "sslcert") if mode is not None else None
+        key_file = _pop_query(query, "sslkey") if mode is not None else None
+        modes, argument = _POSTGRES_SSL_MODES, "ssl_context"
+        mode_name = "sslmode"
+        if mode is not None:
+            mode = mode.strip().lower()
+            # libpq verifies the chain for sslmode=require when a root
+            # certificate is supplied; keep that behavior.
+            if mode == "require" and ca_file:
+                mode = "verify-ca"
+    elif parsed.get_backend_name() in {"mysql", "mariadb"} and driver == "pymysql":
+        mode = _pop_query(query, "ssl-mode", "ssl_mode")
+        ca_file = _pop_query(query, "ssl-ca", "ssl_ca") if mode is not None else None
+        cert_file = _pop_query(query, "ssl-cert", "ssl_cert") if mode is not None else None
+        key_file = _pop_query(query, "ssl-key", "ssl_key") if mode is not None else None
+        modes, argument = _MYSQL_SSL_MODES, "ssl"
+        mode_name = "ssl-mode"
+        if mode is not None:
+            mode = mode.strip().lower().replace("-", "_")
+    else:
+        return parsed, connect_args
+    if mode is None:
+        return parsed, connect_args
+    if mode not in modes:
+        supported = ", ".join(modes)
+        raise RuntimeError(
+            f"DATABASE_URL {mode_name}={mode} is not supported by the {driver} driver; "
+            f"use one of: {supported}"
+        )
+    encrypt, verify_certificate, verify_hostname = modes[mode]
+    if encrypt:
+        connect_args[argument] = _tls_context(
+            verify_certificate=verify_certificate, verify_hostname=verify_hostname,
+            ca_file=ca_file, cert_file=cert_file, key_file=key_file,
+        )
+    return parsed.set(query=query), connect_args
+
+
 def create_database_engine(sqlite_path: Path) -> Engine:
     database_url = normalize_database_url(os.environ.get("DATABASE_URL"), sqlite_path)
-    parsed = make_url(database_url)
+    parsed, connect_args = database_connect_options(database_url)
     kwargs: dict = {"pool_pre_ping": True}
-    if parsed.get_backend_name() == "sqlite":
-        kwargs["connect_args"] = {"check_same_thread": False, "timeout": 30}
-    engine = create_engine(database_url, **kwargs)
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+    engine = create_engine(parsed, **kwargs)
 
     if parsed.get_backend_name() == "sqlite":
         @event.listens_for(engine, "connect")

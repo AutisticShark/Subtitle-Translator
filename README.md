@@ -121,6 +121,17 @@ mysql://subtitle:password@mysql/subtitle?charset=utf8mb4
 
 Ordinary PostgreSQL, MariaDB, and MySQL URLs are normalized to the bundled `pg8000` and `PyMySQL` drivers. URL-encode special characters in credentials. The job files still live below `DATA_DIR`; changing the relational database does not move uploads or translated outputs to object storage.
 
+TLS options in the URL are translated for those drivers:
+
+| URL parameter | Meaning |
+|---|---|
+| PostgreSQL `sslmode=disable`, MySQL/MariaDB `ssl-mode=DISABLED` | No TLS |
+| `sslmode=require`, `ssl-mode=REQUIRED` | Encrypted, but the server certificate is **not** verified (as in `libpq` and the MySQL client). With PostgreSQL `sslrootcert`, the chain is verified as for `verify-ca` |
+| `sslmode=verify-ca`, `ssl-mode=VERIFY_CA` | Encrypted; certificate chain verified, host name not checked |
+| `sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY` | Encrypted; certificate chain and host name verified (recommended over untrusted networks) |
+
+Certificates are verified against the system trust store unless a CA file is given with `sslrootcert=/path` (PostgreSQL) or `ssl-ca=/path` (MySQL/MariaDB); client certificates use `sslcert`/`sslkey` or `ssl-cert`/`ssl-key`. The opportunistic `prefer`/`allow`/`PREFERRED` modes can silently fall back to plaintext and are rejected at startup with an explanatory error; choose an explicit mode instead.
+
 ### Redis caching
 
 Docker Compose includes a private Redis service and enables caching by default. It has no published port, uses an internal network, and caps cached data at 128 MB with LRU eviction. Persistence is disabled because every cached value can be reconstructed from SQL. Redis startup or downtime does not block application startup; reads fall back to SQL with 250 ms connection/command timeouts and a five-second retry cooldown.
