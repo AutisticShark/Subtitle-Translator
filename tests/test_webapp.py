@@ -1124,7 +1124,7 @@ class WebApplicationTests(unittest.TestCase):
         release_provider.set()
         self.assertTrue(provider_exited.wait(1))
 
-    def test_queued_job_is_finalized_by_worker_after_cancellation_request(self):
+    def test_queued_job_is_canceled_immediately_and_worker_skips_it(self):
         job_id = "queued-cancel-test"
         timestamp = webapp.now()
         with webapp.connect_db() as db:
@@ -1136,7 +1136,9 @@ class WebApplicationTests(unittest.TestCase):
 
         response = self.client.post(f"/api/jobs/{job_id}/cancel")
         self.assertEqual(response.status_code, 202)
-        self.assertEqual(response.get_json()["status"], "canceling")
+        # A queued job has no worker to acknowledge the request (fix for jobs
+        # stuck in "canceling" until a worker eventually dequeued them).
+        self.assertEqual(response.get_json()["status"], "canceled")
         webapp.run_job(job_id)
         self.assertEqual(self.client.get(f"/api/jobs/{job_id}").get_json()["status"], "canceled")
         self.assertEqual(self.client.delete(f"/api/jobs/{job_id}").status_code, 200)

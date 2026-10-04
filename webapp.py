@@ -11,7 +11,9 @@ import re
 import secrets
 import shutil
 import sqlite3
+import tempfile
 import threading
+import time
 import unicodedata
 import uuid
 import zipfile
@@ -31,7 +33,7 @@ from flask_jwt_extended import (
     verify_jwt_in_request,
 )
 from sqlalchemy import delete, func, insert, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from database import (
@@ -164,7 +166,6 @@ engine = create_database_engine(DB_PATH)
 # Under Gunicorn the master already recovered interrupted jobs before forking
 # (gunicorn.conf.py); a worker must never fail jobs its siblings are running.
 initialize_database(engine, DEFAULTS, now(), recover_jobs=not startup_recovery_completed())
-
 
 configured_jwt_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
 jwt_secret = configured_jwt_secret or secrets.token_urlsafe(64)
@@ -802,11 +803,15 @@ def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
     return result
 
 
-def update_job(job_id: str, **fields: Any) -> None:
+def update_job(job_id: str, *, if_status: set[str] | None = None, **fields: Any) -> None:
+    """Update a job; with ``if_status`` only while it is still in one of those states."""
     fields["updated_at"] = now()
     with db_lock, transaction(engine) as db:
-        db.execute(update(jobs).where(jobs.c.id == job_id).values(**fields))
-        bump_cache_revision(db, "jobs")
+        statement = update(jobs).where(jobs.c.id == job_id)
+        if if_status is not None:
+            statement = statement.where(jobs.c.status.in_(if_status))
+        if db.execute(statement.values(**fields)).rowcount:
+            bump_cache_revision(db, "jobs")
 
 
 def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool:
@@ -823,6 +828,56 @@ def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool
 def cancel_event_for(job_id: str) -> threading.Event:
     with cancel_events_lock:
         return cancel_events.setdefault(job_id, threading.Event())
+
+
+def signal_local_cancel(job_id: str) -> None:
+    """Wake a worker thread in this process; other processes poll the database.
+
+    Only events registered by a running ``run_job`` are signaled, so requests
+    for jobs owned by another worker process never leak an entry here.
+    """
+    with cancel_events_lock:
+        event = cancel_events.get(job_id)
+    if event is not None:
+        event.set()
+
+
+# How often a running job re-reads its status so a cancellation recorded by
+# another web worker process is honored without one query per batch callback.
+CANCEL_POLL_SECONDS = 1.0
+
+
+def job_cancel_monitor(job_id: str, cancel_event: threading.Event) -> Callable[[], bool]:
+    """Return a thread-safe "stop now?" check for one running job.
+
+    The in-memory event covers cancellation from this process immediately.
+    Cancellation from another process, or any transition that removed the job
+    from ``queued``/``processing``, is detected by a throttled status query.
+    """
+    poll_lock = threading.Lock()
+    next_poll = [0.0]
+
+    def stop_requested() -> bool:
+        if cancel_event.is_set():
+            return True
+        moment = time.monotonic()
+        with poll_lock:
+            if moment < next_poll[0]:
+                return False
+            next_poll[0] = moment + CANCEL_POLL_SECONDS
+        try:
+            with connection(engine) as db:
+                status = db.scalar(select(jobs.c.status).where(jobs.c.id == job_id))
+        except SQLAlchemyError:
+            LOGGER.warning("Could not poll the cancellation state of job %s", job_id,
+                           exc_info=True)
+            return False
+        if status not in {"queued", "processing"}:
+            cancel_event.set()
+            return True
+        return False
+
+    return stop_requested
 
 
 def provider_for(name: str, provider_settings: dict[str, Any], throttle: Throttle,
@@ -857,10 +912,16 @@ def provider_for(name: str, provider_settings: dict[str, Any], throttle: Throttl
 
 def run_job(job_id: str) -> None:
     cancel_event = cancel_event_for(job_id)
+    stop_requested = job_cancel_monitor(job_id, cancel_event)
 
     def check_canceled() -> None:
-        if cancel_event.is_set():
+        if stop_requested():
             raise TranslationCanceled("Translation canceled")
+
+    def report(**fields: Any) -> None:
+        # Never overwrite the "Canceling" stage, or a state written by another
+        # process, with progress from work that is being abandoned.
+        update_job(job_id, if_status={"processing"}, **fields)
 
     try:
         with connection(engine) as db:
@@ -869,24 +930,25 @@ def run_job(job_id: str) -> None:
             return
         if row.status == "canceling":
             cancel_event.set()
-        check_canceled()
+        if cancel_event.is_set():
+            raise TranslationCanceled("Translation canceled")
         options = json.loads(row.options)
         folder = JOBS_DIR / job_id
         source = folder / row.stored_name
         if not update_job_if_status(
             job_id, {"queued"}, status="processing", progress=2, stage="Reading subtitle",
         ):
-            check_canceled()
+            # Already claimed, canceled while queued, or finalized elsewhere.
             return
         document = load_subtitle(source, options.get("encoding", "utf-8"))
         segments = []
         for cue_i, cue in enumerate(document.cues):
             segments.extend(segment_cue(cue, cue_i))
         check_canceled()
-        update_job(job_id, progress=5, stage=f"Parsed {len(document.cues)} cues")
+        report(progress=5, stage=f"Parsed {len(document.cues)} cues")
 
         provider_settings = read_settings(include_secrets=True)
-        throttle = Throttle(float(options["rpm"]), cancel_event.is_set)
+        throttle = Throttle(float(options["rpm"]), stop_requested)
         provider = provider_for(
             options["provider"], provider_settings, throttle, options.get("model")
         )
@@ -899,16 +961,16 @@ def run_job(job_id: str) -> None:
         outputs = []
         untranslated = 0
         for index, language in enumerate(targets):
+            check_canceled()
             start_pct = 5 + round(index / len(targets) * 90)
-            update_job(job_id, progress=start_pct,
-                       stage=f"Translating to {LANGS[language]['name']}")
+            report(progress=start_pct, stage=f"Translating to {LANGS[language]['name']}")
 
             def report_progress(done: int, total: int, *, target_index: int = index,
                                 target_language: str = language) -> None:
                 fraction = done / total if total else 1
                 progress = 5 + round((target_index + fraction) / len(targets) * 90)
-                update_job(
-                    job_id, progress=progress,
+                report(
+                    progress=progress,
                     stage=(f"Translating to {LANGS[target_language]['name']} "
                            f"({done}/{total} segments)"),
                 )
@@ -920,7 +982,7 @@ def run_job(job_id: str) -> None:
             translated = translate_segments(
                 segments, provider, language, options["source_language"],
                 int(options["batch_size"]), 4, 10, throttle, cache,
-                int(options["workers"]), True, report_progress, cancel_event.is_set,
+                int(options["workers"]), True, report_progress, stop_requested,
                 count_untranslated,
             )
             check_canceled()
@@ -932,8 +994,8 @@ def run_job(job_id: str) -> None:
             (folder / output_name).write_bytes(document.clone_with_cues(cues).to_bytes())
             outputs.append({"name": output_name, "language": language})
             cache_path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
-            update_job(job_id, outputs=json.dumps(outputs),
-                       progress=5 + round((index + 1) / len(targets) * 90))
+            report(outputs=json.dumps(outputs),
+                   progress=5 + round((index + 1) / len(targets) * 90))
         if not update_job_if_status(
             job_id, {"processing"}, status="completed", progress=100,
             stage="Ready to download", outputs=json.dumps(outputs), error=None,
@@ -949,15 +1011,15 @@ def run_job(job_id: str) -> None:
             stage="Canceled", error=None,
         )
     except Exception as exc:
-        if cancel_event.is_set():
+        if cancel_event.is_set() or not update_job_if_status(
+            job_id, {"queued", "processing"}, status="failed",
+            stage="Translation failed", error=f"{type(exc).__name__}: {exc}",
+        ):
+            # A cancellation requested here or in another worker process wins
+            # over the failure; never leave the job stuck in "canceling".
             update_job_if_status(
                 job_id, {"queued", "processing", "canceling"}, status="canceled",
                 stage="Canceled", error=None,
-            )
-        else:
-            update_job_if_status(
-                job_id, {"queued", "processing"}, status="failed",
-                stage="Translation failed", error=f"{type(exc).__name__}: {exc}",
             )
     finally:
         with cancel_events_lock:
@@ -1647,24 +1709,34 @@ def get_job(job_id: str):
 def cancel_job(job_id: str):
     user = current_user_row()
     with db_lock, transaction(engine) as db:
-        statement = select(jobs).where(jobs.c.id == job_id)
+        scope = [jobs.c.id == job_id]
         if user.role != "admin":
-            statement = statement.where(jobs.c.user_id == user.id)
-        row = db.execute(statement).first()
-        if row is None:
+            scope.append(jobs.c.user_id == user.id)
+        if db.execute(select(jobs.c.id).where(*scope)).first() is None:
             return jsonify(error=tr("Job not found")), 404
-        if row.status == "canceling":
-            cancel_event_for(job_id).set()
-            return jsonify(job_dict(row)), 202
-        if row.status not in {"queued", "processing"}:
-            return jsonify(error=tr("Only an active job can be canceled")), 409
-        db.execute(update(jobs).where(jobs.c.id == job_id).values(
-            status="canceling", stage="Canceling", updated_at=now()
-        ))
-        bump_cache_revision(db, "jobs")
-        cancel_event_for(job_id).set()
-        row = db.execute(select(jobs).where(jobs.c.id == job_id)).first()
-    return jsonify(job_dict(row)), 202
+        timestamp = now()
+        # Conditional transitions: db_lock is process-local, so another worker
+        # process may claim, complete, or fail the job concurrently. A queued
+        # job has no worker yet and becomes terminal at once; only a running
+        # job needs its worker to acknowledge the request.
+        changed = db.execute(update(jobs).where(*scope, jobs.c.status == "queued").values(
+            status="canceled", stage="Canceled", error=None, updated_at=timestamp,
+        )).rowcount
+        if not changed:
+            changed = db.execute(update(jobs).where(
+                *scope, jobs.c.status == "processing",
+            ).values(status="canceling", stage="Canceling", updated_at=timestamp)).rowcount
+        if changed:
+            bump_cache_revision(db, "jobs")
+        row = db.execute(select(jobs).where(*scope)).first()
+    if row is None:
+        return jsonify(error=tr("Job not found")), 404
+    if row.status == "canceling":
+        signal_local_cancel(job_id)
+        return jsonify(job_dict(row)), 202
+    if changed and row.status == "canceled":
+        return jsonify(job_dict(row)), 202
+    return jsonify(error=tr("Only an active job can be canceled")), 409
 
 
 @app.delete("/api/jobs/<job_id>")
@@ -1721,13 +1793,43 @@ def download_all(job_id: str):
         return jsonify(error=tr("No outputs are ready")), 404
     if len(outputs) == 1:
         return download_output(job_id, outputs[0]["name"])
-    archive = JOBS_DIR / job_id / (Path(row.filename).stem + ".translations.zip")
+    folder = JOBS_DIR / job_id
+    names = [output["name"] for output in outputs]
+    # Key the cached archive by its exact contents: a ZIP requested while a
+    # multi-language job is still running must not be served as the final one.
+    digest = hashlib.sha256(json.dumps(names).encode("utf-8")).hexdigest()[:24]
+    archive = folder / f".translations-{digest}.zip"
     if not archive.exists():
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as bundle:
-            for output in outputs:
-                bundle.write(JOBS_DIR / job_id / output["name"], output["name"])
-    return send_file(archive, as_attachment=True, download_name=archive.name,
+        build_archive(folder, names, archive)
+    return send_file(archive, as_attachment=True,
+                     download_name=Path(row.filename).stem + ".translations.zip",
                      mimetype="application/zip")
+
+
+def build_archive(folder: Path, names: list[str], archive: Path) -> None:
+    """Write the ZIP under a private temporary name and publish it atomically.
+
+    Concurrent requests each build their own copy; none can observe (and
+    serve) a partially written archive.
+    """
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".translations-", suffix=".partial", dir=folder,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle, \
+                zipfile.ZipFile(handle, "w", zipfile.ZIP_DEFLATED) as bundle:
+            for name in names:
+                bundle.write(folder / name, name)
+        try:
+            os.replace(temporary, archive)
+        except PermissionError:
+            # Windows cannot replace a file another request is sending. That
+            # file is an identical, complete archive, so use it.
+            if not archive.exists():
+                raise
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 @app.errorhandler(413)

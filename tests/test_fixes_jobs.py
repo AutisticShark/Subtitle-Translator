@@ -9,13 +9,15 @@ import ssl
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
-from sqlalchemy import Text, insert, select
+from sqlalchemy import Text, create_engine, event, insert, select
 from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.schema import CreateTable
@@ -25,6 +27,7 @@ from database import (
     STARTUP_RECOVERY_ENV, create_database_engine, database_connect_options,
     initialize_database, jobs, metadata, normalize_database_url, retry_database_race,
 )
+from srt_translate import FatalTranslationError
 from test_webapp import webapp
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -113,6 +116,204 @@ def submit(client, targets="ja"):
 
 def zip_names(data):
     return sorted(zipfile.ZipFile(io.BytesIO(data)).namelist())
+
+
+# --- Downloads ------------------------------------------------------------
+
+def test_concurrent_zip_downloads_never_serve_a_partial_archive(client, make_job):
+    outputs = [{"name": "movie.ja.srt", "language": "ja"},
+               {"name": "movie.ko.srt", "language": "ko"}]
+    make_job("zip-concurrent", status="completed", outputs=outputs,
+             files=[item["name"] for item in outputs])
+    original_write = zipfile.ZipFile.write
+    inner = {}
+
+    def download_completely():
+        # Read the body inside the thread: send_file streams lazily, and the
+        # race is about what is on disk while the first archive is written.
+        response = client.get("/api/jobs/zip-concurrent/download")
+        inner["result"] = (response.status_code, response.get_data(),
+                           response.headers.get("Content-Disposition", ""))
+        response.close()
+
+    def write_then_race(self, *args, **kwargs):
+        if not inner:
+            inner["started"] = True
+            # A second request arrives while the first archive is half written.
+            racer = threading.Thread(target=download_completely)
+            racer.start()
+            racer.join(10)
+        return original_write(self, *args, **kwargs)
+
+    with patch.object(zipfile.ZipFile, "write", write_then_race):
+        response = client.get("/api/jobs/zip-concurrent/download")
+        first = (response.status_code, response.get_data(),
+                 response.headers.get("Content-Disposition", ""))
+        response.close()
+    expected = ["movie.ja.srt", "movie.ko.srt"]
+    for status, data, disposition in (first, inner["result"]):
+        assert status == 200
+        assert zip_names(data) == expected
+        assert disposition.endswith("movie.translations.zip")
+    assert not list((webapp.JOBS_DIR / "zip-concurrent").glob("*.partial"))
+
+
+def test_zip_requested_mid_job_is_rebuilt_when_more_outputs_are_registered(client, make_job):
+    first_two = [{"name": "movie.ja.srt", "language": "ja"},
+                 {"name": "movie.ko.srt", "language": "ko"}]
+    third = {"name": "movie.fr.srt", "language": "fr"}
+    make_job("zip-partial", status="processing", outputs=first_two,
+             files=["movie.ja.srt", "movie.ko.srt", "movie.fr.srt"])
+    partial = client.get("/api/jobs/zip-partial/download")
+    assert zip_names(partial.data) == ["movie.ja.srt", "movie.ko.srt"]
+    partial.close()
+
+    webapp.update_job("zip-partial", status="completed",
+                      outputs=json.dumps([*first_two, third]))
+    final = client.get("/api/jobs/zip-partial/download")
+    assert zip_names(final.data) == ["movie.fr.srt", "movie.ja.srt", "movie.ko.srt"]
+    final.close()
+
+
+# --- Cancellation ---------------------------------------------------------
+
+def test_canceling_a_queued_job_is_immediately_terminal_and_deletable(client, make_job):
+    make_job("queued-cancel", status="queued")
+    response = client.post("/api/jobs/queued-cancel/cancel")
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "canceled"
+    assert job_row("queued-cancel").stage == "Canceled"
+    # A worker that dequeues it later must leave it alone.
+    webapp.run_job("queued-cancel")
+    assert job_row("queued-cancel").status == "canceled"
+    assert client.post("/api/jobs/queued-cancel/cancel").status_code == 409
+    assert client.delete("/api/jobs/queued-cancel").status_code == 200
+
+
+def test_cancel_cannot_overwrite_a_completion_committed_by_another_process(client, make_job):
+    make_job("cancel-race", status="processing")
+    fired = []
+
+    def other_worker_completes(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().upper().startswith("UPDATE JOBS") and not fired:
+            fired.append(True)
+            # Commits between the cancel request's lookup and its first write.
+            other = create_engine(webapp.engine.url)
+            try:
+                with other.begin() as db:
+                    db.execute(jobs.update().where(
+                        jobs.c.id == "cancel-race", jobs.c.status == "processing",
+                    ).values(status="completed", stage="Ready to download", progress=100))
+            finally:
+                other.dispose()
+
+    event.listen(webapp.engine, "before_cursor_execute", other_worker_completes)
+    try:
+        response = client.post("/api/jobs/cancel-race/cancel")
+    finally:
+        event.remove(webapp.engine, "before_cursor_execute", other_worker_completes)
+    assert fired
+    assert response.status_code == 409
+    row = job_row("cancel-race")
+    assert (row.status, row.stage) == ("completed", "Ready to download")
+
+
+def test_cancel_for_a_job_running_elsewhere_does_not_leak_an_event(client, make_job):
+    make_job("remote-running", status="processing")
+    assert client.post("/api/jobs/remote-running/cancel").status_code == 202
+    assert client.post("/api/jobs/remote-running/cancel").status_code == 202
+    assert "remote-running" not in webapp.cancel_events
+
+
+def test_worker_stops_when_another_process_records_cancellation(client):
+    calls = []
+
+    def provider(texts, _source, target):
+        calls.append(texts)
+        if len(calls) == 2:
+            job_id = calls_job[0]
+            set_status(job_id, "canceling", "Canceling")  # no in-memory event
+        time.sleep(0.05)  # real provider calls outlast the status poll interval
+        return [f"[{target}] {text}" for text in texts]
+
+    calls_job = []
+    with patch.object(webapp, "CANCEL_POLL_SECONDS", 0.01), \
+            patch.object(webapp, "provider_for", return_value=provider):
+        original_run = webapp.run_job
+
+        def run_and_record(job_id):
+            calls_job.append(job_id)
+            original_run(job_id)
+
+        with patch.object(webapp, "run_job", side_effect=run_and_record):
+            job_id = submit(client)
+        job = wait_terminal(client, job_id)
+    assert job["status"] == "canceled", job.get("error")
+    assert job["stage"] == "Canceled"
+    assert len(calls) < 12, "the worker kept calling the paid provider after cancellation"
+    assert job_id not in webapp.cancel_events
+    assert client.delete(f"/api/jobs/{job_id}").status_code == 200
+
+
+def test_failure_after_remote_cancellation_finalizes_as_canceled(client):
+    holder = []
+
+    def provider(_texts, _source, _target):
+        # Only the first call: the batch pool may start one more call before it
+        # is abandoned, and a test write from it would overwrite the final state.
+        if len(holder) == 1:
+            holder.append("canceled-remotely")
+            set_status(holder[0], "canceling", "Canceling")
+        raise FatalTranslationError("provider rejected the request")
+
+    original_run = webapp.run_job
+
+    def run_and_record(job_id):
+        holder.append(job_id)
+        original_run(job_id)
+
+    with patch.object(webapp, "CANCEL_POLL_SECONDS", 3600), \
+            patch.object(webapp, "provider_for", return_value=provider), \
+            patch.object(webapp, "run_job", side_effect=run_and_record):
+        job_id = submit(client)
+        job = wait_terminal(client, job_id)
+    assert job["status"] == "canceled", job.get("error")
+    assert job["error"] is None
+    assert client.delete(f"/api/jobs/{job_id}").status_code == 200
+
+
+def test_progress_never_overwrites_the_canceling_stage(client):
+    holder, observed = [], []
+
+    def provider(texts, _source, target):
+        set_status(holder[0], "canceling", "Canceling")
+        return [f"[{target}] {text}" for text in texts]
+
+    original_run = webapp.run_job
+    original_update = webapp.update_job
+
+    def run_and_record(job_id):
+        holder.append(job_id)
+        original_run(job_id)
+
+    def update_and_observe(job_id, **fields):
+        original_update(job_id, **fields)
+        row = job_row(job_id)
+        observed.append((row.status, row.stage))
+
+    # Disable status polling so the worker keeps reporting progress while the
+    # job is "canceling", as a worker in another process would until it polls.
+    with patch.object(webapp, "CANCEL_POLL_SECONDS", 3600), \
+            patch.object(webapp, "provider_for", return_value=provider), \
+            patch.object(webapp, "update_job", side_effect=update_and_observe), \
+            patch.object(webapp, "run_job", side_effect=run_and_record):
+        job_id = submit(client, targets="ja,ko")
+        job = wait_terminal(client, job_id)
+    assert job["status"] == "canceled", job.get("error")
+    canceling = [stage for status, stage in observed if status == "canceling"]
+    assert canceling, observed
+    assert set(canceling) == {"Canceling"}, observed
+    assert client.delete(f"/api/jobs/{job_id}").status_code == 200
 
 
 # --- Startup recovery and concurrent initialization -------------------------
