@@ -1,23 +1,29 @@
 """Regression tests for job lifecycle, downloads, startup, and database portability."""
 
+import importlib.util
 import io
 import json
 import re
 import shutil
 import ssl
+import subprocess
+import sys
+import textwrap
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import Text, insert, select
 from sqlalchemy.dialects import mysql
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.schema import CreateTable
 
+import database
 from database import (
-    create_database_engine, database_connect_options,
-    initialize_database, jobs, metadata, normalize_database_url,
+    STARTUP_RECOVERY_ENV, create_database_engine, database_connect_options,
+    initialize_database, jobs, metadata, normalize_database_url, retry_database_race,
 )
 from test_webapp import webapp
 
@@ -107,6 +113,150 @@ def submit(client, targets="ja"):
 
 def zip_names(data):
     return sorted(zipfile.ZipFile(io.BytesIO(data)).namelist())
+
+
+# --- Startup recovery and concurrent initialization -------------------------
+
+def _seed_jobs(engine):
+    timestamp = "2026-01-01T00:00:00+00:00"
+    with engine.begin() as db:
+        for job_id, status in (("q", "queued"), ("p", "processing"), ("c", "canceling"),
+                               ("done", "completed")):
+            db.execute(insert(jobs).values(
+                id=job_id, filename="a.srt", stored_name="source.srt", status=status,
+                stage="Translating to Japanese (3/9 segments)", options="{}",
+                created_at=timestamp, updated_at=timestamp,
+            ))
+
+
+def _statuses(engine):
+    with engine.connect() as db:
+        return {row.id: (row.status, row.stage, row.error)
+                for row in db.execute(select(jobs))}
+
+
+def test_worker_initialization_does_not_fail_jobs_owned_by_live_workers(tmp_path):
+    engine = create_database_engine(tmp_path / "app.db")
+    try:
+        initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")
+        _seed_jobs(engine)
+        initialize_database(engine, {"x": "1"}, "2026-01-02T00:00:00+00:00",
+                            recover_jobs=False)
+        assert {key: value[0] for key, value in _statuses(engine).items()} == {
+            "q": "queued", "p": "processing", "c": "canceling", "done": "completed",
+        }
+        initialize_database(engine, {}, "2026-01-03T00:00:00+00:00")
+        recovered = _statuses(engine)
+        assert recovered["q"] == ("failed", "Translation failed",
+                                  database.RECOVERED_JOB_ERROR)
+        assert recovered["p"] == recovered["q"]
+        assert recovered["c"] == ("canceled", "Canceled", None)
+        assert recovered["done"][0] == "completed"
+    finally:
+        engine.dispose()
+
+
+def test_gunicorn_master_recovers_once_and_marks_workers_to_skip(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    # Recorded so the flag the hook sets is removed again after the test.
+    monkeypatch.setenv(STARTUP_RECOVERY_ENV, "0")
+    path = tmp_path / "data" / "app.db"
+    path.parent.mkdir()
+    engine = create_database_engine(path)
+    try:
+        initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")
+        _seed_jobs(engine)
+    finally:
+        engine.dispose()
+
+    spec = importlib.util.spec_from_file_location("gunicorn_conf", PROJECT_ROOT / "gunicorn.conf.py")
+    config = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config)
+    messages = []
+    config.on_starting(SimpleNamespace(log=SimpleNamespace(info=messages.append)))
+
+    assert database.startup_recovery_completed()
+    assert (tmp_path / "data" / "jobs").is_dir()
+    engine = create_database_engine(path)
+    try:
+        assert _statuses(engine)["p"][0] == "failed"
+    finally:
+        engine.dispose()
+    dockerfile = (PROJECT_ROOT / "Dockerfile").read_text("utf-8")
+    command = re.search(r'(?m)^CMD (\[.*\])\s*$', dockerfile).group(1)
+    assert json.loads(command)[:3] == ["gunicorn", "--config", "gunicorn.conf.py"]
+    for option in ('"--bind", "0.0.0.0:8000"', '"--threads", "8"', '"--timeout", "300"'):
+        assert option in command
+
+
+def test_webapp_skips_recovery_when_the_master_already_recovered():
+    source = (PROJECT_ROOT / "webapp.py").read_text("utf-8")
+    assert re.search(
+        r"(?m)^initialize_database\(engine, DEFAULTS, now\(\), "
+        r"recover_jobs=not startup_recovery_completed\(\)\)$", source,
+    )
+
+
+def test_concurrent_workers_initialize_a_fresh_database(tmp_path):
+    database_path = tmp_path / "fresh.db"
+    go = tmp_path / "go"
+    script = textwrap.dedent(f"""
+        import sys, time
+        from pathlib import Path
+        sys.path.insert(0, {str(PROJECT_ROOT)!r})
+        from database import create_database_engine, initialize_database
+        go = Path({str(go)!r})
+        while not go.exists():
+            time.sleep(0.005)
+        engine = create_database_engine(Path({str(database_path)!r}))
+        initialize_database(engine, {{"a": "1", "b": "2", "c": "3"}},
+                            "2026-01-01T00:00:00+00:00")
+        engine.dispose()
+    """)
+    processes = [
+        subprocess.Popen([sys.executable, "-c", script], stderr=subprocess.PIPE, text=True)
+        for _ in range(6)
+    ]
+    time.sleep(1.5)  # let every interpreter finish importing SQLAlchemy
+    go.write_text("1")
+    errors = []
+    for process in processes:
+        _, stderr = process.communicate(timeout=120)
+        if process.returncode:
+            errors.append(stderr)
+    assert not errors, errors[0]
+    engine = create_database_engine(database_path)
+    try:
+        with engine.connect() as db:
+            names = set(db.execute(select(database.settings.c.name)).scalars())
+            revisions = set(db.execute(select(database.cache_revisions.c.name)).scalars())
+        assert names == {"a", "b", "c"}
+        assert revisions == {"settings", "jobs"}
+    finally:
+        engine.dispose()
+
+
+def test_startup_steps_retry_transient_races():
+    attempts = []
+
+    def flaky():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        return "ok"
+
+    assert retry_database_race(flaky) == "ok"
+    assert len(attempts) == 3
+    permanent = []
+
+    def always_fails():
+        permanent.append(1)
+        raise OperationalError("CREATE", {}, Exception("permanent"))
+
+    with pytest.raises(OperationalError):
+        retry_database_race(always_fails, attempts=2)
+    assert len(permanent) == 2
 
 
 # --- Schema portability ---------------------------------------------------

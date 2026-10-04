@@ -37,8 +37,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from database import (
     bump_cache_revision, cache_revisions,
     connection, create_database_engine, initialize_database, jobs, mfa_accounts,
-    revoked_tokens,
-    rate_limit_buckets, settings as settings_table, transaction, users,
+    retry_database_race, revoked_tokens, rate_limit_buckets,
+    settings as settings_table, startup_recovery_completed, transaction, users,
 )
 from redis_cache import RedisCache
 from mfa import MFA
@@ -161,7 +161,10 @@ for _boolean_setting in BOOLEAN_SETTINGS:
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 engine = create_database_engine(DB_PATH)
-initialize_database(engine, DEFAULTS, now())
+# Under Gunicorn the master already recovered interrupted jobs before forking
+# (gunicorn.conf.py); a worker must never fail jobs its siblings are running.
+initialize_database(engine, DEFAULTS, now(), recover_jobs=not startup_recovery_completed())
+
 
 configured_jwt_secret = os.environ.get("JWT_SECRET_KEY", "").strip()
 jwt_secret = configured_jwt_secret or secrets.token_urlsafe(64)
@@ -484,7 +487,7 @@ def bootstrap_admin() -> None:
         LOGGER.warning("APP_PASSWORD is deprecated; it was used to bootstrap the admin account")
 
 
-bootstrap_admin()
+retry_database_race(bootstrap_admin)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -530,7 +533,7 @@ def encrypt_existing_api_keys() -> None:
         bump_cache_revision(db, "settings")
 
 
-encrypt_existing_api_keys()
+retry_database_race(encrypt_existing_api_keys)
 
 mfa = MFA(
     app, engine, password_hasher=password_hasher, encrypt=encrypt_secret,

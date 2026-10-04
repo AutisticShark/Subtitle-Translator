@@ -24,4 +24,6 @@ VOLUME ["/app/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "8", "--timeout", "300", "webapp:app"]
+# gunicorn.conf.py (copied by COPY *.py) prepares the database and recovers
+# interrupted jobs once in the master before workers fork.
+CMD ["gunicorn", "--config", "gunicorn.conf.py", "--bind", "0.0.0.0:8000", "--workers", "1", "--threads", "8", "--timeout", "300", "webapp:app"]

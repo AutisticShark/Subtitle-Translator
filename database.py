@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import os
 import ssl
+import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 from sqlalchemy import (
     Boolean,
@@ -29,7 +31,16 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import URL, Connection, Engine, make_url
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+
+T = TypeVar("T")
+
+# Set by the Gunicorn master (see gunicorn.conf.py) after it has created the
+# schema and recovered interrupted jobs. Workers inherit it and must not run
+# recovery themselves: a worker that boots later would otherwise fail jobs that
+# its live sibling workers are still running.
+STARTUP_RECOVERY_ENV = "SUBTITLE_TRANSLATOR_STARTUP_RECOVERED"
+RECOVERED_JOB_ERROR = "The server restarted before this job finished"
 
 
 NAMING_CONVENTION = {
@@ -308,8 +319,15 @@ def _migrate_legacy_sqlite(engine: Engine) -> None:
         return
     columns = {column["name"] for column in inspector.get_columns("jobs")}
     if "user_id" not in columns:
+        try:
+            with engine.begin() as connection:
+                connection.execute(text("ALTER TABLE jobs ADD COLUMN user_id VARCHAR(32)"))
+        except SQLAlchemyError:
+            # Another startup worker may have completed the same migration.
+            refreshed = {column["name"] for column in inspect(engine).get_columns("jobs")}
+            if "user_id" not in refreshed:
+                raise
         with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE jobs ADD COLUMN user_id VARCHAR(32)"))
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_jobs_user_created "
                      "ON jobs (user_id, created_at)")
@@ -381,16 +399,26 @@ def _migrate_mfa_management_budget(engine: Engine) -> None:
                 raise
 
 
-def initialize_database(
-    engine: Engine,
-    defaults: dict[str, str],
-    timestamp: str,
-) -> None:
-    _migrate_legacy_sqlite(engine)
-    metadata.create_all(engine)
-    _migrate_user_theme(engine)
-    _migrate_job_warning(engine)
-    _migrate_mfa_management_budget(engine)
+def retry_database_race(operation: Callable[[], T], attempts: int = 8) -> T:
+    """Run an idempotent startup step, retrying when a concurrent process races it.
+
+    Several web workers may initialize the same database at once. Concurrent DDL
+    and check-then-insert seeding then fail with backend-specific errors ("table
+    already exists", duplicate keys, SQLite "database is locked", deadlocks).
+    Every retried step re-reads the current state, so a retry converges.
+    """
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except DBAPIError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(min(0.05 * 2 ** attempt, 1.0))
+    raise AssertionError("unreachable")
+
+
+def _seed_and_recover(engine: Engine, defaults: dict[str, str], timestamp: str,
+                      recover_jobs: bool) -> None:
     with engine.begin() as connection:
         existing_revisions = set(connection.execute(select(cache_revisions.c.name)).scalars())
         for name in ("settings", "jobs"):
@@ -409,16 +437,19 @@ def initialize_database(
         if missing:
             connection.execute(settings.insert(), missing)
         connection.execute(
+            delete(revoked_tokens).where(revoked_tokens.c.expires_at < timestamp)
+        )
+        if not recover_jobs:
+            return
+        connection.execute(
             update(jobs)
             .where(jobs.c.status.in_(("queued", "processing")))
             .values(
                 status="failed",
-                error="The server restarted before this job finished",
+                stage="Translation failed",
+                error=RECOVERED_JOB_ERROR,
                 updated_at=timestamp,
             )
-        )
-        connection.execute(
-            delete(revoked_tokens).where(revoked_tokens.c.expires_at < timestamp)
         )
         connection.execute(
             update(jobs)
@@ -430,6 +461,51 @@ def initialize_database(
                 updated_at=timestamp,
             )
         )
+
+
+def initialize_database(
+    engine: Engine,
+    defaults: dict[str, str],
+    timestamp: str,
+    *,
+    recover_jobs: bool = True,
+) -> None:
+    """Create/migrate the schema, seed defaults, and optionally recover jobs.
+
+    ``recover_jobs`` finalizes every active job, so it is safe only when no
+    process can still be running one: at single-process startup, or once in the
+    Gunicorn master before any worker is forked.
+    """
+    retry_database_race(lambda: _migrate_legacy_sqlite(engine))
+    retry_database_race(lambda: metadata.create_all(engine))
+    retry_database_race(lambda: _migrate_user_theme(engine))
+    retry_database_race(lambda: _migrate_job_warning(engine))
+    retry_database_race(lambda: _migrate_mfa_management_budget(engine))
+    retry_database_race(lambda: _seed_and_recover(engine, defaults, timestamp, recover_jobs))
+
+
+def startup_recovery_completed() -> bool:
+    """Whether a supervising process already recovered jobs for this server run."""
+    return os.environ.get(STARTUP_RECOVERY_ENV) == "1"
+
+
+def initialize_before_workers(sqlite_path: Path) -> None:
+    """Prepare the database once in a pre-fork supervisor, then mark it done.
+
+    Workers forked afterwards inherit ``STARTUP_RECOVERY_ENV`` and skip job
+    recovery, so a worker that starts or restarts later never fails jobs that
+    sibling workers are running.
+    """
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    engine = create_database_engine(sqlite_path)
+    try:
+        initialize_database(
+            engine, {}, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            recover_jobs=True,
+        )
+    finally:
+        engine.dispose()
+    os.environ[STARTUP_RECOVERY_ENV] = "1"
 
 
 @contextmanager

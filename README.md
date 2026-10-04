@@ -132,6 +132,12 @@ TLS options in the URL are translated for those drivers:
 
 Certificates are verified against the system trust store unless a CA file is given with `sslrootcert=/path` (PostgreSQL) or `ssl-ca=/path` (MySQL/MariaDB); client certificates use `sslcert`/`sslkey` or `ssl-cert`/`ssl-key`. The opportunistic `prefer`/`allow`/`PREFERRED` modes can silently fall back to plaintext and are rejected at startup with an explanatory error; choose an explicit mode instead.
 
+### Web workers and startup recovery
+
+At startup, jobs left `queued` or `processing` by a previous run are marked failed and `canceling` jobs become canceled. Under Gunicorn this happens once in the master process before workers are forked (`gunicorn.conf.py`, which Gunicorn loads automatically from the working directory and the Dockerfile names explicitly), so a worker that starts or restarts later never fails jobs that other workers are still running. `python webapp.py` performs the same recovery when it starts. Schema creation and default seeding tolerate several workers starting at once against a fresh database.
+
+Each job runs in the process that accepted its upload. A cancellation received by a different worker process is recorded in SQL and picked up by the running job within about a second. If you run Gunicorn with a custom command, keep `gunicorn.conf.py` in the working directory or pass it with `--config`.
+
 ### Redis caching
 
 Docker Compose includes a private Redis service and enables caching by default. It has no published port, uses an internal network, and caps cached data at 128 MB with LRU eviction. Persistence is disabled because every cached value can be reconstructed from SQL. Redis startup or downtime does not block application startup; reads fall back to SQL with 250 ms connection/command timeouts and a five-second retry cooldown.
@@ -154,7 +160,7 @@ Set these variables in `.env` for Compose, or export them for a non-Docker proce
 - `REDIS_CACHE_TTL`: expiration in seconds.
 - `REDIS_KEY_PREFIX`: default `subtitle-translator`; choose a distinct value for independent deployments sharing Redis. Keys also include a hash of the database URL.
 
-Apply an upgrade with `docker compose up -d --build`; startup creates the revision table and retains existing records. Redis needs no backup; continue backing up the SQL database, data volume, and encryption key. To run only the app with caching disabled, set `REDIS_URL=` and use `docker compose up -d --build subtitle-translator` (stop an existing Redis container with `docker compose stop redis` if desired). This cache does not change the in-process job executor: retain the Dockerfile's single Gunicorn worker.
+Apply an upgrade with `docker compose up -d --build`; startup creates the revision table and retains existing records. Redis needs no backup; continue backing up the SQL database, data volume, and encryption key. To run only the app with caching disabled, set `REDIS_URL=` and use `docker compose up -d --build subtitle-translator` (stop an existing Redis container with `docker compose stop redis` if desired). This cache does not change the in-process job executor: retain the Dockerfile's single Gunicorn worker unless you need more (see [Web workers and startup recovery](#web-workers-and-startup-recovery)).
 
 ## Run without Docker
 
