@@ -66,7 +66,8 @@ def parse_subtitle(raw: bytes, extension: str, encoding: str = "utf-8") -> Subti
         text = raw.decode("utf-8-sig" if bom else encoding)
     except (LookupError, UnicodeDecodeError) as exc:
         raise SubtitleFormatError(f"Could not decode subtitle as {encoding}: {exc}") from exc
-    newline = "\r\n" if b"\r\n" in raw[:8192] else "\n"
+    # Detect on decoded text: in UTF-16 the CR and LF bytes are not adjacent.
+    newline = "\r\n" if "\r\n" in text[:8192] else "\n"
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
 
     if ext == ".srt":
@@ -84,7 +85,8 @@ def parse_subtitle(raw: bytes, extension: str, encoding: str = "utf-8") -> Subti
 def _render_srt(doc: SubtitleDocument) -> str:
     out: list[str] = []
     for number, cue in enumerate(doc.cues, 1):
-        out.extend((str(cue.index or number), f"{cue.start} --> {cue.end}{cue.rest}"))
+        index = cue.index if cue.index is not None else number
+        out.extend((str(index), f"{cue.start} --> {cue.end}{cue.rest}"))
         out.extend(cue.lines or [""])
         out.append("")
     return doc.newline.join(out)
@@ -101,9 +103,17 @@ def _parse_vtt(text: str, newline: str, bom: bool) -> SubtitleDocument:
     if not lines or not lines[0].strip().upper().startswith("WEBVTT"):
         raise SubtitleFormatError("WebVTT file must begin with WEBVTT.")
 
+    # The header block runs to the first blank line and may carry metadata
+    # lines such as `Kind: captions` and `Language: en`. A header can't hold
+    # "-->", so a cue missing its blank separator is still parsed as a cue.
+    header_end = 1
+    while header_end < len(lines) and lines[header_end].strip() \
+            and "-->" not in lines[header_end]:
+        header_end += 1
+
     cues: list[Cue] = []
     blocks: list[dict] = []
-    i = 1
+    i = header_end
     while i < len(lines):
         while i < len(lines) and not lines[i].strip():
             i += 1
@@ -128,13 +138,13 @@ def _parse_vtt(text: str, newline: str, bom: bool) -> SubtitleDocument:
             "identifier": block[:timing_i],
         })
     return SubtitleDocument("vtt", cues, newline, bom, {
-        "header": lines[0],
+        "header": "\n".join(lines[:header_end]),
         "blocks": blocks,
     })
 
 
 def _render_vtt(doc: SubtitleDocument) -> str:
-    out = [doc.metadata.get("header", "WEBVTT"), ""]
+    out = [*doc.metadata.get("header", "WEBVTT").split("\n"), ""]
     for block in doc.metadata.get("blocks", []):
         if block["kind"] == "raw":
             out.extend(block["lines"])
@@ -178,10 +188,12 @@ def _parse_ass(text: str, fmt: str, newline: str, bom: bool) -> SubtitleDocument
         start_i = fields.index("start") if "start" in fields else None
         end_i = fields.index("end") if "end" in fields else None
         cue_i = len(cues)
-        cue_text = values[text_i].replace("\\N", "\n").replace("\\n", "\n")
+        # Only \N is a hard line break. The soft break \n and the hard space
+        # \h stay in the text, where the translation engine masks them.
         cues.append(Cue(cue_i + 1,
                         values[start_i] if start_i is not None else "",
-                        values[end_i] if end_i is not None else "", "", cue_text.split("\n")))
+                        values[end_i] if end_i is not None else "", "",
+                        values[text_i].split("\\N"), dialect="ass"))
         records.append({
             "line": line_i,
             "values": values,

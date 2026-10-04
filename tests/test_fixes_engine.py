@@ -311,6 +311,43 @@ class AssDrawingTests(unittest.TestCase):
         self.assertFalse(needs_translation(Segment(0, masked, tags, False)))
 
 
+class FormatRoundTripTests(unittest.TestCase):
+    def test_vtt_multiline_header_round_trips(self):
+        source = ("WEBVTT\nKind: captions\nLanguage: en\n\n"
+                  "00:01.000 --> 00:02.000\nHello\n").encode()
+
+        document = parse_subtitle(source, ".vtt")
+
+        self.assertEqual(document.to_bytes(), source)
+        self.assertEqual(len(document.cues), 1)
+
+    def test_srt_numbered_from_zero_round_trips(self):
+        source = (b"0\n00:00:01,000 --> 00:00:02,000\nA\n\n"
+                  b"1\n00:00:03,000 --> 00:00:04,000\nB\n")
+
+        self.assertEqual(parse_subtitle(source, ".srt").to_bytes(), source)
+
+    def test_utf16_crlf_newline_is_detected(self):
+        source = "1\r\n00:00:01,000 --> 00:00:02,000\r\nHello\r\n".encode("utf-16")
+
+        document = parse_subtitle(source, ".srt", encoding="utf-16")
+
+        self.assertEqual(document.newline, "\r\n")
+        self.assertIn(b"\r\nHello\r\n", document.to_bytes())
+
+    def test_ass_soft_break_and_hard_space_are_preserved(self):
+        line = ass_line("Hello\\nthere\\hworld\\Nsecond line")
+        source = (ASS_HEADER + line).encode()
+        document = parse_subtitle(source, ".ass")
+        self.assertEqual(document.to_bytes(), source)
+
+        provider, calls = recording_provider(lambda text: text)
+        rendered = translate_document(document, provider, width=40)
+
+        self.assertEqual(calls, [["Hello⟦0⟧there⟦1⟧world second line"]])
+        self.assertIn("Hello\\nthere\\hworld second line", rendered)
+
+
 class SrtParsingTests(unittest.TestCase):
     def test_srt_without_blank_separator_starts_a_new_cue(self):
         cues = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nHello\n"
