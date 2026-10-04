@@ -16,8 +16,10 @@ Design notes
 from __future__ import annotations
 
 import concurrent.futures
+import datetime
 import hashlib
 import html
+import http.client
 import json
 import random
 import re
@@ -396,14 +398,44 @@ def _parse_retry_after(value: str | None) -> float | None:
         dt = parsedate_to_datetime(value)
         if dt is None:
             return None
-        import datetime as _dt
-        now = _dt.datetime.now(dt.tzinfo or _dt.timezone.utc)
+        now = datetime.datetime.now(dt.tzinfo or datetime.timezone.utc)
         return max(0.0, (dt - now).total_seconds())
     except Exception:
         return None
 
 
-def _post_json(url: str, headers: dict, payload: dict, timeout: int = 120,
+_GO_DURATION_RE = re.compile(r"(?:\d+(?:\.\d+)?(?:h|ms|us|µs|μs|ns|m|s))+")
+_GO_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(h|ms|us|µs|μs|ns|m|s)")
+_GO_UNITS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3,
+             "us": 1e-6, "µs": 1e-6, "μs": 1e-6, "ns": 1e-9}
+
+
+def _parse_rate_limit_reset(value: str | None) -> float | None:
+    """Seconds until a rate-limit reset header's moment.
+
+    Accepts what ``retry-after`` accepts, RFC 3339 timestamps
+    (``anthropic-ratelimit-*-reset``), and Go durations such as ``6m0s`` or
+    ``250ms`` (``x-ratelimit-reset-*``). Past moments clamp to zero.
+    """
+    after = _parse_retry_after(value)
+    if after is not None or not value:
+        return after
+    value = value.strip()
+    if _GO_DURATION_RE.fullmatch(value):
+        return max(0.0, sum(float(amount) * _GO_UNITS[unit]
+                            for amount, unit in _GO_DURATION_PART_RE.findall(value)))
+    iso = value[:-1] + "+00:00" if value[-1:] in ("Z", "z") else value
+    try:
+        moment = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return max(0.0, (moment - now).total_seconds())
+
+
+def _post_json(url: str, headers: dict, payload: dict, timeout: float = 120,
                throttle: Throttle | None = None) -> dict:
     import urllib.error
     import urllib.request
@@ -415,9 +447,12 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: int = 120,
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+            raw = r.read()
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")[:800]
+        try:
+            body = e.read().decode("utf-8", "replace")[:800]
+        except (OSError, http.client.HTTPException):
+            body = ""
         hdrs = getattr(e, "headers", None)
 
         # 429 = rate limited, 529 = provider overloaded. Both mean "come back
@@ -429,7 +464,7 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: int = 120,
                 for h in ("anthropic-ratelimit-input-tokens-reset",
                           "anthropic-ratelimit-requests-reset",
                           "x-ratelimit-reset-requests"):
-                    after = _parse_retry_after(hdrs.get(h))
+                    after = _parse_rate_limit_reset(hdrs.get(h))
                     if after is not None:
                         break
             raise RateLimitError(f"HTTP {e.code}: {body[:200]}", after) from None
@@ -442,6 +477,22 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: int = 120,
         raise TranslationError(f"HTTP {e.code}: {body}") from None
     except urllib.error.URLError as e:
         raise TranslationError(f"network error: {e.reason}") from None
+    except (OSError, http.client.HTTPException) as e:
+        # Timeouts while waiting for or reading the response, dropped
+        # connections (RemoteDisconnected), truncated bodies (IncompleteRead),
+        # and TLS failures are transient: let the retry policy handle them.
+        raise TranslationError(
+            f"network error: {type(e).__name__}: {e}".rstrip(": ")
+        ) from None
+
+    try:
+        result = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        # Proxies and gateways sometimes answer 200 with an HTML error page.
+        raise TranslationError("provider returned a response that is not JSON") from None
+    if not isinstance(result, dict):
+        raise TranslationError("provider returned an unexpected JSON response")
+    return result
 
 
 SYSTEM_PROMPT = """You are a professional subtitle translator. Translate each \
@@ -555,7 +606,19 @@ def make_deepl(api_key: str,
             },
             throttle=throttle,
         )
-        return [t["text"] for t in resp["translations"]]
+        try:
+            translations = resp["translations"]
+            if not isinstance(translations, list) or len(translations) != len(texts):
+                raise ValueError
+            result = []
+            for item in translations:
+                translated = item["text"]
+                if not isinstance(translated, str):
+                    raise ValueError
+                result.append(translated)
+            return result
+        except (KeyError, TypeError, ValueError) as exc:
+            raise TranslationError("DeepL API returned an unexpected response") from exc
 
     return call
 
@@ -767,7 +830,8 @@ def translate_segments(
             for position, t in enumerate(texts):
                 try:
                     out.append(call_with_retry([t], "single line")[0])
-                except FatalTranslationError:
+                except (FatalTranslationError, RateLimitError):
+                    # A rate limit must abort, never fan out line by line.
                     raise
                 except TranslationError:
                     out.append(t)  # last resort: source passes through
