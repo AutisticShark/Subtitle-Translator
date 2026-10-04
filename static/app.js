@@ -1,5 +1,20 @@
+const JOBS_PAGE_SIZE = 50;
+const RECENT_JOBS = 5;
+const POLL_ACTIVE_MS = 1500;
+const POLL_IDLE_MS = 8000;
+const POLL_MAX_BACKOFF_MS = 60000;
+const activeStatuses = ['queued', 'processing', 'canceling'];
+
+function emptyJobList() {
+  return { jobs: [], total: 0, counts: {}, offset: 0, has_more: false };
+}
+
 const state = {
-  user: null, settings: null, jobs: [], overviewJobs: [], users: [], timer: null, setup: false,
+  user: null, settings: null, jobs: [], users: [], timer: null, setup: false,
+  // history is the visible page; overview feeds the dashboard metrics and recent list.
+  history: emptyJobList(), overview: emptyJobList(), jobsOffset: 0,
+  // session changes on sign-in/out so stale responses from another account are dropped.
+  session: 0, jobsRequest: 0, jobsController: null, pollFailures: 0,
   authMode: 'login', authConfig: {
     registration_enabled: false,
     captcha: { provider: 'none', site_key: '', protected_actions: [] },
@@ -74,10 +89,24 @@ async function api(url, options = {}) {
   return data;
 }
 
+// Like api(), but resolves to undefined (never data or an error) when the user signed
+// out or switched accounts while the request was in flight.
+async function sessionApi(url, options = {}) {
+  const session = state.session;
+  try {
+    const data = await api(url, options);
+    return session === state.session ? data : undefined;
+  } catch (error) {
+    if (session !== state.session) return undefined;
+    throw error;
+  }
+}
+
+const htmlEscapes = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+
+// Safe for element text and for quoted attribute values.
 function escapeHtml(value) {
-  const node = document.createElement('div');
-  node.textContent = String(value ?? '');
-  return node.innerHTML;
+  return String(value ?? '').replace(/[&<>"']/g, character => htmlEscapes[character]);
 }
 
 function captchaRequired(action) {
@@ -216,16 +245,47 @@ async function refreshAuthConfiguration(status = null) {
   return configuration;
 }
 
+// Start a new session generation: stop polling and make in-flight responses stale.
+function endSession() {
+  state.session += 1;
+  state.jobsRequest += 1;
+  state.jobsController?.abort();
+  state.jobsController = null;
+  clearTimeout(state.timer);
+  state.timer = null;
+  state.pollFailures = 0;
+}
+
+// Remove every trace of the previous account from memory and the hidden app shell.
+function clearAccountData() {
+  state.user = null;
+  state.settings = null;
+  state.jobs = [];
+  state.users = [];
+  state.history = emptyJobList();
+  state.overview = emptyJobList();
+  state.jobsOffset = 0;
+  ['#jobs', '#jobsPageStatus', '#dashboardMetrics', '#dashboardRecent', '#dashboardProviders',
+    '#adminMetrics', '#adminProviders', '#userList', '#fileList', '#provider', '#defaultProvider',
+    '#providerState', '#mfaStatus', '#userName', '#userRole', '#userInitial', '#settingsMessage',
+  ].forEach(selector => $(selector).replaceChildren());
+  $('#jobsPager').hidden = true;
+  $('#allJobs').checked = false;
+  const dialog = $('#settingsDialog');
+  if (dialog.open) dialog.close();
+  ['#settingsForm', '#translateForm', '#createUserForm'].forEach(selector => $(selector).reset());
+}
+
 function showAuth(setup = false, mode = 'login') {
+  endSession();
+  clearAccountData();
   clearMfaSecrets();
   state.loginChallenge = null;
   $('#authForm').hidden = false;
   $('#mfaLoginForm').hidden = true;
   state.setup = setup;
   state.authMode = setup ? 'setup' : mode;
-  state.user = null;
   applyTheme('system');
-  clearTimeout(state.timer);
   $('#appShell').hidden = true;
   $('#authView').hidden = false;
   const registering = state.authMode === 'register';
@@ -252,6 +312,8 @@ function showAuth(setup = false, mode = 'login') {
 }
 
 async function enterApp(user) {
+  endSession();
+  const session = state.session;
   state.user = user;
   applyTheme(user.theme);
   $('#authView').hidden = true;
@@ -263,8 +325,10 @@ async function enterApp(user) {
   $('#adminNavButton').hidden = !admin;
   $('#allJobsLabel').hidden = !admin;
   $('#allJobs').checked = admin;
+  state.jobsOffset = 0;
   showView(window.location.hash.slice(1) || 'dashboard', false);
   await Promise.all([loadSettings(), loadJobs(), admin ? loadUsers() : Promise.resolve()]);
+  if (session !== state.session) return;
   await renderCaptcha('upload', 'upload').catch(error => toast(error.message));
 }
 
@@ -328,28 +392,41 @@ function renderProviderSummaries() {
   }).join('');
 }
 
+function activeJobCount(counts = {}) {
+  return activeStatuses.reduce((sum, status) => sum + (counts[status] || 0), 0);
+}
+
+function providerLabel(key) {
+  return state.settings?.providers?.[key] || key;
+}
+
+function jobStatusText(job) {
+  // Stages arrive localized; a queued job has no stage yet, so localize its status.
+  return job.stage || t(job.status);
+}
+
 function renderDashboard() {
   if (!state.user) return;
-  const overviewJobs = state.overviewJobs;
-  const active = overviewJobs.filter(job => ['queued', 'processing', 'canceling'].includes(job.status)).length;
-  const completed = overviewJobs.filter(job => job.status === 'completed').length;
-  const failed = overviewJobs.filter(job => job.status === 'failed').length;
+  const { jobs: recentJobs, total, counts } = state.overview;
+  const active = activeJobCount(counts);
+  const completed = counts.completed || 0;
+  const failed = counts.failed || 0;
   const scope = state.user.role === 'admin' ? t('Across all users') : t('In your workspace');
   $('#welcomeTitle').textContent = t('Welcome back, {username}', { username: state.user.username });
   $('#welcomeDescription').textContent = state.user.role === 'admin'
     ? t('Your panel-wide activity and access overview is ready.')
     : t('Here is what is happening in your translation workspace.');
   $('#dashboardMetrics').innerHTML = [
-    metricCard(t('Total jobs'), overviewJobs.length, scope),
+    metricCard(t('Total jobs'), total, scope),
     metricCard(t('Active now'), active,
       active === 1 ? t('Translation in progress') : t('Translations in progress'), active > 0),
     metricCard(t('Completed'), completed, t('Ready or downloaded')),
     metricCard(t('Needs attention'), failed, t('Failed translations')),
   ].join('');
-  $('#dashboardRecent').innerHTML = overviewJobs.length ? overviewJobs.slice(0, 5).map(job => `
+  $('#dashboardRecent').innerHTML = recentJobs.length ? recentJobs.slice(0, RECENT_JOBS).map(job => `
     <div class="recent-row">
       <div><div class="recent-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
-      <div class="recent-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(job.options.target_languages.map(languageName).join(', '))} · ${escapeHtml(formatJobDate(job.created_at))}</div></div>
+      <div class="recent-meta">${escapeHtml(providerLabel(job.options.provider))} · ${escapeHtml(job.options.target_languages.map(languageName).join(', '))} · ${escapeHtml(formatJobDate(job.created_at))}</div></div>
       <span class="status ${escapeHtml(job.status)}">${escapeHtml(t(job.status))}</span>
     </div>`).join('') : `<div class="empty">${escapeHtml(t('No translations yet.'))}</div>`;
   renderProviderSummaries();
@@ -360,13 +437,13 @@ function renderAdminDashboard() {
   if (state.user?.role !== 'admin') return;
   const activeUsers = state.users.filter(user => user.active).length;
   const admins = state.users.filter(user => user.role === 'admin' && user.active).length;
-  const activeJobs = state.overviewJobs.filter(job => ['queued', 'processing', 'canceling'].includes(job.status)).length;
+  const activeJobs = activeJobCount(state.overview.counts);
   const providers = state.settings ? Object.keys(state.settings.providers) : [];
   const readyProviders = state.settings ? providers.filter(key => state.settings.configured[key]).length : 0;
   $('#adminMetrics').innerHTML = [
     metricCard(t('Total users'), state.users.length, t('{count} active accounts', { count: activeUsers })),
     metricCard(t('Active administrators'), admins, t('Protected panel access')),
-    metricCard(t('Panel jobs'), state.overviewJobs.length, t('{count} currently active', { count: activeJobs }), activeJobs > 0),
+    metricCard(t('Panel jobs'), state.overview.total, t('{count} currently active', { count: activeJobs }), activeJobs > 0),
     metricCard(t('Ready providers'), `${readyProviders}/${providers.length}`, t('Configured for translation')),
   ].join('');
 }
@@ -443,7 +520,8 @@ function updateMfaMethod() {
 }
 
 async function loadMfa() {
-  const data = await api('/api/auth/mfa');
+  const data = await sessionApi('/api/auth/mfa');
+  if (!data) return;
   $('#mfaStatus').textContent = data.method
     ? t('MFA enabled: {method}. Recovery codes remaining: {count}.', {
       method: data.method === 'totp' ? t('Authenticator app') : data.email,
@@ -574,6 +652,7 @@ async function sendManagementEmail(event) {
 }
 
 async function logout() {
+  endSession(); // Stop polling before the token is revoked.
   try { await api('/api/auth/logout', { method: 'POST' }); }
   catch (error) { if (error.status !== 401) toast(error.message); }
   const status = await refreshAuthConfiguration();
@@ -609,17 +688,36 @@ function configureProviderSelect(selectElement, selected) {
   ).join('');
 }
 
-async function loadSettings() {
-  state.settings = await api('/api/settings');
-  configureProviderSelect($('#provider'), state.settings.default_provider);
+function populateSettingsFields() {
+  if (!state.settings) return;
   configureProviderSelect($('#defaultProvider'), state.settings.default_provider);
+  Object.entries(state.settings).forEach(([key, value]) => {
+    const field = $(`#settingsForm [name="${key}"]`);
+    if (field && field.type !== 'password' && !key.endsWith('_api_key')) field.value = value;
+  });
+}
+
+function clearSettingsSecrets() {
+  $$('#settingsForm input[type="password"]').forEach(input => { input.value = ''; });
+}
+
+// Discard abandoned edits and typed secrets, then show the saved configuration.
+function resetSettingsForm() {
+  $('#settingsForm').reset();
+  clearSettingsSecrets();
+  populateSettingsFields();
+  $('#settingsMessage').textContent = '';
+}
+
+async function loadSettings() {
+  const settings = await sessionApi('/api/settings');
+  if (!settings) return;
+  state.settings = settings;
+  configureProviderSelect($('#provider'), state.settings.default_provider);
   $('#sourceLanguage').value = state.settings.source_language;
   const defaults = state.settings.target_languages.split(',');
   $$('#languagePicker input').forEach(box => { box.checked = defaults.includes(box.value); });
-  Object.entries(state.settings).forEach(([key, value]) => {
-    const field = $(`#settingsForm [name="${key}"]`);
-    if (field && !key.endsWith('_api_key')) field.value = value;
-  });
+  populateSettingsFields();
   $$('.key-state').forEach(element => {
     const provider = element.dataset.provider;
     const ready = provider.startsWith('captcha-') ?
@@ -631,6 +729,7 @@ async function loadSettings() {
     if (clearButton) clearButton.hidden = !ready;
   });
   updateProviderState();
+  renderJobs(); // Provider labels come from settings.
   renderDashboard();
 }
 
@@ -680,18 +779,29 @@ async function submitTranslation(event) {
   finally { button.disabled = false; resetCaptcha('upload'); }
 }
 
+function renderJobsPager() {
+  const { total, offset, has_more: hasMore } = state.history;
+  $('#jobsPager').hidden = offset === 0 && !hasMore;
+  $('#jobsPageStatus').textContent = state.jobs.length ? t('Showing {start}–{end} of {total}', {
+    start: offset + 1, end: offset + state.jobs.length, total,
+  }) : '';
+  $('#jobsNewer').disabled = offset === 0;
+  $('#jobsOlder').disabled = !hasMore;
+}
+
 function renderJobs() {
   const container = $('#jobs');
+  renderJobsPager();
   if (!state.jobs.length) {
     container.innerHTML = `<div class="empty">${escapeHtml(t('No translations yet.'))}</div>`;
     return;
   }
   container.innerHTML = state.jobs.map(job => {
-    const jobId = encodeURIComponent(job.id);
+    const jobId = escapeHtml(encodeURIComponent(job.id));
     const targetNames = job.options.target_languages.map(languageName).join(', ');
     const owner = job.owner !== undefined ? ` · ${escapeHtml(job.owner || t('deleted user'))}` : '';
     const outputLinks = job.outputs.map(output =>
-      `<a href="/api/jobs/${jobId}/download/${encodeURIComponent(output.name)}">${escapeHtml(languageName(output.language))}</a>`
+      `<a href="/api/jobs/${jobId}/download/${escapeHtml(encodeURIComponent(output.name))}">${escapeHtml(languageName(output.language))}</a>`
     ).join('');
     const primaryAction = job.status === 'completed' ?
       `<div class="download-actions"><a class="download" href="/api/jobs/${jobId}/download">${escapeHtml(t(job.outputs.length > 1 ? 'Download ZIP' : 'Download'))}</a>${job.outputs.length > 1 ? `<div class="language-downloads">${outputLinks}</div>` : ''}</div>` :
@@ -703,29 +813,75 @@ function renderJobs() {
       `<button class="delete-job" type="button" data-job-id="${jobId}">${escapeHtml(t('Delete'))}</button>` : '';
     return `<article class="job">
       <div><div class="job-name" title="${escapeHtml(job.filename)}">${escapeHtml(job.filename)}</div>
-      <div class="job-meta">${escapeHtml(job.options.provider)} · ${escapeHtml(targetNames)}${owner}</div></div>
+      <div class="job-meta">${escapeHtml(providerLabel(job.options.provider))} · ${escapeHtml(targetNames)}${owner}</div></div>
       <div><div class="progress-track"><div class="progress-bar" style="width:${Number(job.progress)}%"></div></div>
-      <div class="job-meta">${escapeHtml(job.stage || job.status)} · ${Number(job.progress)}%</div>
+      <div class="job-meta">${escapeHtml(jobStatusText(job))} · ${Number(job.progress)}%</div>
       ${job.error ? `<div class="job-error">${escapeHtml(job.error)}</div>` : ''}
       ${job.warning ? `<div class="job-warning">${escapeHtml(job.warning)}</div>` : ''}</div>
       <div class="job-actions">${primaryAction}${cancelAction}${deleteAction}</div></article>`;
   }).join('');
 }
 
+function jobsUrl(params) {
+  return `/api/jobs?${new URLSearchParams(params)}`;
+}
+
+function scheduleJobsPoll(delay) {
+  clearTimeout(state.timer);
+  state.timer = setTimeout(loadJobs, delay);
+}
+
 async function loadJobs() {
+  if (!state.user) return; // Never poll while signed out.
+  const session = state.session;
+  const request = state.jobsRequest + 1;
+  state.jobsRequest = request;
+  state.jobsController?.abort(); // A newer load (scope toggle, page, refresh) wins.
+  const controller = new AbortController();
+  state.jobsController = controller;
+  clearTimeout(state.timer);
+  const current = () => session === state.session && request === state.jobsRequest;
   try {
-    const admin = state.user?.role === 'admin';
+    const admin = state.user.role === 'admin';
     const all = admin && $('#allJobs').checked;
-    state.jobs = (await api(`/api/jobs${all ? '?all=1' : ''}`)).jobs;
-    state.overviewJobs = admin && !all ? (await api('/api/jobs?all=1')).jobs : state.jobs;
+    const historyParams = { limit: JOBS_PAGE_SIZE, offset: state.jobsOffset };
+    if (all) historyParams.all = '1';
+    // Administrators always see panel-wide dashboard metrics.
+    const reuseHistory = state.jobsOffset === 0 && all === admin;
+    const [history, overview] = await Promise.all([
+      api(jobsUrl(historyParams), { signal: controller.signal }),
+      reuseHistory ? null : api(jobsUrl({ limit: RECENT_JOBS, ...(admin ? { all: '1' } : {}) }),
+        { signal: controller.signal }),
+    ]);
+    if (!current()) return;
+    if (!history.jobs.length && history.offset > 0) {
+      // The page emptied (deletions); step back to the last page that has jobs.
+      state.jobsOffset = Math.max(0, Math.floor((history.total - 1) / JOBS_PAGE_SIZE) * JOBS_PAGE_SIZE);
+      if (state.jobsOffset < history.offset) return loadJobs();
+    }
+    state.pollFailures = 0;
+    state.jobsOffset = history.offset;
+    state.jobs = history.jobs;
+    state.history = history;
+    state.overview = overview || history;
     renderJobs();
     renderDashboard();
-    const active = state.jobs.some(job => ['queued', 'processing', 'canceling'].includes(job.status));
-    clearTimeout(state.timer);
-    state.timer = setTimeout(loadJobs, active ? 1500 : 8000);
+    const active = activeJobCount(history.counts) > 0 || activeJobCount(state.overview.counts) > 0;
+    scheduleJobsPoll(active ? POLL_ACTIVE_MS : POLL_IDLE_MS);
   } catch (error) {
-    if (error.status === 401) showAuth(false); else toast(error.message);
+    if (!current()) return; // Superseded, aborted, or from a previous session.
+    if (error.status === 401) return showAuth(false);
+    state.pollFailures += 1;
+    if (state.pollFailures === 1) toast(error.message);
+    scheduleJobsPoll(Math.min(POLL_IDLE_MS * 2 ** (state.pollFailures - 1), POLL_MAX_BACKOFF_MS));
+  } finally {
+    if (state.jobsController === controller) state.jobsController = null;
   }
+}
+
+function showJobsPage(offset) {
+  state.jobsOffset = Math.max(0, offset);
+  loadJobs();
 }
 
 async function jobAction(event) {
@@ -753,10 +909,12 @@ async function saveSettings(event) {
   const form = event.currentTarget;
   const payload = Object.fromEntries(new FormData(form).entries());
   try {
-    state.settings = await api('/api/settings', {
+    const saved = await sessionApi('/api/settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
     });
     form.querySelectorAll('input[type="password"]').forEach(input => { input.value = ''; });
+    if (!saved) return;
+    state.settings = saved;
     $('#settingsMessage').textContent = t('Saved');
     await Promise.all([loadSettings(), refreshAuthConfiguration()]);
     await renderCaptcha('upload', 'upload');
@@ -782,7 +940,9 @@ async function removeKey(event) {
 }
 
 async function loadUsers() {
-  state.users = (await api('/api/users')).users;
+  const data = await sessionApi('/api/users');
+  if (!data) return;
+  state.users = data.users;
   $('#userList').innerHTML = state.users.map(user => `
     <article class="user-row" data-user-id="${escapeHtml(user.id)}">
       <div><strong>${escapeHtml(user.username)}</strong><div class="job-meta">${escapeHtml(t('{count} jobs', { count: user.job_count }))} · ${escapeHtml(t(user.active ? 'active' : 'disabled'))}${user.locked ? ` · ${escapeHtml(t('locked'))}` : ''}</div></div>
@@ -900,19 +1060,25 @@ $('#translateForm').addEventListener('submit', submitTranslation);
 $('#settingsForm').addEventListener('submit', saveSettings);
 $('#settingsForm').addEventListener('click', removeKey);
 function openSettings() {
-  if (state.user?.role === 'admin') $('#settingsDialog').showModal();
+  if (state.user?.role !== 'admin' || !state.settings) return;
+  resetSettingsForm();
+  $('#settingsDialog').showModal();
 }
 $('#settingsButton').addEventListener('click', openSettings);
 $('#providerSettingsButton').addEventListener('click', openSettings);
 $('#closeSettings').addEventListener('click', () => $('#settingsDialog').close());
+// Covers the close button, Escape, and the post-save close: never keep typed secrets.
+$('#settingsDialog').addEventListener('close', clearSettingsSecrets);
 $('#createUserForm').addEventListener('submit', createUser);
 $('#userList').addEventListener('click', userAction);
 $('#userList').addEventListener('change', userAction);
-$('#refreshButton').addEventListener('click', loadJobs);
+$('#refreshButton').addEventListener('click', () => loadJobs());
+$('#jobsNewer').addEventListener('click', () => showJobsPage(state.jobsOffset - JOBS_PAGE_SIZE));
+$('#jobsOlder').addEventListener('click', () => showJobsPage(state.jobsOffset + JOBS_PAGE_SIZE));
 $('#dashboardRefresh').addEventListener('click', async () => {
   await Promise.all([loadJobs(), state.user?.role === 'admin' ? loadUsers() : Promise.resolve()]);
 });
-$('#allJobs').addEventListener('change', loadJobs);
+$('#allJobs').addEventListener('change', () => showJobsPage(0));
 $('#jobs').addEventListener('click', jobAction);
 document.addEventListener('click', event => {
   const control = event.target.closest('[data-view-button], [data-go-view]');
