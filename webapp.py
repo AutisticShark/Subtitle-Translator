@@ -30,13 +30,14 @@ from flask_jwt_extended import (
     get_jwt_request_location, set_access_cookies, unset_jwt_cookies,
     verify_jwt_in_request,
 )
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from database import (
     bump_cache_revision, cache_revisions,
-    connection, create_database_engine, initialize_database, jobs, revoked_tokens,
+    connection, create_database_engine, initialize_database, jobs, mfa_accounts,
+    revoked_tokens,
     rate_limit_buckets, settings as settings_table, transaction, users,
 )
 from redis_cache import RedisCache
@@ -67,7 +68,9 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", BASE_DIR / "data")).resolve()
 JOBS_DIR = DATA_DIR / "jobs"
 DB_PATH = DATA_DIR / "app.db"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
-USERNAME_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9_.-]{1,62}[a-z0-9])?$")
+# 3-64 characters that start and end with a letter or digit. Only account creation
+# validates this; existing accounts keep signing in with their stored names.
+USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,62}[a-z0-9]$")
 PASSWORD_MIN_LENGTH = 12
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_LOCK_MINUTES = 15
@@ -230,10 +233,71 @@ executor = ThreadPoolExecutor(max_workers=max(1, int(os.environ.get("JOB_WORKERS
 db_lock = threading.RLock()
 cancel_events_lock = threading.Lock()
 cancel_events: dict[str, threading.Event] = {}
-login_attempts_lock = threading.Lock()
-login_attempts: dict[str, list[datetime]] = {}
-registration_attempts_lock = threading.Lock()
-registration_attempts: dict[str, list[datetime]] = {}
+
+
+class AttemptLimiter:
+    """Process-local sliding-window limit per client address.
+
+    ``reserve`` checks the limit and records the attempt in one locked step, so
+    parallel requests cannot all pass the check before any of them is recorded.
+    Expired addresses are pruned periodically so the map cannot grow without bound.
+    """
+
+    def __init__(self, limit: int, window: timedelta) -> None:
+        self.limit = limit
+        self.window = window
+        self.lock = threading.Lock()
+        self.attempts: dict[str, list[datetime]] = {}
+        self.next_prune: datetime | None = None
+
+    def _recent(self, key: str, current: datetime) -> list[datetime]:
+        cutoff = current - self.window
+        if self.next_prune is None or current >= self.next_prune:
+            self.next_prune = current + timedelta(seconds=ATTEMPT_PRUNE_SECONDS)
+            for address in list(self.attempts):
+                kept = [value for value in self.attempts[address] if value > cutoff]
+                if kept:
+                    self.attempts[address] = kept
+                else:
+                    del self.attempts[address]
+        recent = [value for value in self.attempts.get(key, []) if value > cutoff]
+        if recent:
+            self.attempts[key] = recent
+        else:
+            self.attempts.pop(key, None)
+        return recent
+
+    def limited(self, key: str) -> bool:
+        with self.lock:
+            return len(self._recent(key, now_datetime())) >= self.limit
+
+    def reserve(self, key: str) -> datetime | None:
+        """Record an attempt and return its marker, or ``None`` when over the limit."""
+        current = now_datetime()
+        with self.lock:
+            recent = self._recent(key, current)
+            if len(recent) >= self.limit:
+                return None
+            recent.append(current)
+            self.attempts[key] = recent
+            return current
+
+    def release(self, key: str, marker: datetime) -> None:
+        """Forget a reserved attempt that turned out not to count (a successful login)."""
+        with self.lock:
+            recent = self.attempts.get(key)
+            if recent and marker in recent:
+                recent.remove(marker)
+                if not recent:
+                    del self.attempts[key]
+
+
+login_limiter = AttemptLimiter(LOGIN_RATE_LIMIT, timedelta(minutes=LOGIN_LOCK_MINUTES))
+registration_limiter = AttemptLimiter(
+    REGISTER_RATE_LIMIT, timedelta(minutes=LOGIN_LOCK_MINUTES),
+)
+login_attempts = login_limiter.attempts
+registration_attempts = registration_limiter.attempts
 
 
 def available_providers() -> tuple[str, ...]:
@@ -247,37 +311,6 @@ def normalize_username(value: Any) -> str:
 def json_payload() -> dict[str, Any]:
     payload = request.get_json(silent=True)
     return payload if isinstance(payload, dict) else {}
-
-
-def login_rate_limited(remote_address: str) -> bool:
-    cutoff = now_datetime() - timedelta(minutes=LOGIN_LOCK_MINUTES)
-    with login_attempts_lock:
-        recent = [value for value in login_attempts.get(remote_address, []) if value > cutoff]
-        if recent:
-            login_attempts[remote_address] = recent
-        else:
-            login_attempts.pop(remote_address, None)
-        return len(recent) >= LOGIN_RATE_LIMIT
-
-
-def record_login_failure(remote_address: str) -> None:
-    with login_attempts_lock:
-        login_attempts.setdefault(remote_address, []).append(now_datetime())
-
-
-def registration_rate_limited(remote_address: str) -> bool:
-    cutoff = now_datetime() - timedelta(minutes=LOGIN_LOCK_MINUTES)
-    with registration_attempts_lock:
-        recent = [
-            value for value in registration_attempts.get(remote_address, [])
-            if value > cutoff
-        ]
-        if len(recent) >= REGISTER_RATE_LIMIT:
-            registration_attempts[remote_address] = recent
-            return True
-        recent.append(now_datetime())
-        registration_attempts[remote_address] = recent
-        return False
 
 
 def validate_username(username: str) -> str | None:
@@ -309,13 +342,42 @@ def public_user(row: Any) -> dict[str, Any]:
     return result
 
 
-def issue_token(user_row: Any) -> str:
+def issue_token(user_row: Any, session_id: str | None = None) -> str:
+    """Issue an access JWT; a new sign-in starts a new session, refreshes keep theirs.
+
+    The ``sid`` claim lets logout revoke every token of one session, including
+    earlier refreshed tokens, without signing the account out on other devices.
+    """
     values = user_row._mapping if hasattr(user_row, "_mapping") else user_row
     return create_access_token(
         identity=values["id"],
-        additional_claims={"role": values["role"], "ver": values["token_version"]},
+        additional_claims={
+            "role": values["role"], "ver": values["token_version"],
+            "sid": session_id or uuid.uuid4().hex,
+        },
         fresh=True,
     )
+
+
+def revoked_session_key(session_id: str) -> str:
+    return REVOKED_SESSION_PREFIX + session_id
+
+
+def token_session_id(claims: dict) -> str | None:
+    """Return the token's session id; tokens issued before ``sid`` use their own jti."""
+    for name in ("sid", "jti"):
+        value = claims.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def token_revocation_keys(claims: dict) -> list[str]:
+    keys = [str(claims.get("jti", ""))]
+    session_id = token_session_id(claims)
+    if session_id:
+        keys.append(revoked_session_key(session_id))
+    return keys
 
 
 def insert_user(db, user_id: str, username: str, password: str, role: str, timestamp: str) -> None:
@@ -348,11 +410,57 @@ def record_account_login_failure(user_id: str) -> None:
             ))
 
 
+def observed_lock_condition(observed_locked_until: str | None):
+    """Match the lock state read before verification, or a lock already cleared.
+
+    A lock written by a concurrent failure has a different value, so a guarded
+    UPDATE using this condition can neither ignore nor clear that newer lock.
+    """
+    if observed_locked_until is None:
+        return users.c.locked_until.is_(None)
+    return or_(
+        users.c.locked_until.is_(None), users.c.locked_until == observed_locked_until,
+    )
+
+
+def reserve_account_login_attempt(user: Any) -> bool:
+    """Reserve one password attempt before verifying it (a single conditional UPDATE).
+
+    The reservation counts as a failure until a successful login resets it, so at
+    most ``LOGIN_FAILURE_LIMIT`` guesses can be evaluated per lock period no matter
+    how many requests run in parallel.
+    """
+    with transaction(engine) as db:
+        reserved = db.execute(update(users).where(
+            users.c.id == user.id, users.c.active.is_(True),
+            users.c.failed_login_count < LOGIN_FAILURE_LIMIT,
+            observed_lock_condition(user.locked_until),
+        ).values(failed_login_count=users.c.failed_login_count + 1, updated_at=now()))
+        return reserved.rowcount == 1
+
+
+def lock_exhausted_account(user_id: str) -> None:
+    """Lock an account whose reserved attempts reached the limit (one atomic UPDATE)."""
+    with transaction(engine) as db:
+        db.execute(update(users).where(
+            users.c.id == user_id, users.c.failed_login_count >= LOGIN_FAILURE_LIMIT,
+        ).values(
+            locked_until=(now_datetime() + timedelta(
+                minutes=LOGIN_LOCK_MINUTES
+            )).isoformat(timespec="seconds"),
+            failed_login_count=0, updated_at=now(),
+        ))
+
+
 def bootstrap_admin() -> None:
     password = os.environ.get("ADMIN_PASSWORD", "") or os.environ.get("APP_PASSWORD", "")
     if not password:
         return
     username = normalize_username(os.environ.get("ADMIN_USERNAME", "admin"))
+    with connection(engine) as db:
+        if db.scalar(select(func.count()).select_from(users)):
+            # Already bootstrapped: never reject a previously accepted account name.
+            return
     error = validate_username(username) or validate_password(password)
     if error:
         raise RuntimeError(error)
@@ -436,8 +544,8 @@ mfa = MFA(
 def token_is_revoked(_header: dict, payload: dict) -> bool:
     with connection(engine) as db:
         if db.scalar(select(revoked_tokens.c.jti).where(
-            revoked_tokens.c.jti == payload.get("jti", "")
-        )):
+            revoked_tokens.c.jti.in_(token_revocation_keys(payload))
+        ).limit(1)):
             return True
         user = db.execute(select(users.c.active, users.c.token_version).where(
             users.c.id == payload.get("sub")
@@ -500,7 +608,9 @@ def security_headers(response):
     response.headers.setdefault("Content-Language", current_locale())
     response.vary.add("Accept-Language")
     response.vary.add("Cookie")
-    if request.endpoint == "logout" or (request.endpoint or "").startswith("mfa_"):
+    endpoint = request.endpoint or ""
+    if (endpoint in NO_TOKEN_REFRESH_ENDPOINTS or endpoint.startswith("mfa_")
+            or response_sets_access_cookie(response)):
         return response
     try:
         verify_jwt_in_request(optional=True)
@@ -509,12 +619,42 @@ def security_headers(response):
                 and claims.get("exp") and datetime.fromtimestamp(
             claims["exp"], timezone.utc
         ) < now_datetime() + timedelta(minutes=10)):
-            user = current_user_row()
-            if user is not None and user.active:
-                set_access_cookies(response, issue_token(user))
+            token = refreshed_session_token(claims)
+            if token:
+                set_access_cookies(response, token)
     except Exception:
         pass
     return response
+
+
+def response_sets_access_cookie(response) -> bool:
+    prefix = app.config.get("JWT_ACCESS_COOKIE_NAME", "access_token_cookie") + "="
+    return any(cookie.startswith(prefix) for cookie in response.headers.getlist("Set-Cookie"))
+
+
+def refreshed_session_token(claims: dict) -> str | None:
+    """Re-issue a token only if the presented one is still exactly current.
+
+    The request was verified earlier, but a password reset, role change,
+    deactivation, or logout can commit while it runs. Re-check everything from one
+    fresh read and keep the presented token version and session id: if a change
+    commits after this read, the new token carries the old version or a revoked
+    session and is rejected on its next use.
+    """
+    with connection(engine) as db:
+        user = db.execute(select(users).where(users.c.id == claims.get("sub"))).first()
+        if user is None or not user.active:
+            return None
+        try:
+            if int(claims.get("ver", -1)) != user.token_version:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if db.scalar(select(revoked_tokens.c.jti).where(
+            revoked_tokens.c.jti.in_(token_revocation_keys(claims))
+        ).limit(1)):
+            return None
+    return issue_token(user, token_session_id(claims))
 
 
 def cached_rows(name: str, scope: str, statement) -> list[dict[str, Any]]:
@@ -916,12 +1056,18 @@ def login():
     if request.content_length and request.content_length > 8192:
         return jsonify(error=tr("Authentication request is too large")), 413
     remote_address = request.remote_addr or "unknown"
-    if login_rate_limited(remote_address):
-        return jsonify(error=tr("Too many login attempts; try again later")), 429
+    too_many = (jsonify(error=tr("Too many login attempts; try again later")), 429)
+    if login_limiter.limited(remote_address):
+        return too_many
     payload = json_payload()
     captcha_error = verify_captcha("login", payload.get("captcha_token"))
     if captcha_error:
         return captcha_error
+    # Reserve the per-address attempt before the slow password check; parallel
+    # guesses cannot all pass a check that is recorded only after verification.
+    address_attempt = login_limiter.reserve(remote_address)
+    if address_attempt is None:
+        return too_many
     raw_username = payload.get("username")
     password = payload.get("password")
     valid_input = (
@@ -932,30 +1078,39 @@ def login():
     candidate_password = password if valid_input else ""
     with connection(engine) as db:
         user = db.execute(select(users).where(users.c.username == username)).first()
-    candidate_hash = user.password_hash if user is not None else DUMMY_PASSWORD_HASH
-    try:
-        verified = password_hasher.verify(candidate_hash, candidate_password)
-    except (VerifyMismatchError, VerificationError, InvalidHashError):
-        verified = False
     locked_until = parse_timestamp(user.locked_until) if user is not None else None
     locked = bool(locked_until and locked_until > now_datetime())
-    if user is None or not valid_input or not verified or not user.active or locked:
-        record_login_failure(remote_address)
-        if user is not None and user.active and not locked:
-            record_account_login_failure(user.id)
+    reserved = bool(
+        user is not None and valid_input and user.active and not locked
+        and reserve_account_login_attempt(user)
+    )
+    # Without a reservation the outcome is already a failure; hash the dummy value
+    # so the response time does not reveal whether the account is locked.
+    candidate_hash = user.password_hash if reserved else DUMMY_PASSWORD_HASH
+    try:
+        verified = password_hasher.verify(candidate_hash, candidate_password) and reserved
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        verified = False
+    if not verified:
+        if reserved:
+            lock_exhausted_account(user.id)
         return jsonify(error=tr("Invalid username or password")), 401
     values = {"failed_login_count": 0, "locked_until": None, "updated_at": now()}
     if password_hasher.check_needs_rehash(user.password_hash):
         values["password_hash"] = password_hasher.hash(candidate_password)
     with transaction(engine) as db:
+        # Conditional on the lock state observed before verification, so a lock set
+        # by concurrent failures is never cleared by this success.
         changed = db.execute(update(users).where(
             users.c.id == user.id, users.c.active.is_(True),
             users.c.token_version == user.token_version,
             users.c.password_hash == user.password_hash,
+            observed_lock_condition(user.locked_until),
         ).values(**values))
         if not changed.rowcount:
             return jsonify(error=tr("Invalid username or password")), 401
         refreshed_user = db.execute(select(users).where(users.c.id == user.id)).first()
+    login_limiter.release(remote_address, address_attempt)
     return mfa.begin_login(refreshed_user, payload)
 
 
@@ -964,7 +1119,7 @@ def register():
     if request.content_length and request.content_length > 8192:
         return jsonify(error=tr("Authentication request is too large")), 413
     remote_address = request.remote_addr or "unknown"
-    if registration_rate_limited(remote_address):
+    if registration_limiter.reserve(remote_address) is None:
         return jsonify(error=tr("Too many registration attempts; try again later")), 429
     payload = json_payload()
     settings = read_settings()
@@ -997,18 +1152,32 @@ def register():
     return response, 201
 
 
+def revoke_token_key(key: str, expires: datetime) -> None:
+    """Record a revoked jti or session key; repeated logouts are harmless."""
+    try:
+        with transaction(engine) as db:
+            if db.scalar(select(revoked_tokens.c.jti).where(revoked_tokens.c.jti == key)):
+                return
+            db.execute(insert(revoked_tokens).values(
+                jti=key, expires_at=expires.isoformat(timespec="seconds"), created_at=now(),
+            ))
+    except IntegrityError:
+        pass  # A concurrent logout recorded the same key first.
+
+
 @app.post("/api/auth/logout")
 @jwt_required()
 def logout():
     claims = get_jwt()
-    expires_at = datetime.fromtimestamp(claims["exp"], timezone.utc).isoformat(timespec="seconds")
-    with transaction(engine) as db:
-        if not db.scalar(select(revoked_tokens.c.jti).where(
-            revoked_tokens.c.jti == claims["jti"]
-        )):
-            db.execute(insert(revoked_tokens).values(
-                jti=claims["jti"], expires_at=expires_at, created_at=now()
-            ))
+    token_expires = datetime.fromtimestamp(claims["exp"], timezone.utc)
+    revoke_token_key(claims["jti"], token_expires)
+    session_id = token_session_id(claims)
+    if session_id:
+        # Revoke the whole session: earlier refreshed tokens, and any token an
+        # in-flight request mints for it, which expires no later than this bound.
+        revoke_token_key(revoked_session_key(session_id), max(
+            token_expires, now_datetime() + app.config["JWT_ACCESS_TOKEN_EXPIRES"],
+        ) + timedelta(minutes=1))
     response = jsonify(message=tr("Logged out"))
     unset_jwt_cookies(response)
     return response
@@ -1034,7 +1203,7 @@ def update_my_preferences():
             "Unknown fields: {fields}", fields=', '.join(sorted(unknown))
         )), 400
     theme = payload.get("theme")
-    if theme not in ACCOUNT_THEMES:
+    if not isinstance(theme, str) or theme not in ACCOUNT_THEMES:
         return jsonify(error=tr("Theme must be system, light, or dark")), 400
     with transaction(engine) as db:
         db.execute(update(users).where(users.c.id == user.id).values(
@@ -1068,7 +1237,7 @@ def create_user():
     error = validate_username(username) or validate_password(password)
     if error:
         return jsonify(error=error), 400
-    if role not in {"user", "admin"}:
+    if not valid_role(role):
         return jsonify(error=tr("Invalid role")), 400
     user_id = uuid.uuid4().hex
     timestamp = now()
@@ -1082,7 +1251,35 @@ def create_user():
     return jsonify(user=public_user(user)), 201
 
 
+def valid_role(role: Any) -> bool:
+    return isinstance(role, str) and role in {"user", "admin"}
+
+
+def lock_admin_roster(db) -> None:
+    """Serialize changes that can remove an active administrator.
+
+    Writing the shared row first takes a row lock on PostgreSQL/MariaDB/MySQL and
+    the database write lock on SQLite, so concurrent demotions, deactivations, and
+    deletions re-count administrators one at a time (across all web workers).
+    """
+    db.execute(update(settings_table).where(
+        settings_table.c.name == ADMIN_ROSTER_LOCK_SETTING
+    ).values(updated_at=settings_table.c.updated_at))
+
+
+def actor_still_admin(db, actor: Any) -> bool:
+    """Re-check, inside the roster lock, that a concurrent change did not revoke the actor."""
+    current = db.execute(select(users.c.role, users.c.active, users.c.token_version).where(
+        users.c.id == actor.id
+    )).first()
+    return bool(
+        current is not None and current.role == "admin" and current.active
+        and current.token_version == actor.token_version
+    )
+
+
 def active_admin_count(db) -> int:
+    """Count active administrators; call after ``lock_admin_roster`` in the same transaction."""
     return int(db.scalar(select(func.count()).select_from(users).where(
         users.c.role == "admin", users.c.active.is_(True)
     )) or 0)
@@ -1098,7 +1295,7 @@ def update_user(user_id: str):
         return jsonify(error=tr("Unknown fields: {fields}", fields=', '.join(sorted(unknown)))), 400
     values: dict[str, Any] = {"updated_at": now()}
     if "role" in payload:
-        if payload["role"] not in {"user", "admin"}:
+        if not valid_role(payload["role"]):
             return jsonify(error=tr("Invalid role")), 400
         values["role"] = payload["role"]
     if "active" in payload:
@@ -1111,7 +1308,8 @@ def update_user(user_id: str):
             return jsonify(error=error), 400
         values["password_hash"] = password_hasher.hash(payload["password"])
         values["token_version"] = users.c.token_version + 1
-    if payload.get("unlock") is True:
+    unlock = payload.get("unlock") is True
+    if unlock:
         values["failed_login_count"] = 0
         values["locked_until"] = None
     if user_id == actor.id and (
@@ -1119,6 +1317,9 @@ def update_user(user_id: str):
     ):
         return jsonify(error=tr("You cannot deactivate or demote your own account")), 409
     with transaction(engine) as db:
+        lock_admin_roster(db)
+        if not actor_still_admin(db, actor):
+            return jsonify(error=tr("Administrator access required")), 403
         target = db.execute(select(users).where(users.c.id == user_id)).first()
         if target is None:
             return jsonify(error=tr("User not found")), 404
@@ -1130,6 +1331,17 @@ def update_user(user_id: str):
         if "active" in values or "role" in values:
             values["token_version"] = users.c.token_version + 1
         db.execute(update(users).where(users.c.id == user_id).values(**values))
+        if unlock:
+            # MFA verification locks are separate from the password lock; an
+            # administrator unlock clears all of them (MFA factors stay enrolled).
+            mfa_locks = {
+                column: 0 for column in (
+                    "failures", "locked_until", "manage_failures", "manage_locked_until",
+                ) if column in mfa_accounts.c
+            }
+            db.execute(update(mfa_accounts).where(
+                mfa_accounts.c.user_id == user_id
+            ).values(**mfa_locks))
     with connection(engine) as db:
         updated = db.execute(select(users).where(users.c.id == user_id)).first()
     return jsonify(user=public_user(updated))
@@ -1142,6 +1354,9 @@ def delete_user(user_id: str):
     if user_id == actor.id:
         return jsonify(error=tr("You cannot delete your own account")), 409
     with transaction(engine) as db:
+        lock_admin_roster(db)
+        if not actor_still_admin(db, actor):
+            return jsonify(error=tr("Administrator access required")), 403
         target = db.execute(select(users).where(users.c.id == user_id)).first()
         if target is None:
             return jsonify(error=tr("User not found")), 404
