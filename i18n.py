@@ -45,11 +45,13 @@ def normalize_locale(value: Any) -> str | None:
     candidate = str(value or "").strip().lower().replace("_", "-")
     if not candidate:
         return None
-    direct = LOCALE_ALIASES.get(candidate)
-    if direct:
-        return direct
-    primary = candidate.split("-", 1)[0]
-    return LOCALE_ALIASES.get(primary)
+    # Try progressively shorter prefixes so zh-Hant-HK reaches zh-Hant before zh.
+    subtags = candidate.split("-")
+    for length in range(len(subtags), 0, -1):
+        locale = LOCALE_ALIASES.get("-".join(subtags[:length]))
+        if locale:
+            return locale
+    return None
 
 
 def select_locale(
