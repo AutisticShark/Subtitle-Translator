@@ -85,6 +85,10 @@ mfa_accounts = Table(
     Column("next_send", Integer, nullable=False, default=0),
     Column("send_window", Integer, nullable=False, default=0),
     Column("send_count", Integer, nullable=False, default=0),
+    # MFA-management password/code failures have their own budget so that a
+    # session holder cannot lock the owner out of signing in.
+    Column("manage_failures", Integer, nullable=False, default=0),
+    Column("manage_locked_until", Integer, nullable=False, default=0),
 )
 
 mfa_challenges = Table(
@@ -253,6 +257,31 @@ def _migrate_job_warning(engine: Engine) -> None:
             raise
 
 
+MFA_MANAGEMENT_BUDGET_COLUMNS = {
+    "manage_failures": "ALTER TABLE mfa_accounts ADD COLUMN manage_failures INTEGER NOT NULL DEFAULT 0",
+    "manage_locked_until": "ALTER TABLE mfa_accounts ADD COLUMN manage_locked_until INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _migrate_mfa_management_budget(engine: Engine) -> None:
+    """Add the separate MFA-management failure budget to older databases."""
+    inspector = inspect(engine)
+    if not inspector.has_table("mfa_accounts"):
+        return
+    existing = {column["name"] for column in inspector.get_columns("mfa_accounts")}
+    for name, statement in MFA_MANAGEMENT_BUDGET_COLUMNS.items():
+        if name in existing:
+            continue
+        try:
+            with engine.begin() as connection:
+                connection.execute(text(statement))
+        except SQLAlchemyError:
+            # Another startup worker may have completed the same migration.
+            refreshed = {column["name"] for column in inspect(engine).get_columns("mfa_accounts")}
+            if name not in refreshed:
+                raise
+
+
 def initialize_database(
     engine: Engine,
     defaults: dict[str, str],
@@ -262,6 +291,7 @@ def initialize_database(
     metadata.create_all(engine)
     _migrate_user_theme(engine)
     _migrate_job_warning(engine)
+    _migrate_mfa_management_budget(engine)
     with engine.begin() as connection:
         existing_revisions = set(connection.execute(select(cache_revisions.c.name)).scalars())
         for name in ("settings", "jobs"):

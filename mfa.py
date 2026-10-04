@@ -103,23 +103,39 @@ class MFA:
             mfa_accounts.c.user_id == user_id,
         ).values(**values))
 
-    def guard(self, user, account):
+    # Sign-in verification and authenticated MFA management keep separate failure
+    # budgets: (failures column, lock column, challenge purposes revoked on lockout).
+    # Management failures therefore cannot lock the owner out of signing in.
+    BUDGETS = {
+        "login": ("failures", "locked_until", ("login",)),
+        "manage": ("manage_failures", "manage_locked_until", ("enroll", "manage")),
+    }
+
+    def guard(self, user, account, scope="login"):
         if user is None:
             return self.error(tr("Authentication required"), 401)
-        remaining = account.locked_until - self.timestamp()
+        remaining = getattr(account, self.BUDGETS[scope][1]) - self.timestamp()
         if remaining > 0:
             return self.error(tr("Too many verification attempts; try again later"), 429, remaining)
         return None
 
-    def failed(self, db, account):
+    def failed(self, db, account, scope="login", message=None):
         # Keep this update committed even though the request returns an error.
-        failures = account.failures + 1
+        failures_column, lock_column, purposes = self.BUDGETS[scope]
+        failures = getattr(account, failures_column) + 1
         locked_until = self.timestamp() + 900 if failures >= 5 else 0
-        self.change_account(db, account.user_id,
-                            failures=0 if locked_until else failures, locked_until=locked_until)
+        self.change_account(db, account.user_id, **{
+            failures_column: 0 if locked_until else failures, lock_column: locked_until,
+        })
         if locked_until:
-            db.execute(delete(mfa_challenges).where(mfa_challenges.c.user_id == account.user_id))
-        return self.error(status=400)
+            db.execute(delete(mfa_challenges).where(
+                mfa_challenges.c.user_id == account.user_id, mfa_challenges.c.purpose.in_(purposes),
+            ))
+        return self.error(message, status=400)
+
+    def reset_failures(self, db, user_id, scope):
+        failures_column, lock_column, _ = self.BUDGETS[scope]
+        self.change_account(db, user_id, **{failures_column: 0, lock_column: 0})
 
     def password_valid(self, user, password):
         if not isinstance(password, str) or len(password) > 256:
@@ -164,6 +180,16 @@ class MFA:
     def digest_code(self, challenge_id, code):
         return hmac.new(self.key, (challenge_id + "\0" + code).encode(), hashlib.sha256).hexdigest()
 
+    def encode_challenge(self, user, challenge_id, purpose, method, timestamp, expires, transport):
+        # The signed transport claim lets a reissued challenge serve a client that
+        # asked for a different token transport than the challenge's creator.
+        token = pyjwt.encode({
+            "sub": user.id, "ver": user.token_version, "cid": challenge_id,
+            "purpose": purpose, "iat": timestamp, "exp": expires, "tr": transport,
+            "iss": "subtitle-translator", "aud": "subtitle-mfa",
+        }, self.key, algorithm="HS256")
+        return {"challenge_token": token, "method": method, "expires_in": expires - timestamp}
+
     def create_challenge(self, db, user, purpose, method, *, email="", secret="", transport="cookies"):
         timestamp = self.timestamp()
         challenge_id = secrets.token_hex(32)
@@ -179,12 +205,30 @@ class MFA:
             method=method, email=email, secret=secret, expires=expires, transport=transport,
             code_hash=self.digest_code(challenge_id, code) if code else "",
         ))
-        token = pyjwt.encode({
-            "sub": user.id, "ver": user.token_version, "cid": challenge_id,
-            "purpose": purpose, "iat": timestamp, "exp": expires,
-            "iss": "subtitle-translator", "aud": "subtitle-mfa",
-        }, self.key, algorithm="HS256")
-        return {"challenge_token": token, "method": method, "expires_in": expires - timestamp}, code
+        return self.encode_challenge(user, challenge_id, purpose, method, timestamp, expires, transport), code
+
+    def reissue_login_challenge(self, db, user, transport):
+        """Return a token for the current email login challenge without replacing its code.
+
+        While sending is suppressed, a new challenge would delete the code already
+        emailed and never deliver its replacement, letting a password holder
+        invalidate the owner's code on every attempt. Returns ``(result, has_code)``.
+        """
+        timestamp = self.timestamp()
+        challenge = db.execute(select(mfa_challenges).where(
+            mfa_challenges.c.user_id == user.id, mfa_challenges.c.version == user.token_version,
+            mfa_challenges.c.purpose == "login", mfa_challenges.c.method == "email",
+            mfa_challenges.c.expires > timestamp,
+        ).order_by(mfa_challenges.c.expires.desc())).first()
+        if challenge is None:
+            return None, False
+        return self.encode_challenge(user, challenge.id, "login", "email", timestamp,
+                                     challenge.expires, transport), bool(challenge.code_hash)
+
+    @staticmethod
+    def claimed_transport(claims, fallback):
+        transport = claims.get("tr")
+        return transport if transport in ("cookies", "header") else fallback
 
     def deliver(self, result, email, code):
         if code:
@@ -201,25 +245,38 @@ class MFA:
         transport = "header" if payload.get("token_transport") == "header" else "cookies"
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, original_user.id, original_user.token_version)
+            if user is None or user.password_hash != original_user.password_hash:
+                return self.error(tr("Authentication required"), 401)
+            if not account.method:
+                # The MFA lockout protects a second factor; without one there is
+                # nothing to guard, and password throttling happens in the caller.
+                return self.finish_login(user, transport)
             error = self.guard(user, account)
             if error:
                 return error
-            if user.password_hash != original_user.password_hash:
-                return self.error(tr("Authentication required"), 401)
-            if not account.method:
-                return self.finish_login(user, transport)
             send = account.method == "email" and email_available()
             if send:
                 error = self.email_limit(db, account)
                 if error:
                     send = False  # Recovery codes remain usable during delivery cooldowns.
-            result, code = self.create_challenge(db, user, "login", account.method,
-                                                 email=account.email, transport=transport)
+            result = None
+            code = ""
+            unsent_warning = tr("Email could not be sent. Retry later or use a recovery code.")
             if account.method == "email" and not send:
-                code = ""
-                result.update(email_sent=False, warning=tr(
-                    "Email could not be sent. Retry later or use a recovery code.",
-                ))
+                # Keep the code that was already emailed valid instead of
+                # replacing it with one that will never be delivered.
+                result, has_code = self.reissue_login_challenge(db, user, transport)
+                if result:
+                    result.update(email_sent=False, warning=tr(
+                        "A verification code was requested recently. "
+                        "Enter the latest code you received or use a recovery code.",
+                    ) if has_code else unsent_warning)
+            if result is None:
+                result, code = self.create_challenge(db, user, "login", account.method,
+                                                     email=account.email, transport=transport)
+                if account.method == "email" and not send:
+                    code = ""
+                    result.update(email_sent=False, warning=unsent_warning)
             result["mfa_required"] = True
         return self.deliver(result, account.email, code)
 
@@ -291,8 +348,8 @@ class MFA:
             if not self.check_factor(db, account, payload.get("code"), challenge):
                 return self.failed(db, account)
             db.execute(delete(mfa_challenges).where(mfa_challenges.c.id == challenge.id))
-            self.change_account(db, user.id, failures=0, locked_until=0)
-            return self.finish_login(user, challenge.transport)
+            self.reset_failures(db, user.id, "login")
+            return self.finish_login(user, self.claimed_transport(claims, challenge.transport))
 
     def setup(self):
         payload = self.payload()
@@ -313,11 +370,11 @@ class MFA:
             email = ""
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, get_jwt_identity(), get_jwt()["ver"])
-            error = self.guard(user, account)
+            error = self.guard(user, account, "manage")
             if error:
                 return error
             if not self.password_valid(user, payload.get("password")):
-                return self.failed(db, account)
+                return self.failed(db, account, "manage", tr("Invalid password"))
             if account.method:
                 return self.error(tr("Disable your current MFA method before replacing it"), 409)
             if method == "email":
@@ -358,7 +415,7 @@ class MFA:
             return self.error()
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, claims["sub"], claims["ver"])
-            error = self.guard(user, account)
+            error = self.guard(user, account, "manage")
             if error:
                 return error
             challenge = self.challenge_row(db, claims)
@@ -375,10 +432,10 @@ class MFA:
                 else:
                     valid = hmac.compare_digest(self.digest_code(challenge.id, code), challenge.code_hash)
             if not valid:
-                return self.failed(db, account)
+                return self.failed(db, account, "manage")
             self.change_account(db, user.id, method=challenge.method, secret=challenge.secret,
-                                email=challenge.email, last_step=step if step is not None else -1,
-                                failures=0, locked_until=0)
+                                email=challenge.email, last_step=step if step is not None else -1)
+            self.reset_failures(db, user.id, "manage")
             codes = self.new_recovery_codes(db, user.id)
             return self.rotate_session(db, user, recovery_codes=codes)
 
@@ -386,11 +443,11 @@ class MFA:
         payload = self.payload()
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, get_jwt_identity(), get_jwt()["ver"])
-            error = self.guard(user, account)
+            error = self.guard(user, account, "manage")
             if error:
                 return error
             if not self.password_valid(user, payload.get("password")):
-                return self.failed(db, account)
+                return self.failed(db, account, "manage", tr("Invalid password"))
             if account.method != "email" or not email_available():
                 return self.error(tr("Email verification is unavailable; ask an administrator to configure email delivery"), 503)
             error = self.email_limit(db, account)
@@ -403,20 +460,20 @@ class MFA:
         payload = self.payload()
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, get_jwt_identity(), get_jwt()["ver"])
-            error = self.guard(user, account)
+            error = self.guard(user, account, "manage")
             if error:
                 return error
             if not account.method:
                 return self.error(tr("MFA is not enabled"), 409)
             if not self.password_valid(user, payload.get("password")):
-                return self.failed(db, account)
+                return self.failed(db, account, "manage", tr("Invalid password"))
             claims = self.decode_challenge(payload, "manage")
             challenge = None
             if claims and claims["sub"] == user.id and claims["ver"] == user.token_version:
                 challenge = self.challenge_row(db, claims)
             if not self.check_factor(db, account, payload.get("code"), challenge):
-                return self.failed(db, account)
-            self.change_account(db, user.id, failures=0, locked_until=0)
+                return self.failed(db, account, "manage")
+            self.reset_failures(db, user.id, "manage")
             if regenerate:
                 codes = self.new_recovery_codes(db, user.id)
                 return self.rotate_session(db, user, recovery_codes=codes)
@@ -435,7 +492,7 @@ class MFA:
             return self.error()
         with transaction(self.engine) as db:
             user, account = self.lock_account(db, claims["sub"], claims["ver"])
-            error = self.guard(user, account)
+            error = self.guard(user, account, "login" if claims["purpose"] == "login" else "manage")
             if error:
                 return error
             challenge = self.challenge_row(db, claims)
@@ -447,6 +504,8 @@ class MFA:
             if error:
                 return error
             # Rotation invalidates both the previous JWT challenge and its email code.
-            result, code = self.create_challenge(db, user, challenge.purpose, "email",
-                                                 email=challenge.email, transport=challenge.transport)
+            result, code = self.create_challenge(
+                db, user, challenge.purpose, "email", email=challenge.email,
+                transport=self.claimed_transport(claims, challenge.transport),
+            )
         return self.deliver(result, challenge.email, code)
