@@ -96,7 +96,9 @@ class SegmentationAndWrappingTests(unittest.TestCase):
 
 class ProviderOutputParsingTests(unittest.TestCase):
     def test_parse_numbered_accepts_common_separators_and_reorders(self):
-        output = "2) second\nignored heading\n1： first"
+        # Unnumbered text before the first entry is preamble; after an entry
+        # it would be a continuation of that entry.
+        output = "ignored heading\n2) second\n1： first"
 
         self.assertEqual(parse_numbered(output, 2), ["first", "second"])
 

@@ -16,6 +16,8 @@ from srt_translate import (
     _parse_rate_limit_reset,
     _post_json,
     make_deepl,
+    parse_numbered,
+    parse_srt,
     rebuild_cues,
     segment_cue,
     translate_segments,
@@ -150,6 +152,36 @@ class PostJsonErrorTests(unittest.TestCase):
         with self.assertRaises(RateLimitError) as caught:
             self.post("rate-limited")
         self.assertEqual(caught.exception.retry_after, 360.0)
+
+
+class SrtParsingTests(unittest.TestCase):
+    def test_srt_without_blank_separator_starts_a_new_cue(self):
+        cues = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+                         "2\n00:00:03,000 --> 00:00:04,000\nWorld\n"
+                         "00:00:05,000 --> 00:00:06,000\nAgain\n")
+
+        self.assertEqual([cue.lines for cue in cues], [["Hello"], ["World"], ["Again"]])
+        self.assertEqual([cue.index for cue in cues], [1, 2, 3])
+
+
+class ParseNumberedTests(unittest.TestCase):
+    def test_accepts_an_empty_translation(self):
+        self.assertEqual(parse_numbered("1\tHola\n2\t\n3\tAdiós", 3), ["Hola", "", "Adiós"])
+        self.assertEqual(parse_numbered("1\tHola\n2\n3\tAdiós", 3), ["Hola", "", "Adiós"])
+        self.assertEqual(parse_numbered("1. Hola\n2.\n3. Adiós", 3), ["Hola", "", "Adiós"])
+
+    def test_unnumbered_lines_continue_the_previous_entry(self):
+        output = "1\tHe said that he would\ncome back tomorrow.\n2\tBye"
+
+        self.assertEqual(parse_numbered(output, 2),
+                         ["He said that he would come back tomorrow.", "Bye"])
+
+    def test_cjk_continuation_is_joined_without_a_space(self):
+        self.assertEqual(parse_numbered("1\t他說他明天\n會回來。", 1), ["他說他明天會回來。"])
+
+    def test_out_of_range_number_is_continuation_text(self):
+        self.assertEqual(parse_numbered("1\tThe year was\n1999. Then\n2\tOk", 2),
+                         ["The year was 1999. Then", "Ok"])
 
 
 class PerLineFallbackRateLimitTests(unittest.TestCase):

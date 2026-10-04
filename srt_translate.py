@@ -105,6 +105,17 @@ def parse_srt(raw: str) -> list[Cue]:
     n = len(lines)
     auto_index = 0
 
+    def starts_cue(j: int) -> bool:
+        """A timing line, or an index line directly followed by one."""
+        return bool(
+            TIMING_RE.search(lines[j])
+            or (
+                lines[j].strip().isdigit()
+                and j + 1 < n
+                and TIMING_RE.search(lines[j + 1])
+            )
+        )
+
     while i < n:
         # Skip blank padding between cues
         while i < n and not lines[i].strip():
@@ -128,26 +139,21 @@ def parse_srt(raw: str) -> list[Cue]:
         auto_index += 1
         body: list[str] = []
         # Consume until a blank line that is followed by a new cue header,
-        # so blank lines *inside* a cue don't truncate it.
+        # so blank lines *inside* a cue don't truncate it. A header directly
+        # after text (a missing blank separator) also ends the cue.
         while i < n:
             if not lines[i].strip():
                 j = i + 1
                 while j < n and not lines[j].strip():
                     j += 1
-                is_next = j < n and (
-                    TIMING_RE.search(lines[j])
-                    or (
-                        lines[j].strip().isdigit()
-                        and j + 1 < n
-                        and TIMING_RE.search(lines[j + 1])
-                    )
-                )
-                if is_next or j >= n:
+                if j >= n or starts_cue(j):
                     i = j
                     break
                 body.append("")
                 i += 1
                 continue
+            if starts_cue(i):
+                break
             body.append(lines[i])
             i += 1
 
@@ -688,19 +694,44 @@ def make_echo() -> Callable[[list[str], str, str], list[str]]:
     return call
 
 
+_NUMBERED_RE = re.compile(r"^(\d+)\s*[\t.)\uff1a:\u3001-]\s*(.*)$")
+_NUMBER_ONLY_RE = re.compile(r"^(\d+)$")
+
+
+def _join_continuation(head: str, tail: str) -> str:
+    if not head:
+        return tail
+    # CJK text has no inter-word spaces; don't invent one at the line break.
+    if HAS_CJK_RE.match(head[-1]) and HAS_CJK_RE.match(tail[0]):
+        return head + tail
+    return f"{head} {tail}"
+
+
 def parse_numbered(out: str, expected: int) -> list[str]:
-    """Pull `N<tab>text` pairs back out, tolerating stray formatting."""
+    """Pull `N<tab>text` pairs back out, tolerating stray formatting.
+
+    A bare `N` (the tab and empty translation trimmed away) is an empty line,
+    and an unnumbered line continues the entry before it. Text before the
+    first numbered line is preamble and ignored.
+    """
     got: dict[int, str] = {}
+    last: int | None = None
     for line in out.splitlines():
         line = line.strip()
-        if not line:
+        if not line or line.startswith("```"):
             continue
-        m = re.match(r"^(\d+)\s*[\t.)\uff1a:\u3001-]\s*(.*)$", line)
-        if not m:
+        m = _NUMBERED_RE.match(line)
+        if m and 1 <= int(m.group(1)) <= expected:
+            last = int(m.group(1))
+            got[last] = m.group(2).strip()
             continue
-        k = int(m.group(1))
-        if 1 <= k <= expected:
-            got[k] = m.group(2).strip()
+        m = _NUMBER_ONLY_RE.match(line)
+        if m and 1 <= int(m.group(1)) <= expected and int(m.group(1)) not in got:
+            last = int(m.group(1))
+            got[last] = ""
+            continue
+        if last is not None:
+            got[last] = _join_continuation(got[last], line)
     missing = [i for i in range(1, expected + 1) if i not in got]
     if missing:
         raise TranslationError(
