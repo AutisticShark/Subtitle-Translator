@@ -14,7 +14,8 @@ const state = {
   // history is the visible page; overview feeds the dashboard metrics and recent list.
   history: emptyJobList(), overview: emptyJobList(), jobsOffset: 0,
   // session changes on sign-in/out so stale responses from another account are dropped.
-  session: 0, jobsRequest: 0, jobsController: null, pollFailures: 0,
+  session: 0, jobsRequest: 0, jobsController: null, pollFailures: 0, pollDeferred: false,
+  toastTimer: null,
   authMode: 'login', authConfig: {
     registration_enabled: false,
     captcha: { provider: 'none', site_key: '', protected_actions: [] },
@@ -69,7 +70,8 @@ function toast(message) {
   const element = $('#toast');
   element.textContent = message;
   element.classList.add('show');
-  setTimeout(() => element.classList.remove('show'), 3000);
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => element.classList.remove('show'), 3000);
 }
 
 async function api(url, options = {}) {
@@ -207,8 +209,8 @@ async function renderCaptcha(slot, action) {
     return;
   }
   const existing = state.captchaWidgets[slot];
-  if (existing && existing.provider === provider && existing.theme === theme
-      && (provider !== 'turnstile' || existing.action === action)) {
+  if (existing && existing.provider === provider && existing.siteKey === siteKey
+      && existing.theme === theme && (provider !== 'turnstile' || existing.action === action)) {
     resetCaptcha(slot);
     return;
   }
@@ -224,7 +226,7 @@ async function renderCaptcha(slot, action) {
   const options = { sitekey: siteKey, theme };
   if (provider === 'turnstile') options.action = action;
   const id = captchaApi(provider).render(container, options);
-  state.captchaWidgets[slot] = { id, provider, action, theme };
+  state.captchaWidgets[slot] = { id, provider, siteKey, action, theme };
 }
 
 function captchaToken(slot, action) {
@@ -254,6 +256,7 @@ function endSession() {
   clearTimeout(state.timer);
   state.timer = null;
   state.pollFailures = 0;
+  state.pollDeferred = false;
 }
 
 // Remove every trace of the previous account from memory and the hidden app shell.
@@ -327,7 +330,13 @@ async function enterApp(user) {
   $('#allJobs').checked = admin;
   state.jobsOffset = 0;
   showView(window.location.hash.slice(1) || 'dashboard', false);
-  await Promise.all([loadSettings(), loadJobs(), admin ? loadUsers() : Promise.resolve()]);
+  try {
+    await Promise.all([loadSettings(), loadJobs(), admin ? loadUsers() : Promise.resolve()]);
+  } catch (error) {
+    if (session !== state.session) return;
+    if (error.status === 401) return showAuth(false);
+    toast(error.message); // Settings are fetched again on demand (submitTranslation).
+  }
   if (session !== state.session) return;
   await renderCaptcha('upload', 'upload').catch(error => toast(error.message));
 }
@@ -533,7 +542,9 @@ async function loadMfa() {
   $('#mfaManageEmail').hidden = data.method !== 'email';
   $('#mfaMethod option[value="email"]').disabled = !data.email_available;
   if (!data.email_available && !data.method) {
-    $('#mfaStatus').textContent += `. ${t('Email verification is unavailable; ask an administrator to configure email delivery')}`;
+    // A line break rather than ASCII ". ", which is wrong punctuation in CJK locales.
+    $('#mfaStatus').append(document.createElement('br'),
+      t('Email verification is unavailable; ask an administrator to configure email delivery'));
   }
 }
 
@@ -654,9 +665,21 @@ async function sendManagementEmail(event) {
 async function logout() {
   endSession(); // Stop polling before the token is revoked.
   try { await api('/api/auth/logout', { method: 'POST' }); }
-  catch (error) { if (error.status !== 401) toast(error.message); }
-  const status = await refreshAuthConfiguration();
-  showAuth(!status.configured);
+  catch (error) {
+    if (error.status !== 401) {
+      // The session cookie is still valid; showing the sign-in screen would only
+      // hide a live session from the next person at this browser.
+      toast(error.message);
+      return loadJobs();
+    }
+  }
+  try {
+    const status = await refreshAuthConfiguration();
+    showAuth(!status.configured);
+  } catch (error) {
+    showAuth(false);
+    toast(error.message);
+  }
 }
 
 async function saveTheme(event) {
@@ -758,6 +781,10 @@ async function submitTranslation(event) {
   if (!files.length) return toast(t('Choose at least one subtitle file'));
   if (!targets.length) return toast(t('Choose at least one target language'));
   const provider = $('#provider').value;
+  if (!state.settings) {
+    try { await loadSettings(); } catch (error) { return toast(error.message); }
+    if (!state.settings) return;
+  }
   if (!state.settings.configured[provider]) return toast(t('This provider is not configured'));
   const button = $('#submitButton');
   try {
@@ -828,7 +855,29 @@ function jobsUrl(params) {
 
 function scheduleJobsPoll(delay) {
   clearTimeout(state.timer);
-  state.timer = setTimeout(loadJobs, delay);
+  state.timer = setTimeout(() => {
+    // Every authenticated request may refresh the session cookie, so an
+    // unattended background tab must not poll; resume when it is shown again.
+    if (document.hidden) state.pollDeferred = true;
+    else loadJobs();
+  }, delay);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.pollDeferred) return;
+  state.pollDeferred = false;
+  loadJobs();
+});
+
+// A request sent with a cookie that an MFA change just rotated fails with 401
+// although the session continues; only a 401 from /me means signed out.
+async function sessionEnded(isCurrent) {
+  try {
+    await api('/api/auth/me');
+    return false;
+  } catch (error) {
+    return isCurrent() && error.status === 401;
+  }
 }
 
 async function loadJobs() {
@@ -870,7 +919,11 @@ async function loadJobs() {
     scheduleJobsPoll(active ? POLL_ACTIVE_MS : POLL_IDLE_MS);
   } catch (error) {
     if (!current()) return; // Superseded, aborted, or from a previous session.
-    if (error.status === 401) return showAuth(false);
+    if (error.status === 401) {
+      if (await sessionEnded(current)) return showAuth(false);
+      if (current()) scheduleJobsPoll(POLL_ACTIVE_MS);
+      return;
+    }
     state.pollFailures += 1;
     if (state.pollFailures === 1) toast(error.message);
     scheduleJobsPoll(Math.min(POLL_IDLE_MS * 2 ** (state.pollFailures - 1), POLL_MAX_BACKOFF_MS));
@@ -926,7 +979,9 @@ async function removeKey(event) {
   const button = event.target.closest('.clear-key');
   if (!button) return;
   const provider = button.dataset.provider;
-  if (!window.confirm(t('Remove the saved secret for {provider}?', { provider }))) return;
+  const label = button.dataset.label
+    || button.closest('label')?.firstChild?.textContent.trim() || provider;
+  if (!window.confirm(t('Remove the saved secret for {provider}?', { provider: label }))) return;
   button.disabled = true;
   try {
     state.settings = await api(`/api/settings/keys/${encodeURIComponent(provider)}`, {
@@ -1003,11 +1058,15 @@ async function userAction(event) {
     });
     await loadUsers();
     toast(t(method === 'DELETE' ? 'User deleted' : 'User updated'));
-  } catch (error) { toast(error.message); await loadUsers(); }
+  } catch (error) {
+    toast(error.message);
+    await loadUsers().catch(() => {});
+  }
 }
 
 async function initialize() {
-  await loadI18n();
+  // English source strings are better than no sign-in screen at all.
+  await loadI18n().catch(() => {});
   const status = await refreshAuthConfiguration();
   if (!status.configured) return showAuth(true);
   try {
@@ -1075,8 +1134,9 @@ $('#userList').addEventListener('change', userAction);
 $('#refreshButton').addEventListener('click', () => loadJobs());
 $('#jobsNewer').addEventListener('click', () => showJobsPage(state.jobsOffset - JOBS_PAGE_SIZE));
 $('#jobsOlder').addEventListener('click', () => showJobsPage(state.jobsOffset + JOBS_PAGE_SIZE));
-$('#dashboardRefresh').addEventListener('click', async () => {
-  await Promise.all([loadJobs(), state.user?.role === 'admin' ? loadUsers() : Promise.resolve()]);
+$('#dashboardRefresh').addEventListener('click', () => {
+  Promise.all([loadJobs(), state.user?.role === 'admin' ? loadUsers() : Promise.resolve()])
+    .catch(error => toast(error.message));
 });
 $('#allJobs').addEventListener('change', () => showJobsPage(0));
 $('#jobs').addEventListener('click', jobAction);

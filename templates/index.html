@@ -187,13 +187,14 @@
           <div class="form-grid">
             <label>{{ tr('Source language') }}<input name="source_language" id="sourceLanguage" value="English" placeholder="{{ tr('Auto or English') }}"></label>
             <label>{{ tr('Provider') }}<select name="provider" id="provider"></select></label>
-            <label class="wide">{{ tr('Target languages') }}
+            <fieldset class="wide field-group">
+              <legend>{{ tr('Target languages') }}</legend>
               <div class="language-picker" id="languagePicker">
                 {% for code, language in languages.items() %}
                 <label class="chip"><input type="checkbox" value="{{ code }}"><span>{{ language.name }}</span></label>
                 {% endfor %}
               </div>
-            </label>
+            </fieldset>
             <label class="wide optional-model" id="modelField">{{ tr('Model override') }} <span>({{ tr('optional') }})</span>
               <input name="model" placeholder="{{ tr('Use the configured model') }}">
             </label>
@@ -287,13 +288,13 @@
         <div class="settings-group">
           <h3>Cloudflare Turnstile</h3>
           <label>{{ tr('Site key') }}<input name="turnstile_site_key" autocomplete="off"></label>
-          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="turnstile_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-turnstile"></span><button class="clear-key" data-provider="captcha-turnstile" type="button">{{ tr('Remove') }}</button></div></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="turnstile_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-turnstile"></span><button class="clear-key" data-provider="captcha-turnstile" data-label="Cloudflare Turnstile" type="button">{{ tr('Remove') }}</button></div></label>
           <h3>Google reCAPTCHA v2</h3>
           <label>{{ tr('Site key') }}<input name="recaptcha_site_key" autocomplete="off"></label>
-          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="recaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-recaptcha"></span><button class="clear-key" data-provider="captcha-recaptcha" type="button">{{ tr('Remove') }}</button></div></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="recaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-recaptcha"></span><button class="clear-key" data-provider="captcha-recaptcha" data-label="Google reCAPTCHA v2" type="button">{{ tr('Remove') }}</button></div></label>
           <h3>hCaptcha</h3>
           <label>{{ tr('Site key') }}<input name="hcaptcha_site_key" autocomplete="off"></label>
-          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="hcaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-hcaptcha"></span><button class="clear-key" data-provider="captcha-hcaptcha" type="button">{{ tr('Remove') }}</button></div></label>
+          <label>{{ tr('Secret key') }}<div class="key-row"><input type="password" name="hcaptcha_secret_key" autocomplete="new-password" placeholder="{{ tr('Leave blank to keep current key') }}"><span class="key-state" data-provider="captcha-hcaptcha"></span><button class="clear-key" data-provider="captcha-hcaptcha" data-label="hCaptcha" type="button">{{ tr('Remove') }}</button></div></label>
         </div>
       </details>
       <details>
