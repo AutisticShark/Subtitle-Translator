@@ -19,7 +19,7 @@ A self-hosted web app for translating subtitle files with LLM APIs, DeepL, or Go
 - Per-user job isolation, with administrator access to cross-user job cleanup
 - SQLite by default, plus PostgreSQL and MariaDB/MySQL through SQLAlchemy
 - Optional Redis cache for settings and frequently polled job lists/details, with SQL fallback
-- Context-aware batching, shared rate-limit backoff, retries, resumable per-job cache, tag masking, and subtitle-aware line wrapping
+- Context-aware batching, shared rate-limit backoff, retries, tag masking, and subtitle-aware line wrapping
 - Docker health check, persistent named volume, CSRF-protected HttpOnly auth cookies, and bearer-token API support
 
 ## Start with Docker Compose
@@ -30,9 +30,9 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-Open <http://localhost:8000>. If `ADMIN_PASSWORD` was left blank, the one-time setup screen creates the first administrator. Complete that setup before exposing the service to an untrusted network; for unattended deployment, set `ADMIN_PASSWORD` before the first start instead. Sign in, choose **Settings**, add a provider key and model, then upload subtitles. Application settings, users, job records, sources, outputs, and resumable caches live in the `subtitle_data` Docker volume.
+Open <http://localhost:8000>. If `ADMIN_PASSWORD` was left blank, the one-time setup screen creates the first administrator. Complete that setup before exposing the service to an untrusted network; for unattended deployment, set `ADMIN_PASSWORD` before the first start instead. Sign in, choose **Settings**, add a provider key and model, then upload subtitles. Application settings, users, job records, sources, and outputs live in the `subtitle_data` Docker volume. Jobs interrupted by a restart are marked failed and must be resubmitted; they do not resume.
 
-Queued or processing jobs can be canceled from **Recent jobs**. Finished, failed, and canceled jobs can then be deleted; deletion removes the database record, uploaded source, translated outputs, ZIP bundle, and resumable cache.
+Queued or processing jobs can be canceled from **Recent jobs**. Finished, failed, and canceled jobs can then be deleted; deletion removes the database record, uploaded source, translated outputs, and ZIP bundle.
 
 Useful commands:
 
@@ -130,7 +130,7 @@ TLS options in the URL are translated for those drivers:
 | `sslmode=verify-ca`, `ssl-mode=VERIFY_CA` | Encrypted; certificate chain verified, host name not checked |
 | `sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY` | Encrypted; certificate chain and host name verified (recommended over untrusted networks) |
 
-Certificates are verified against the system trust store unless a CA file is given with `sslrootcert=/path` (PostgreSQL) or `ssl-ca=/path` (MySQL/MariaDB); client certificates use `sslcert`/`sslkey` or `ssl-cert`/`ssl-key`. The opportunistic `prefer`/`allow`/`PREFERRED` modes can silently fall back to plaintext and are rejected at startup with an explanatory error; choose an explicit mode instead.
+Certificates are verified against the system trust store unless a CA file is given with `sslrootcert=/path` (PostgreSQL) or `ssl-ca=/path` (MySQL/MariaDB); client certificates use `sslcert`/`sslkey` or `ssl-cert`/`ssl-key`. Without an explicit mode, a PostgreSQL `sslrootcert` means `verify-ca` and client certificate files alone mean `require`; for MySQL/MariaDB without `ssl-mode`, an `ssl-ca` file enables TLS with certificate and host name verification, while client certificate files alone encrypt without verifying the server. The opportunistic `prefer`/`allow`/`PREFERRED` modes can silently fall back to plaintext and are rejected at startup with an explanatory error; choose an explicit mode instead.
 
 ### Web workers and startup recovery
 
@@ -148,7 +148,7 @@ Docker Compose includes a private Redis service and enables caching by default. 
 | Job lists and detail polling | Redis caches raw rows, scoped to the requesting account or explicit administrator view and list limit. Stages are localized after retrieval. |
 | Accounts, roles, token versions, logout revocations | Read directly from SQL so authentication changes take effect immediately. |
 | Job submission quotas, cancellation, deletion, download authorization | Enforced directly in SQL; quota counters and job inserts remain in one transaction. |
-| Uploads, translated outputs, resumable translation caches | Remain in the persistent data volume. |
+| Uploads and translated outputs | Remain in the persistent data volume. |
 
 Settings and job writes change a random revision in the new `cache_revisions` SQL table **in the same transaction**. Cache reads check that revision before looking up Redis. This replaces full result queries with a small primary-key lookup on cache hits, and prevents an old cache value from being reused after a committed change, even if Redis was unavailable during the write. An in-flight reader can finish with its pre-change snapshot. All job changes invalidate the job cache; active workloads with frequent progress updates may therefore have fewer cache hits. No user/job/settings data is migrated out of SQL.
 
