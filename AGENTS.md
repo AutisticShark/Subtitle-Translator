@@ -87,3 +87,14 @@ For web-job tests, wait for a terminal job state and include `job["error"]` in f
 Do not make live paid-provider calls as routine validation. Use Echo unless the user explicitly requests an integration test and supplies authorization and credentials through a safe channel.
 
 Do not import `webapp` merely as a smoke test without first assigning `DATA_DIR` to a temporary writable directory: importing the module initializes SQLite immediately. The actual web tests already set this environment variable before import.
+
+## Commits
+
+Split work into commits by kind, never one mixed commit (owner's decision, 2026-10-13). Use Conventional Commits, `type(scope): summary` in the imperative, with a body that explains why:
+
+- `chore(deps)`: dependency pins, Docker base image and digest, GitHub Action versions, Compose service images. Nothing else.
+- `fix(<area>)`: bug fixes, one commit per area (`engine`, `api`, `ui`, `mfa,db,settings`, ...), including that area's regression tests and the locale entries its messages need.
+- `feat(<area>)`: one commit per feature, with its tests, configuration (`.env.example`, `compose.yaml`) and the documentation describing it.
+- `refactor`: behavior-neutral restructuring; `test`: test-only hardening; `docs`: documentation-only changes and retrospectives (`MEMORY.md`, new `AGENTS.md` rules).
+
+Order commits so that each one passes `pytest` and `ruff` on its own: check every commit in a separate worktree (`git worktree add <tmp> <commit>`), not only the final tree. When one file holds changes for several commits, stage each part separately; interactive `git add -p` is unavailable to agents here, so build the intermediate file content and stage it with `git hash-object -w` plus `git update-index --cacheinfo` (a replaced line must be staged as both its deletion and its insertion). Work on a branch, not directly on `main`.
