@@ -613,7 +613,7 @@ class WebApplicationTests(unittest.TestCase):
             ({"workers": 2.5}, "workers must be a whole number between 1 and 16"),
             ({"max_lines": "1.0"}, "max_lines must be a whole number between 1 and 5"),
             ({"workers": "many"}, "workers must be a whole number between 1 and 16"),
-            ({"width": "wide"}, "could not convert string to float"),
+            ({"width": "wide"}, "width must be between 4 and 80"),
             ({"rate_limit_window_minutes": 0}, "must be a whole number between 1 and 10080"),
             ({"user_job_limit": "1.5"}, "must be a whole number between 0 and 100000"),
             ({"captcha_provider": "robot-checker"}, "Invalid CAPTCHA provider"),

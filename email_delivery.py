@@ -62,6 +62,18 @@ def _required(env, name):
     return value
 
 
+_ADDRESS_PATTERN = re.compile(
+    r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}"
+)
+
+
+def is_valid_address(value) -> bool:
+    """Whether ``value`` is one bare address (no display name) that providers accept."""
+    return (isinstance(value, str) and len(value) <= 254
+            and len(value.partition("@")[0]) <= 64
+            and _ADDRESS_PATTERN.fullmatch(value) is not None)
+
+
 def _mailbox(value, *, display_name=False):
     # Reject lists and header injection before any provider sees the address.
     if not isinstance(value, str) or not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
@@ -70,9 +82,7 @@ def _mailbox(value, *, display_name=False):
     if len(addresses) != 1:
         raise EmailConfigurationError("Enter a valid single email address")
     name, address = addresses[0]
-    if (not address or len(address) > 254 or len(address.partition("@")[0]) > 64
-            or not re.fullmatch(r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}", address)
-            or (not display_name and value != address)):
+    if not is_valid_address(address) or (not display_name and value != address):
         raise EmailConfigurationError("Enter a valid single email address")
     return name, address
 
@@ -177,9 +187,9 @@ class _NoRedirects(HTTPRedirectHandler):
 def _post_json(url, data, headers):
     request = Request(url, data=data, headers={"User-Agent": "Subtitle-Translator", **headers}, method="POST")
     opener = build_opener(_NoRedirects(), HTTPSHandler(context=ssl.create_default_context()))
+    # The opener's default HTTPErrorProcessor raises HTTPError for every non-2xx
+    # final status (redirects included, since _NoRedirects declines them).
     with opener.open(request, timeout=TIMEOUT) as response:
-        if not 200 <= response.status < 300:
-            raise EmailDeliveryError("Email delivery failed")
         raw = response.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise EmailDeliveryError("Email delivery failed")

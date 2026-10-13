@@ -40,7 +40,8 @@ SERVICE_ERRORS = (
 _warned_unpinned_hostname = False
 
 
-def _normalize_hostname(value: str) -> str:
+def normalize_hostname(value: str) -> str:
+    """Canonical comparison form: trimmed, lowercase, without a trailing dot."""
     return value.strip().lower().rstrip(".")
 
 
@@ -104,9 +105,9 @@ def verify_token(
         error_codes = result.get("error-codes", []) if isinstance(result, dict) else []
         LOGGER.info("%s CAPTCHA rejected a token: %s", provider, error_codes)
         return failed
-    expected_hostname = _normalize_hostname(configured_hostname)
+    expected_hostname = normalize_hostname(configured_hostname)
     if expected_hostname:
-        actual_hostname = _normalize_hostname(str(result.get("hostname", "")))
+        actual_hostname = normalize_hostname(str(result.get("hostname", "")))
         if actual_hostname != expected_hostname:
             LOGGER.warning("%s CAPTCHA returned an unexpected hostname", provider)
             return failed

@@ -252,26 +252,39 @@ def database_connect_options(database_url: str) -> tuple[URL, dict]:
     driver = parsed.get_driver_name()
     if parsed.get_backend_name() == "postgresql" and driver == "pg8000":
         mode = _pop_query(query, "sslmode")
-        ca_file = _pop_query(query, "sslrootcert") if mode is not None else None
-        cert_file = _pop_query(query, "sslcert") if mode is not None else None
-        key_file = _pop_query(query, "sslkey") if mode is not None else None
+        ca_file = _pop_query(query, "sslrootcert")
+        cert_file = _pop_query(query, "sslcert")
+        key_file = _pop_query(query, "sslkey")
         modes, argument = _POSTGRES_SSL_MODES, "ssl_context"
         mode_name = "sslmode"
         if mode is not None:
             mode = mode.strip().lower()
-            # libpq verifies the chain for sslmode=require when a root
-            # certificate is supplied; keep that behavior.
-            if mode == "require" and ca_file:
-                mode = "verify-ca"
+        elif (ca_file, cert_file, key_file) != (None, None, None):
+            # libpq's default (prefer) cannot be expressed with pg8000. A
+            # certificate file signals that TLS is intended, so require it.
+            mode = "require"
+        # libpq verifies the chain for sslmode=require (and the default) when a
+        # root certificate is supplied; keep that behavior.
+        if mode == "require" and ca_file:
+            mode = "verify-ca"
     elif parsed.get_backend_name() in {"mysql", "mariadb"} and driver == "pymysql":
         mode = _pop_query(query, "ssl-mode", "ssl_mode")
-        ca_file = _pop_query(query, "ssl-ca", "ssl_ca") if mode is not None else None
-        cert_file = _pop_query(query, "ssl-cert", "ssl_cert") if mode is not None else None
-        key_file = _pop_query(query, "ssl-key", "ssl_key") if mode is not None else None
+        ca_file = _pop_query(query, "ssl-ca", "ssl_ca")
+        cert_file = _pop_query(query, "ssl-cert", "ssl_cert")
+        key_file = _pop_query(query, "ssl-key", "ssl_key")
+        if mode is None:
+            # SQLAlchemy's MySQL dialects already turn ssl_ca/ssl_cert/ssl_key
+            # into PyMySQL's ssl dict (a CA verifies the chain and host name).
+            # Keep that, but accept the MySQL-client hyphenated spellings,
+            # which PyMySQL would reject as unknown keyword arguments.
+            for name, value in (("ssl_ca", ca_file), ("ssl_cert", cert_file),
+                                ("ssl_key", key_file)):
+                if value is not None:
+                    query[name] = value
+            return parsed.set(query=query), connect_args
         modes, argument = _MYSQL_SSL_MODES, "ssl"
         mode_name = "ssl-mode"
-        if mode is not None:
-            mode = mode.strip().lower().replace("-", "_")
+        mode = mode.strip().lower().replace("-", "_")
     else:
         return parsed, connect_args
     if mode is None:
@@ -310,23 +323,34 @@ def create_database_engine(sqlite_path: Path) -> Engine:
     return engine
 
 
+def _add_column_if_missing(engine: Engine, table: str, column: str, statement: str) -> bool:
+    """Run the ``ALTER TABLE ... ADD COLUMN`` ``statement`` unless ``column`` exists.
+
+    Returns whether the column was missing (and has now been added, by this or a
+    concurrent startup process). A missing table is left to ``create_all``.
+    Keep MySQL rule 26 in ``statement``: no literal ``DEFAULT`` on ``TEXT`` columns.
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table(table):
+        return False
+    if column in {item["name"] for item in inspector.get_columns(table)}:
+        return False
+    try:
+        with engine.begin() as connection:
+            connection.execute(text(statement))
+    except SQLAlchemyError:
+        # Another startup worker may have completed the same migration.
+        if column not in {item["name"] for item in inspect(engine).get_columns(table)}:
+            raise
+    return True
+
+
 def _migrate_legacy_sqlite(engine: Engine) -> None:
     """Add ownership to databases created before authentication existed."""
     if engine.dialect.name != "sqlite":
         return
-    inspector = inspect(engine)
-    if not inspector.has_table("jobs"):
-        return
-    columns = {column["name"] for column in inspector.get_columns("jobs")}
-    if "user_id" not in columns:
-        try:
-            with engine.begin() as connection:
-                connection.execute(text("ALTER TABLE jobs ADD COLUMN user_id VARCHAR(32)"))
-        except SQLAlchemyError:
-            # Another startup worker may have completed the same migration.
-            refreshed = {column["name"] for column in inspect(engine).get_columns("jobs")}
-            if "user_id" not in refreshed:
-                raise
+    if _add_column_if_missing(engine, "jobs", "user_id",
+                              "ALTER TABLE jobs ADD COLUMN user_id VARCHAR(32)"):
         with engine.begin() as connection:
             connection.execute(
                 text("CREATE INDEX IF NOT EXISTS ix_jobs_user_created "
@@ -334,69 +358,24 @@ def _migrate_legacy_sqlite(engine: Engine) -> None:
             )
 
 
-def _migrate_user_theme(engine: Engine) -> None:
-    """Add the account theme preference to databases created by older releases."""
-    inspector = inspect(engine)
-    if not inspector.has_table("users"):
-        return
-    columns = {column["name"] for column in inspector.get_columns("users")}
-    if "theme" not in columns:
-        try:
-            with engine.begin() as connection:
-                connection.execute(text(
-                    "ALTER TABLE users ADD COLUMN theme "
-                    "VARCHAR(16) NOT NULL DEFAULT 'system'"
-                ))
-        except SQLAlchemyError:
-            # Another startup worker may have completed the same migration.
-            refreshed = inspect(engine)
-            refreshed_columns = {
-                column["name"] for column in refreshed.get_columns("users")
-            }
-            if "theme" not in refreshed_columns:
-                raise
+# Columns added after a table's first release: (table, column, DDL statement).
+ADDED_COLUMNS = (
+    # Account theme preference.
+    ("users", "theme",
+     "ALTER TABLE users ADD COLUMN theme VARCHAR(16) NOT NULL DEFAULT 'system'"),
+    # Non-fatal job warning.
+    ("jobs", "warning", "ALTER TABLE jobs ADD COLUMN warning TEXT"),
+    # Separate MFA-management failure budget.
+    ("mfa_accounts", "manage_failures",
+     "ALTER TABLE mfa_accounts ADD COLUMN manage_failures INTEGER NOT NULL DEFAULT 0"),
+    ("mfa_accounts", "manage_locked_until",
+     "ALTER TABLE mfa_accounts ADD COLUMN manage_locked_until INTEGER NOT NULL DEFAULT 0"),
+)
 
 
-def _migrate_job_warning(engine: Engine) -> None:
-    """Add the non-fatal job warning column to databases created by older releases."""
-    inspector = inspect(engine)
-    if not inspector.has_table("jobs"):
-        return
-    if "warning" in {column["name"] for column in inspector.get_columns("jobs")}:
-        return
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE jobs ADD COLUMN warning TEXT"))
-    except SQLAlchemyError:
-        # Another startup worker may have completed the same migration.
-        refreshed = {column["name"] for column in inspect(engine).get_columns("jobs")}
-        if "warning" not in refreshed:
-            raise
-
-
-MFA_MANAGEMENT_BUDGET_COLUMNS = {
-    "manage_failures": "ALTER TABLE mfa_accounts ADD COLUMN manage_failures INTEGER NOT NULL DEFAULT 0",
-    "manage_locked_until": "ALTER TABLE mfa_accounts ADD COLUMN manage_locked_until INTEGER NOT NULL DEFAULT 0",
-}
-
-
-def _migrate_mfa_management_budget(engine: Engine) -> None:
-    """Add the separate MFA-management failure budget to older databases."""
-    inspector = inspect(engine)
-    if not inspector.has_table("mfa_accounts"):
-        return
-    existing = {column["name"] for column in inspector.get_columns("mfa_accounts")}
-    for name, statement in MFA_MANAGEMENT_BUDGET_COLUMNS.items():
-        if name in existing:
-            continue
-        try:
-            with engine.begin() as connection:
-                connection.execute(text(statement))
-        except SQLAlchemyError:
-            # Another startup worker may have completed the same migration.
-            refreshed = {column["name"] for column in inspect(engine).get_columns("mfa_accounts")}
-            if name not in refreshed:
-                raise
+def _migrate_added_columns(engine: Engine) -> None:
+    for table, column, statement in ADDED_COLUMNS:
+        _add_column_if_missing(engine, table, column, statement)
 
 
 def retry_database_race(operation: Callable[[], T], attempts: int = 8) -> T:
@@ -478,9 +457,7 @@ def initialize_database(
     """
     retry_database_race(lambda: _migrate_legacy_sqlite(engine))
     retry_database_race(lambda: metadata.create_all(engine))
-    retry_database_race(lambda: _migrate_user_theme(engine))
-    retry_database_race(lambda: _migrate_job_warning(engine))
-    retry_database_race(lambda: _migrate_mfa_management_budget(engine))
+    retry_database_race(lambda: _migrate_added_columns(engine))
     retry_database_race(lambda: _seed_and_recover(engine, defaults, timestamp, recover_jobs))
 
 

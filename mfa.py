@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import re
 import secrets
 
@@ -19,10 +20,22 @@ from flask_jwt_extended import (
     get_jwt, get_jwt_identity, get_jwt_request_location, jwt_required, set_access_cookies,
 )
 from sqlalchemy import delete, insert, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from database import connection, mfa_accounts, mfa_challenges, transaction, users
 from i18n import translate as tr
-from email_delivery import EmailDeliveryError, email_available, send_email
+from email_delivery import EmailDeliveryError, email_available, is_valid_address, send_email
+
+
+LOGGER = logging.getLogger(__name__)
+# Other accounts' expired challenges are removed outside request transactions,
+# at most this often per process, in small primary-key batches.
+PURGE_INTERVAL_SECONDS = 300
+PURGE_BATCH_SIZE = 500
+
+
+class UnreadableSecret(Exception):
+    """The stored TOTP secret cannot be decrypted with the configured keys."""
 
 
 def send_email_code(address, code):
@@ -48,6 +61,8 @@ class MFA:
         self.public_user = public_user
         self.clock = clock
         self.stable_keys = stable_keys
+        self.next_purge = 0
+        self.warned_unreadable = False
         # A challenge JWT can never validate as an application access JWT.
         self.key = hmac.digest(signing_secret.encode(), b"subtitle-mfa-v1", "sha256")
         routes = [
@@ -119,7 +134,7 @@ class MFA:
             return self.error(tr("Too many verification attempts; try again later"), 429, remaining)
         return None
 
-    def failed(self, db, account, scope="login", message=None):
+    def failed(self, db, account, scope="login", message=None, status=400):
         # Keep this update committed even though the request returns an error.
         failures_column, lock_column, purposes = self.BUDGETS[scope]
         failures = getattr(account, failures_column) + 1
@@ -131,7 +146,15 @@ class MFA:
             db.execute(delete(mfa_challenges).where(
                 mfa_challenges.c.user_id == account.user_id, mfa_challenges.c.purpose.in_(purposes),
             ))
-        return self.error(message, status=400)
+        return self.error(message, status=status)
+
+    def unreadable_factor(self, db, account, scope):
+        # An unreadable secret cannot prove a code, but the attempt still spends
+        # the failure budget so recovery-code guessing stays rate limited.
+        return self.failed(db, account, scope, tr(
+            "Your authenticator secret cannot be read. Use a recovery code "
+            "and ask an administrator to restore the encryption key.",
+        ), 503)
 
     def reset_failures(self, db, user_id, scope):
         failures_column, lock_column, _ = self.BUDGETS[scope]
@@ -190,22 +213,59 @@ class MFA:
         }, self.key, algorithm="HS256")
         return {"challenge_token": token, "method": method, "expires_in": expires - timestamp}
 
-    def create_challenge(self, db, user, purpose, method, *, email="", secret="", transport="cookies"):
+    def create_challenge(self, db, user, purpose, method, *, email="", secret="",
+                         transport="cookies", send=True):
+        """Replace the account's ``purpose`` challenge; return ``(result, code)``.
+
+        An email challenge stores a code hash only when its code will be sent, so
+        a stored hash means the owner may hold the code (see ``reissue_login_challenge``).
+        """
         timestamp = self.timestamp()
         challenge_id = secrets.token_hex(32)
-        code = f"{secrets.randbelow(1000000):06d}" if method == "email" else ""
+        code = f"{secrets.randbelow(1000000):06d}" if method == "email" and send else ""
         expires = timestamp + (600 if purpose == "enroll" and method == "totp" else 300)
-        db.execute(delete(mfa_challenges).where(mfa_challenges.c.expires <= timestamp))
+        # Touch only this account's rows while its user row is locked. A range
+        # delete across all accounts takes gap locks on MySQL/MariaDB that the
+        # user-row lock does not order (deadlocks), and serializes unrelated users
+        # elsewhere; other accounts' expired rows go in purge_expired_challenges.
         # Only the newest challenge of each purpose is usable for an account.
         db.execute(delete(mfa_challenges).where(
-            mfa_challenges.c.user_id == user.id, mfa_challenges.c.purpose == purpose,
+            mfa_challenges.c.user_id == user.id,
+            (mfa_challenges.c.purpose == purpose) | (mfa_challenges.c.expires <= timestamp),
         ))
         db.execute(insert(mfa_challenges).values(
             id=challenge_id, user_id=user.id, version=user.token_version, purpose=purpose,
             method=method, email=email, secret=secret, expires=expires, transport=transport,
             code_hash=self.digest_code(challenge_id, code) if code else "",
         ))
-        return self.encode_challenge(user, challenge_id, purpose, method, timestamp, expires, transport), code
+        result = self.encode_challenge(user, challenge_id, purpose, method, timestamp, expires, transport)
+        # Internal only: deliver() pops it before responding.
+        result["challenge_id"] = challenge_id
+        return result, code
+
+    def purge_expired_challenges(self):
+        """Best-effort removal of every account's expired challenges.
+
+        Runs in its own short transaction after the request transaction has
+        committed. Expired rows are read without locks and deleted by primary key,
+        so no range (gap) locks block other accounts' challenge inserts. Expired
+        rows are already unusable, so a skipped or failed purge is harmless.
+        """
+        timestamp = self.timestamp()
+        if timestamp < self.next_purge:
+            return
+        self.next_purge = timestamp + PURGE_INTERVAL_SECONDS
+        try:
+            with transaction(self.engine) as db:
+                expired = db.execute(select(mfa_challenges.c.id).where(
+                    mfa_challenges.c.expires <= timestamp,
+                ).limit(PURGE_BATCH_SIZE)).scalars().all()
+                if expired:
+                    db.execute(delete(mfa_challenges).where(
+                        mfa_challenges.c.id.in_(expired), mfa_challenges.c.expires <= timestamp,
+                    ))
+        except SQLAlchemyError:
+            LOGGER.debug("Expired MFA challenge cleanup was skipped", exc_info=True)
 
     def reissue_login_challenge(self, db, user, transport):
         """Return a token for the current email login challenge without replacing its code.
@@ -231,6 +291,8 @@ class MFA:
         return transport if transport in ("cookies", "header") else fallback
 
     def deliver(self, result, email, code):
+        """Send a challenge's code; called after the request transaction commits."""
+        challenge_id = result.pop("challenge_id", None)
         if code:
             try:
                 send_email_code(email, code)
@@ -239,7 +301,22 @@ class MFA:
                 # Delivery errors are sanitized; keep provider responses and codes private.
                 result["email_sent"] = False
                 result["warning"] = tr("Email could not be sent. Retry later or use a recovery code.")
+                self.forget_unsent_code(challenge_id, code)
+        self.purge_expired_challenges()
         return jsonify(result)
+
+    def forget_unsent_code(self, challenge_id, code):
+        # The client was told the email was not sent, so a later sign-in during
+        # the cooldown must not claim that a code was delivered. The hash
+        # condition leaves any newer challenge or code untouched.
+        try:
+            with transaction(self.engine) as db:
+                db.execute(update(mfa_challenges).where(
+                    mfa_challenges.c.id == challenge_id,
+                    mfa_challenges.c.code_hash == self.digest_code(challenge_id, code),
+                ).values(code_hash=""))
+        except SQLAlchemyError:
+            LOGGER.warning("Could not clear an undelivered MFA email code", exc_info=True)
 
     def begin_login(self, original_user, payload):
         transport = "header" if payload.get("token_transport") == "header" else "cookies"
@@ -273,9 +350,9 @@ class MFA:
                     ) if has_code else unsent_warning)
             if result is None:
                 result, code = self.create_challenge(db, user, "login", account.method,
-                                                     email=account.email, transport=transport)
+                                                     email=account.email, transport=transport,
+                                                     send=send)
                 if account.method == "email" and not send:
-                    code = ""
                     result.update(email_sent=False, warning=unsent_warning)
             result["mfa_required"] = True
         return self.deliver(result, account.email, code)
@@ -303,10 +380,22 @@ class MFA:
             mfa_challenges.c.expires > self.timestamp(),
         )).first()
 
-    def totp_step(self, secret, code, last_step=-1):
+    def totp_step(self, secret, code, last_step=-1, *, user_id=""):
         if not re.fullmatch(r"[0-9]{6}", code):
             return None
-        totp = pyotp.TOTP(self.decrypt(secret))
+        try:
+            plain = self.decrypt(secret)
+        except RuntimeError:
+            # For example JWT_SECRET_KEY was rotated without API_KEY_ENCRYPTION_KEY.
+            if not self.warned_unreadable:
+                self.warned_unreadable = True
+                LOGGER.error(
+                    "A stored MFA authenticator secret (user %s) cannot be decrypted; restore "
+                    "the JWT_SECRET_KEY or API_KEY_ENCRYPTION_KEY it was saved with. Affected "
+                    "users can sign in only with recovery codes.", user_id,
+                )
+            raise UnreadableSecret from None
+        totp = pyotp.TOTP(plain)
         current = self.timestamp() // 30
         for step in (current, current - 1, current + 1):
             if step > last_step and hmac.compare_digest(totp.at(step * 30), code):
@@ -324,7 +413,7 @@ class MFA:
             self.change_account(db, account.user_id, recovery_hashes=json.dumps(hashes))
             return True
         if account.method == "totp":
-            step = self.totp_step(account.secret, code, account.last_step)
+            step = self.totp_step(account.secret, code, account.last_step, user_id=account.user_id)
             if step is not None:
                 self.change_account(db, account.user_id, last_step=step)
                 return True
@@ -345,7 +434,11 @@ class MFA:
             challenge = self.challenge_row(db, claims)
             if challenge is None or not account.method:
                 return self.error()
-            if not self.check_factor(db, account, payload.get("code"), challenge):
+            try:
+                valid = self.check_factor(db, account, payload.get("code"), challenge)
+            except UnreadableSecret:
+                return self.unreadable_factor(db, account, "login")
+            if not valid:
                 return self.failed(db, account)
             db.execute(delete(mfa_challenges).where(mfa_challenges.c.id == challenge.id))
             self.reset_failures(db, user.id, "login")
@@ -362,9 +455,7 @@ class MFA:
         if method == "email":
             if not email_available():
                 return self.error(tr("Email verification is unavailable; ask an administrator to configure email delivery"), 503)
-            if not isinstance(email, str) or len(email) > 254 or not re.fullmatch(
-                r"[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}", email,
-            ) or len(email.partition("@")[0]) > 64:
+            if not is_valid_address(email):
                 return self.error(tr("Enter a valid email address"))
         else:
             email = ""
@@ -427,7 +518,10 @@ class MFA:
             if isinstance(code, str) and len(code) <= 64:
                 code = code.strip()
                 if challenge.method == "totp":
-                    step = self.totp_step(challenge.secret, code)
+                    try:
+                        step = self.totp_step(challenge.secret, code, user_id=user.id)
+                    except UnreadableSecret:
+                        return self.unreadable_factor(db, account, "manage")
                     valid = step is not None
                 else:
                     valid = hmac.compare_digest(self.digest_code(challenge.id, code), challenge.code_hash)
@@ -471,7 +565,11 @@ class MFA:
             challenge = None
             if claims and claims["sub"] == user.id and claims["ver"] == user.token_version:
                 challenge = self.challenge_row(db, claims)
-            if not self.check_factor(db, account, payload.get("code"), challenge):
+            try:
+                valid = self.check_factor(db, account, payload.get("code"), challenge)
+            except UnreadableSecret:
+                return self.unreadable_factor(db, account, "manage")
+            if not valid:
                 return self.failed(db, account, "manage")
             self.reset_failures(db, user.id, "manage")
             if regenerate:

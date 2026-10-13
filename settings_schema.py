@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+from captcha import normalize_hostname
 from i18n import translate as tr
 
 
@@ -92,7 +93,7 @@ def validate_choice_and_flag_settings(
         if key in payload and str(payload[key]).strip() not in {"0", "1"}:
             return tr("{key} must be enabled or disabled", key=key)
     if "captcha_hostname" in payload:
-        hostname = str(payload["captcha_hostname"]).strip().lower().rstrip(".")
+        hostname = normalize_hostname(str(payload["captcha_hostname"]))
         if hostname and not _HOSTNAME_PATTERN.fullmatch(hostname):
             return tr("CAPTCHA hostname must be a hostname without a scheme or port")
         payload["captcha_hostname"] = hostname
@@ -104,29 +105,29 @@ def validate_numeric_settings(payload: dict[str, Any]) -> str | None:
 
     Each rule checks the exact stripped text that will be stored, so the worker's
     later ``int()``/``float()`` conversion of that text is guaranteed to succeed.
+    The caller validates value types first (``validate_choice_and_flag_settings``);
+    a non-scalar reaching this function still fails conversion and is rejected.
     """
-    error = validate_setting_types(
-        {key: value for key, value in payload.items()
-         if key in NUMBER_SETTINGS or key in INTEGER_SETTINGS}
-    )
-    if error:
-        return error
-    try:
-        for key, (minimum, maximum) in NUMBER_SETTINGS.items():
-            if key in payload and not minimum <= float(str(payload[key]).strip()) <= maximum:
-                return tr(
-                    "{key} must be between {minimum} and {maximum}",
-                    key=key, minimum=minimum, maximum=maximum,
-                )
-    except (TypeError, ValueError) as exc:
-        return str(exc)
+    for key, (minimum, maximum) in NUMBER_SETTINGS.items():
+        if key not in payload:
+            continue
+        try:
+            value = float(str(payload[key]).strip())
+        except ValueError:
+            value = None
+        # NaN fails both comparisons, so it is rejected with the bounds message too.
+        if value is None or not minimum <= value <= maximum:
+            return tr(
+                "{key} must be between {minimum} and {maximum}",
+                key=key, minimum=minimum, maximum=maximum,
+            )
     for key, (minimum, maximum) in INTEGER_SETTINGS.items():
         if key not in payload:
             continue
         text = str(payload[key]).strip()
         try:
             value = int(text)
-        except (TypeError, ValueError):
+        except ValueError:
             value = None
         if value is None or str(value) != text or not minimum <= value <= maximum:
             return tr(

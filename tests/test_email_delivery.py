@@ -209,11 +209,11 @@ def test_resend_wire_payload_and_redirect_policy(monkeypatch):
 @pytest.mark.parametrize("provider,body,status", [
     ("resend", b'{"id":"ok", "error":"secret"}', 200),
     ("resend", b'{"message":"secret"}', 200), ("resend", b'[]', 200),
-    ("resend", b'not json: private', 200), ("resend", b'{"id":"ok"}', 429),
+    ("resend", b'not json: private', 200),
     ("resend", b'x' * (mail.MAX_RESPONSE_BYTES + 1), 200),
     ("aliyun", b'{"Code":"InvalidKey", "Message":"secret"}', 200),
     ("aliyun", b'{"RequestId":"ok"}', 200),
-], ids=["resend-error", "missing-id", "array", "invalid-json", "http-error", "oversized", "aliyun-error", "missing-env-id"])
+], ids=["resend-error", "missing-id", "array", "invalid-json", "oversized", "aliyun-error", "missing-env-id"])
 def test_provider_rejection_and_malformed_responses_are_sanitized(monkeypatch, provider, body, status):
     configure(monkeypatch, provider)
     _, opener, _ = capture_http(monkeypatch, body, status)
@@ -223,9 +223,11 @@ def test_provider_rejection_and_malformed_responses_are_sanitized(monkeypatch, p
     assert opener.open.call_count == 1
 
 
+# The real opener raises HTTPError for every non-2xx status (see test_modules_audit).
 @pytest.mark.parametrize("error", [TimeoutError("private code"), HTTPError(
     "https://api.resend.com/emails", 403, "private key", {}, io.BytesIO(b"secret")),
-])
+    HTTPError("https://api.resend.com/emails", 429, "slow down", {}, io.BytesIO(b"secret")),
+], ids=["timeout", "http-403", "http-429"])
 def test_network_errors_are_sanitized_without_retry(monkeypatch, error):
     configure(monkeypatch)
     _, opener, _ = capture_http(monkeypatch)

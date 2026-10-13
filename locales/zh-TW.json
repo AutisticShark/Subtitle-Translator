@@ -309,6 +309,7 @@
     "Email address": "電子郵件地址",
     "Email could not be sent. Retry later or use a recovery code.": "無法寄送郵件。請稍後重試或使用復原碼。",
     "A verification code was requested recently. Enter the latest code you received or use a recovery code.": "最近已索取過驗證碼。請輸入您收到的最新驗證碼，或使用復原碼。",
+    "Your authenticator secret cannot be read. Use a recovery code and ask an administrator to restore the encryption key.": "無法讀取您的驗證器密鑰。請使用復原碼，並請管理員還原加密金鑰。",
     "Email verification code": "電子郵件驗證碼",
     "Email verification is unavailable; ask an administrator to configure email delivery": "電子郵件驗證尚未開放，請管理員設定郵件傳送服務",
     "Enter a new code from your authenticator app, or a recovery code.": "請輸入驗證器應用程式產生的新驗證碼，或輸入復原碼。",
