@@ -982,7 +982,7 @@ def run_job(job_id: str) -> None:
             translated = translate_segments(
                 segments, provider, language, options["source_language"],
                 int(options["batch_size"]), 4, 10, throttle, cache,
-                int(options["workers"]), True, report_progress, stop_requested,
+                int(options["workers"]), report_progress, stop_requested,
                 count_untranslated,
             )
             check_canceled()

@@ -10,7 +10,7 @@ def translate_echo(document, language="zh-TW"):
         segments.extend(segment_cue(cue, cue_i))
     output = translate_segments(
         segments, make_echo(), language, "English", 20, 1, 1,
-        Throttle(), {}, 1, True,
+        Throttle(), {}, 1,
     )
     cues = rebuild_cues(document.cues, segments, output, language, 40, 2)
     return document.clone_with_cues(cues).render()
@@ -23,7 +23,7 @@ class SubtitleFormatTests(unittest.TestCase):
 
         output = translate_segments(
             segments, make_echo(), "zh-TW", "English", 1, 1, 1,
-            Throttle(), {}, 2, True, lambda done, total: updates.append((done, total)),
+            Throttle(), {}, 2, lambda done, total: updates.append((done, total)),
         )
 
         self.assertEqual(updates, [(0, 4), (1, 4), (2, 4), (3, 4), (4, 4)])

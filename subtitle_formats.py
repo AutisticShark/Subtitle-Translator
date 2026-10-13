@@ -92,9 +92,10 @@ def _render_srt(doc: SubtitleDocument) -> str:
     return doc.newline.join(out)
 
 
+# WebVTT hours have two or more digits; a single digit is tolerated as well.
 VTT_TIMING_RE = re.compile(
-    r"(?P<start>(?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
-    r"(?P<end>(?:\d{1,2}:)?\d{2}:\d{2}[.,]\d{3})(?P<rest>.*)"
+    r"(?P<start>(?:\d+:)?\d{2}:\d{2}[.,]\d{3})\s*-->\s*"
+    r"(?P<end>(?:\d+:)?\d{2}:\d{2}[.,]\d{3})(?P<rest>.*)"
 )
 
 
@@ -130,8 +131,10 @@ def _parse_vtt(text: str, newline: str, bom: bool) -> SubtitleDocument:
         match = VTT_TIMING_RE.fullmatch(block[timing_i].strip())
         assert match is not None
         cue_index = len(cues)
+        # The "vtt" dialect decodes character references (`&amp;`) for
+        # translation and re-escapes &, < and > in the translated text.
         cues.append(Cue(cue_index + 1, match.group("start"), match.group("end"),
-                        match.group("rest"), block[timing_i + 1 :]))
+                        match.group("rest"), block[timing_i + 1 :], dialect="vtt"))
         blocks.append({
             "kind": "cue",
             "cue": cue_index,

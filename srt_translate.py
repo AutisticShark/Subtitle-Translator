@@ -4,13 +4,14 @@ segmentation, provider clients, batched translation, cue rebuilding, and wrappin
 
 Design notes
 ------------
-* Cues are sent in batches with surrounding context so the model can resolve
-  pronouns and continuation lines across cue boundaries.
+* Consecutive segments are sent together as one numbered batch, so the model
+  sees neighbouring lines and can carry sentence fragments across cues.
 * Inline markup (<i>, <b>, <font ...>, {\\an8}, ASS overrides) is masked with
   sentinels before translation and restored after, so it can't be "helpfully"
   reworded away.
-* Translations are cached by content hash so interrupted jobs resume without
-  repeating completed batches.
+* Translations are stored by content hash in a caller-supplied in-memory dict;
+  a later call with the same dict and target reuses them instead of sending
+  those segments again. Nothing is persisted, and jobs never resume.
 """
 
 from __future__ import annotations
@@ -21,9 +22,9 @@ import hashlib
 import html
 import http.client
 import json
+import math
 import random
 import re
-import sys
 import threading
 import time
 import unicodedata
@@ -80,9 +81,12 @@ TIMING_RE = re.compile(
 
 # <i> <b> <u> <font ...> </...>, WebVTT karaoke timestamps <00:00:01.000>,
 # ASS overrides {\an8}, and {y:i} legacy tags
-TAG_RE = re.compile(
-    r"(</?[a-zA-Z][^>]*>|<(?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3}>|\{[^}]*\})"
-)
+_TAG_ALT = r"</?[a-zA-Z][^>]*>|<(?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3}>|\{[^}]*\}"
+TAG_RE = re.compile(f"({_TAG_ALT})")
+
+# An index line is ASCII digits only: str.isdigit() also accepts "①" and "²",
+# which int() then rejects.
+_INDEX_RE = re.compile(r"[0-9]+")
 
 
 @dataclass
@@ -94,11 +98,8 @@ class Cue:
     lines: list[str]
     # Markup dialect of the text. "ass" additionally masks the \h hard space
     # and \n soft break escapes, which are plain text in the other formats.
+    # "vtt" text escapes &, < and > as character references.
     dialect: str = ""
-
-    @property
-    def text(self) -> str:
-        return "\n".join(self.lines)
 
 
 def parse_srt(raw: str) -> list[Cue]:
@@ -117,7 +118,7 @@ def parse_srt(raw: str) -> list[Cue]:
         return bool(
             TIMING_RE.search(lines[j])
             or (
-                lines[j].strip().isdigit()
+                _INDEX_RE.fullmatch(lines[j].strip())
                 and j + 1 < n
                 and TIMING_RE.search(lines[j + 1])
             )
@@ -132,7 +133,8 @@ def parse_srt(raw: str) -> list[Cue]:
 
         # Optional numeric index line
         index = None
-        if lines[i].strip().isdigit() and i + 1 < n and TIMING_RE.search(lines[i + 1]):
+        if _INDEX_RE.fullmatch(lines[i].strip()) and i + 1 < n \
+                and TIMING_RE.search(lines[i + 1]):
             index = int(lines[i].strip())
             i += 1
 
@@ -197,15 +199,17 @@ SENTINEL_RE = re.compile(r"\u27e6\s*(\d+)\s*\u27e7")
 _PH_BASE = 0xF0000
 _PH_CLASS = "\U000f0000-\U000ffffd"
 _PH_RE = re.compile(f"[{_PH_CLASS}]")
+_PH_SPLIT_RE = re.compile(f"([{_PH_CLASS}])")
 _LEAD_PH_RE = re.compile(f"^[\\s{_PH_CLASS}]*")
 
 # Characters that must never reach a provider as text: the sentinel brackets
 # themselves and the internal placeholder range. They are masked as tags so
 # they round-trip byte-for-byte instead of being mistaken for placeholders.
 _RESERVED = f"[\u27e6\u27e7{_PH_CLASS}]"
-_MASK_RE = re.compile(TAG_RE.pattern[:-1] + "|" + _RESERVED + ")")
+_RESERVED_RE = re.compile(f"({_RESERVED})")
+_MASK_RE = re.compile(f"{_TAG_ALT}|{_RESERVED}")
 # ASS additionally has the \h (hard space) and \n (soft line break) escapes.
-_MASK_ASS_RE = re.compile(TAG_RE.pattern[:-1] + r"|\\[hn]|" + _RESERVED + ")")
+_MASK_ASS_RE = re.compile(rf"{_TAG_ALT}|\\[hn]|{_RESERVED}")
 _DRAWING_RE = re.compile(r"\\p(\d+)")
 
 
@@ -217,17 +221,21 @@ class Segment:
     text: str          # masked, tags replaced by sentinels
     tags: list[str]    # sentinel payloads, in order
     dashed: bool
-    trailing_ws: str = ""
     # The dash followed leading tags (`<i>- Hi`) rather than preceding them.
     dash_inside: bool = False
 
 
-def mask_tags(s: str, ass: bool = False) -> tuple[str, list[str]]:
+def mask_tags(s: str, ass: bool = False,
+              entities: bool = False) -> tuple[str, list[str]]:
     """Replace markup with numbered sentinels.
 
     ASS vector drawings (the text after a ``\\p1`` override, up to and
     including the ``\\p0`` override that ends it) are folded into one
     placeholder: drawing commands are neither translatable nor wrappable.
+
+    ``entities`` decodes character references (WebVTT ``&amp;``) in the text
+    between tags, so the provider sees ``&`` rather than markup. Decoding
+    happens after tags are found, so ``&lt;i&gt;`` stays literal text.
     """
     pattern = _MASK_ASS_RE if ass else _MASK_RE
     pieces: list[list] = []  # [is_tag, text]
@@ -252,6 +260,18 @@ def mask_tags(s: str, ass: bool = False) -> tuple[str, list[str]]:
             if modes:
                 drawing = int(modes[-1]) > 0
         pos = m.end()
+
+    if entities:
+        # A reference may decode to a reserved character (`&#x27e6;`); mask
+        # it like a literal one. Odd split parts are those characters.
+        pieces = [
+            [is_tag or bool(k % 2), part]
+            for is_tag, text in pieces
+            for k, part in enumerate(
+                [text] if is_tag else _RESERVED_RE.split(html.unescape(text))
+            )
+            if part
+        ]
 
     tags: list[str] = []
     out: list[str] = []
@@ -290,7 +310,11 @@ def placeholders_match(source: str, translated: str) -> bool:
 
 def needs_translation(seg: Segment) -> bool:
     """Segments with no text besides markup are passed through unchanged."""
-    return bool(SENTINEL_RE.sub("", seg.text).strip())
+    return _has_text(seg.text)
+
+
+def _has_text(s: str) -> bool:
+    return bool(SENTINEL_RE.sub("", s).strip())
 
 
 def _split_dash(line: str, ass: bool) -> tuple[bool, bool, str]:
@@ -306,12 +330,18 @@ def _split_dash(line: str, ass: bool) -> tuple[bool, bool, str]:
 
 def segment_cue(cue: Cue, cue_i: int) -> list[Segment]:
     ass = cue.dialect == "ass"
+    vtt = cue.dialect == "vtt"
     stripped = [line.strip() for line in cue.lines if line.strip()]
+    # Dash detection works on the raw lines; entities are decoded only by the
+    # final masking below, so `&amp;lt;` is never decoded twice.
     parsed = [_split_dash(line, ass) for line in stripped]
 
     # Two or more dashed lines => speaker pair; keep the speakers distinct.
-    # An undashed line continues the preceding speaker's sentence.
-    if sum(1 for dashed, _inside, _body in parsed if dashed) >= 2:
+    # An undashed line continues the preceding speaker's sentence. So is an
+    # undashed line answered by a dashed one (`Where to?` / `-The store.`):
+    # the first speaker's dash is often omitted.
+    single_dash_pair = len(parsed) == 2 and not parsed[0][0] and parsed[1][0]
+    if single_dash_pair or sum(1 for dashed, _inside, _body in parsed if dashed) >= 2:
         groups: list[tuple[bool, bool, list[str]]] = []
         for dashed, inside, body in parsed:
             if dashed or not groups:
@@ -320,13 +350,13 @@ def segment_cue(cue: Cue, cue_i: int) -> list[Segment]:
                 groups[-1][2].append(body.strip())
         segs = []
         for dashed, inside, bodies in groups:
-            masked, tags = mask_tags(" ".join(bodies), ass)
+            masked, tags = mask_tags(" ".join(bodies), ass, entities=vtt)
             segs.append(Segment(cue_i, masked, tags, dashed=dashed, dash_inside=inside))
         return segs
 
     # Otherwise the cue is one sentence fragment possibly wrapped over lines.
     dashed, inside, joined = _split_dash(" ".join(stripped), ass)
-    masked, tags = mask_tags(joined.strip(), ass)
+    masked, tags = mask_tags(joined.strip(), ass, entities=vtt)
     return [Segment(cue_i, masked, tags, dashed=dashed, dash_inside=inside)]
 
 
@@ -343,20 +373,22 @@ def display_width(s: str) -> float:
     """Full-width chars count 1, half-width count 0.5, so the limit is
     expressed in 'full-width equivalents'. Internal tag placeholders are
     zero-width."""
-    w = 0.0
-    for ch in s:
-        if _is_placeholder(ch):
-            continue
-        w += 1.0 if unicodedata.east_asian_width(ch) in ("W", "F") else 0.5
-    return w
+    return _cells(s) / 2
 
 
 def _is_placeholder(ch: str) -> bool:
     return _PH_BASE <= ord(ch) <= 0xFFFFD
 
 
-def _visible_len(s: str) -> int:
-    return sum(1 for ch in s if not _is_placeholder(ch))
+def _cells(s: str) -> int:
+    """Width in half-width cells: full-width and wide characters (CJK,
+    Hangul) take two, tag placeholders none, everything else one."""
+    return sum(
+        0 if _is_placeholder(ch)
+        else 2 if unicodedata.east_asian_width(ch) in ("W", "F")
+        else 1
+        for ch in s
+    )
 
 
 def wrap_cjk(s: str, limit: float, max_lines: int = 2) -> list[str]:
@@ -412,7 +444,7 @@ def _latin_words(s: str) -> list[str]:
     words: list[str] = []
     pending = ""
     for w in s.split():
-        if not _visible_len(w):
+        if not _cells(w):
             pending = f"{pending} {w}" if pending else w
             continue
         words.append(f"{pending} {w}" if pending else w)
@@ -426,9 +458,11 @@ def _latin_words(s: str) -> list[str]:
 
 
 def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
+    """Wrap at spaces. ``limit`` is in half-width cells, so space-separated
+    scripts with wide characters (Korean Hangul) get half as many per line."""
     words, lines, cur = _latin_words(s), [], ""
     for w in words:
-        if cur and _visible_len(cur) + 1 + _visible_len(w) > limit:
+        if cur and _cells(cur) + 1 + _cells(w) > limit:
             lines.append(cur)
             cur = w
         else:
@@ -449,10 +483,10 @@ def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
     balanced: list[str] = []
     while remaining and len(balanced) < max_lines - 1:
         slots = max_lines - len(balanced)
-        remaining_width = sum(_visible_len(word) for word in remaining) + len(remaining) - 1
+        remaining_width = sum(_cells(word) for word in remaining) + len(remaining) - 1
         target = (remaining_width + slots - 1) // slots
         current = remaining.pop(0)
-        while remaining and _visible_len(current) + 1 + _visible_len(remaining[0]) <= target:
+        while remaining and _cells(current) + 1 + _cells(remaining[0]) <= target:
             current += " " + remaining.pop(0)
         balanced.append(current)
     if remaining:
@@ -522,13 +556,23 @@ class Throttle:
             return self._blocked_until - now
 
 
+# Longest server-requested pause worth waiting out. A longer one (a daily
+# quota, say) ends the run with the final RateLimitError instead.
+MAX_RATE_LIMIT_WAIT = 300.0
+
+
+def _seconds(value: float) -> float | None:
+    """Clamp a parsed delay to >= 0; reject `inf` and `nan` as malformed."""
+    return max(0.0, value) if math.isfinite(value) else None
+
+
 def _parse_retry_after(value: str | None) -> float | None:
     """`retry-after` is either delta-seconds or an HTTP date."""
     if not value:
         return None
     value = value.strip()
     try:
-        return max(0.0, float(value))
+        return _seconds(float(value))
     except ValueError:
         pass
     try:
@@ -560,7 +604,8 @@ def _parse_rate_limit_reset(value: str | None) -> float | None:
         return after
     value = value.strip()
     if _GO_DURATION_RE.fullmatch(value):
-        return max(0.0, sum(float(amount) * _GO_UNITS[unit]
+        # A long enough digit run overflows float() to `inf`.
+        return _seconds(sum(float(amount) * _GO_UNITS[unit]
                             for amount, unit in _GO_DURATION_PART_RE.findall(value)))
     iso = value[:-1] + "+00:00" if value[-1:] in ("Z", "z") else value
     try:
@@ -678,10 +723,15 @@ def make_anthropic(model: str, api_key: str,
             },
             throttle=throttle,
         )
-        out = "".join(
-            b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"
-        )
-        return parse_numbered(out, len(texts))
+        # `content` can be null, and a text block's `text` too; both must
+        # become a retryable error rather than a TypeError (AGENTS.md rule 24).
+        content = resp.get("content")
+        if not isinstance(content, list) or not all(isinstance(b, dict) for b in content):
+            raise TranslationError("Anthropic API returned an unexpected response")
+        parts = [b.get("text") for b in content if b.get("type") == "text"]
+        if not all(isinstance(part, str) for part in parts):
+            raise TranslationError("Anthropic API returned an unexpected response")
+        return parse_numbered("".join(parts), len(texts))
 
     return call
 
@@ -721,6 +771,9 @@ def make_openai(model: str, api_key: str, throttle: Throttle,
             out = resp["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise TranslationError("OpenAI-compatible API returned an unexpected response") from exc
+        # A refusal has `content: null`; some servers return a list of parts.
+        if not isinstance(out, str):
+            raise TranslationError("OpenAI-compatible API returned no text content")
         return parse_numbered(out, len(texts))
 
     return call
@@ -876,11 +929,16 @@ def parse_numbered(out: str, expected: int) -> list[str]:
 # Batch driver
 # --------------------------------------------------------------------------- #
 
+def _cache_key(tgt_key: str, text: str) -> str:
+    return hashlib.sha256(f"{tgt_key}\u0000{text}".encode()).hexdigest()[:24]
+
+
 def _validate_output(texts: list[str], output: object) -> None:
     """Reject provider output that can't be mapped back onto the input:
-    the wrong number of strings, or translations whose tag placeholders were
-    dropped, duplicated, or invented. Raised as a retryable format error so
-    the retry and per-line fallback path handles it."""
+    the wrong number of strings, an empty translation of a line with text, or
+    translations whose tag placeholders were dropped, duplicated, or invented.
+    Raised as a retryable format error so the retry and per-line fallback path
+    handles it."""
     if not isinstance(output, list) or len(output) != len(texts):
         count = len(output) if isinstance(output, list) else "no"
         raise TranslationError(
@@ -891,10 +949,18 @@ def _validate_output(texts: list[str], output: object) -> None:
             raise TranslationError(
                 f"provider returned a non-text translation for line {position + 1}"
             )
+        if _has_text(source) and not _has_text(translated):
+            raise TranslationError(f"provider returned an empty line {position + 1}")
         if not placeholders_match(source, translated):
             raise TranslationError(
                 f"line {position + 1} lost or altered its markup placeholders"
             )
+
+
+def _retry_delay(attempt: int) -> float:
+    """Backoff before retrying a transient failure, jittered so parallel
+    workers don't retry in lockstep."""
+    return min(2.0 ** attempt, 30.0) + random.uniform(0, 1)
 
 
 def translate_segments(
@@ -908,7 +974,6 @@ def translate_segments(
     throttle: Throttle,
     cache: dict,
     workers: int,
-    quiet: bool,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_callback: Callable[[], bool] | None = None,
     fallback_callback: Callable[[int], None] | None = None,
@@ -919,9 +984,13 @@ def translate_segments(
     that could not be translated and were passed through as source text.
     """
     results: list[str | None] = [None] * len(segs)
+    # Set when the run ends abnormally (fatal error, exhausted rate limit,
+    # cancellation). Executor shutdown only drops batches that haven't
+    # started, so in-flight workers check this before every further request.
+    stopped = threading.Event()
 
     def check_canceled() -> None:
-        if cancel_callback and cancel_callback():
+        if stopped.is_set() or (cancel_callback and cancel_callback()):
             raise TranslationCanceled("Translation canceled")
 
     def interruptible_sleep(seconds: float) -> None:
@@ -941,16 +1010,11 @@ def translate_segments(
             # Empty text or markup only (e.g. an ASS drawing): nothing to send.
             results[i] = s.text
             continue
-        key = hashlib.sha256(f"{tgt_key}\u0000{s.text}".encode()).hexdigest()[:24]
-        hit = cache.get(key)
+        hit = cache.get(_cache_key(tgt_key, s.text))
         if isinstance(hit, str) and placeholders_match(s.text, hit):
             results[i] = hit
         else:
             todo.append(i)
-
-    if not quiet and len(todo) < len(segs):
-        print(f"  cache: {len(segs) - len(todo)}/{len(segs)} segments reused",
-              file=sys.stderr)
 
     batches = [todo[i:i + batch_size] for i in range(0, len(todo), batch_size)]
     done = 0
@@ -985,22 +1049,22 @@ def translate_segments(
                 # Prefer the server's own number; otherwise exponential with
                 # jitter so parallel workers don't resynchronise on retry.
                 delay = e.retry_after
+                # `not <=` also catches NaN. The throttle would otherwise park
+                # every worker for as long as the provider asked, unbounded.
+                if delay is not None and not delay <= MAX_RATE_LIMIT_WAIT:
+                    raise RateLimitError(
+                        f"rate limited for {delay:.0f}s, giving up on {label}", delay,
+                    ) from None
                 if delay is None:
                     delay = min(2.0 ** limited, 60.0)
                 delay += random.uniform(0, min(delay * 0.25, 5.0))
                 waited = throttle.penalise(delay)
-                if not quiet:
-                    print(f"\r  rate limited, all workers pausing "
-                          f"{waited:.0f}s (attempt {limited}/{rate_retries})"
-                          f"{' ' * 12}", file=sys.stderr, flush=True)
                 interruptible_sleep(min(waited, 120.0))
             except TranslationError:
                 soft += 1
                 if soft >= retries:
                     raise
-                interruptible_sleep(
-                    min(2.0 ** soft, 30.0) + random.uniform(0, 1)
-                )
+                interruptible_sleep(_retry_delay(soft))
 
     def run(batch: list[int]) -> tuple[list[int], list[str], set[int]]:
         texts = [segs[i].text for i in batch]
@@ -1010,7 +1074,11 @@ def translate_segments(
             raise
         except RateLimitError:
             raise
-        except TranslationError as last:
+        except TranslationError:
+            if len(texts) == 1:
+                # Retrying one line alone would repeat the request that just
+                # used up its retries; pass the source through instead.
+                return batch, list(texts), {0}
             # Genuine batch failure — usually one malformed line breaking the
             # numbered-output contract. Retry individually so one bad cue can't
             # sink nineteen good ones. Never do this for rate limits: it turns
@@ -1026,9 +1094,6 @@ def translate_segments(
                 except TranslationError:
                     out.append(t)  # last resort: source passes through
                     passed_through.add(position)
-            if not quiet:
-                print(f"\r  batch fell back to per-line ({last}){' ' * 12}",
-                      file=sys.stderr)
             return batch, out, passed_through
 
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
@@ -1047,26 +1112,19 @@ def translate_segments(
                     results[i] = translated
                     if position in passed_through:
                         continue  # never cache untranslated source text
-                    key = hashlib.sha256(
-                        f"{tgt_key}\u0000{segs[i].text}".encode()
-                    ).hexdigest()[:24]
-                    cache[key] = translated
+                    cache[_cache_key(tgt_key, segs[i].text)] = translated
                 if passed_through and fallback_callback:
                     fallback_callback(len(passed_through))
                 done += len(batch)
                 if progress_callback:
                     progress_callback(cached + done, len(segs))
-                if not quiet:
-                    pct = 100 * done / max(len(todo), 1)
-                    print(f"\r  {tgt_key}: {done}/{len(todo)} ({pct:.0f}%)",
-                          end="", file=sys.stderr, flush=True)
         check_canceled()
         completed_normally = True
     finally:
+        if not completed_normally:
+            stopped.set()
         ex.shutdown(wait=completed_normally, cancel_futures=not completed_normally)
 
-    if not quiet and todo:
-        print(file=sys.stderr)
     return [r if r is not None else "" for r in results]
 
 
@@ -1095,12 +1153,18 @@ def _to_wrap_form(t: str, tags: list[str]) -> str:
     return s + "".join(chr(_PH_BASE + k) for k in range(len(tags)) if k not in seen)
 
 
-def _from_wrap_form(s: str, tags: list[str]) -> str:
-    def repl(m: re.Match) -> str:
-        k = ord(m.group(0)) - _PH_BASE
-        return tags[k] if 0 <= k < len(tags) else ""
-
-    return _PH_RE.sub(repl, s)
+def _from_wrap_form(s: str, tags: list[str], escape: bool = False) -> str:
+    """Restore tags from placeholders. ``escape`` re-escapes &, < and > in the
+    text (WebVTT), never inside the restored markup."""
+    out: list[str] = []
+    # Odd split parts are the placeholder characters.
+    for k, part in enumerate(_PH_SPLIT_RE.split(s)):
+        if k % 2:
+            n = ord(part) - _PH_BASE
+            out.append(tags[n] if 0 <= n < len(tags) else "")
+        else:
+            out.append(html.escape(part, quote=False) if escape else part)
+    return "".join(out)
 
 
 def _with_dash(line: str, inside: bool) -> str:
@@ -1133,6 +1197,8 @@ def rebuild_cues(
             new.append(cue)
             continue
 
+        # WebVTT text was decoded for translation; re-escape it on the way out.
+        vtt = cue.dialect == "vtt"
         if len(items) >= 2:
             # Speaker pair: one line each, dash restored.
             lines = []
@@ -1140,7 +1206,7 @@ def rebuild_cues(
                 line = _to_wrap_form(t, s.tags).strip()
                 if s.dashed:
                     line = _with_dash(line, s.dash_inside)
-                lines.append(_from_wrap_form(line, s.tags).strip())
+                lines.append(_from_wrap_form(line, s.tags, vtt).strip())
         else:
             s, t = items[0]
             # Wrap with each tag as an unbreakable zero-width character, so a
@@ -1155,7 +1221,7 @@ def rebuild_cues(
                     else wrap_latin(t, int(width * 2), max_lines))
             if s.dashed and body:
                 body[0] = _with_dash(body[0], s.dash_inside)
-            lines = [_from_wrap_form(line, s.tags) for line in body]
+            lines = [_from_wrap_form(line, s.tags, vtt) for line in body]
 
         new.append(Cue(cue.index, cue.start, cue.end, cue.rest, lines, cue.dialect))
 

@@ -124,7 +124,6 @@ class TranslationDriverTests(unittest.TestCase):
             "throttle": Throttle(),
             "cache": {},
             "workers": 1,
-            "quiet": True,
         }
         options.update(overrides)
         return translate_segments(segments, provider, **options)
@@ -144,9 +143,8 @@ class TranslationDriverTests(unittest.TestCase):
         self.assertEqual(result, ["Hola"])
         self.assertEqual(progress, [(1, 1)])
 
-    @patch("srt_translate.time.sleep")
-    @patch("srt_translate.random.uniform", return_value=0)
-    def test_transient_failure_is_retried(self, _random, _sleep):
+    @patch("srt_translate._retry_delay", return_value=0)
+    def test_transient_failure_is_retried(self, _delay):
         calls = []
 
         def provider(texts, _source, _target):
@@ -191,8 +189,8 @@ class TranslationDriverTests(unittest.TestCase):
         self.assertEqual(reported, [1])
         self.assertEqual(list(cache.values()), ["GOOD"])
 
-    @patch("srt_translate.time.sleep")
-    def test_exhausted_rate_limit_aborts_without_per_line_fallback(self, _sleep):
+    def test_exhausted_rate_limit_aborts_without_per_line_fallback(self):
+        # retry_after=0 makes the single rate-limit retry wait zero seconds.
         calls = []
 
         def provider(texts, _source, _target):

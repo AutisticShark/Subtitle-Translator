@@ -45,7 +45,6 @@ def run_translation(segments, provider, **overrides):
     options = {
         "tgt_key": "es", "src": "English", "batch_size": 20, "retries": 1,
         "rate_retries": 1, "throttle": Throttle(), "cache": {}, "workers": 1,
-        "quiet": True,
     }
     options.update(overrides)
     return translate_segments(segments, provider, **options)
@@ -281,8 +280,10 @@ class SpeakerDashTests(unittest.TestCase):
         self.assertEqual(segments[0].text, "-10 degrees outside")
         rebuilt = rebuild_cues([cue], segments, [segments[0].text], "es", 40, 2)
         self.assertEqual(rebuilt[0].lines, ["-10 degrees outside"])
+        # Undashed line answered by a dashed one: the minus sign stays text.
         speakers = segment_cue(Cue(1, *CUE, ["-10 degrees?", "- Yes."]), 0)
-        self.assertEqual(len(speakers), 1)
+        self.assertEqual([(s.text, s.dashed) for s in speakers],
+                         [("-10 degrees?", False), ("Yes.", True)])
 
 
 class AssDrawingTests(unittest.TestCase):
@@ -379,8 +380,10 @@ class PlaceholderValidationTests(unittest.TestCase):
         self.assertFalse(placeholders_match(source, "⟦0⟧Hola⟦1⟧ ⟦2⟧mundo"))
         self.assertFalse(placeholders_match(source, "⟦0⟧Hola⟦1⟧ ⟦mundo"))
 
-    @patch("srt_translate.time.sleep")
-    def test_dropped_placeholder_is_retried_then_passed_through(self, _sleep):
+    # Patch the backoff, not time.sleep: that is process-wide and would make
+    # the interruptible sleep loop spin and disable other threads' sleeps.
+    @patch("srt_translate._retry_delay", return_value=0)
+    def test_dropped_placeholder_is_retried_then_passed_through(self, _delay):
         calls = []
 
         def provider(texts, _source, _target):
@@ -458,8 +461,8 @@ class ParseNumberedTests(unittest.TestCase):
 
 
 class PerLineFallbackRateLimitTests(unittest.TestCase):
-    @patch("srt_translate.time.sleep")
-    def test_rate_limit_during_per_line_fallback_aborts(self, _sleep):
+    def test_rate_limit_during_per_line_fallback_aborts(self):
+        # One soft attempt and no rate-limit retries: nothing ever sleeps.
         calls = []
 
         def provider(texts, _source, _target):
