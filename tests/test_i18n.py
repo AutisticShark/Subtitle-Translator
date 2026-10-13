@@ -43,17 +43,33 @@ class InternationalizationTests(unittest.TestCase):
         tree = ast.parse("\n".join(
             path.read_text("utf-8") for path in project_root.glob("*.py")
         ))
+        def constants(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return [node.value]
+            if isinstance(node, ast.IfExp):  # tr("A" if condition else "B")
+                return constants(node.body) + constants(node.orelse)
+            return []
+
         for node in ast.walk(tree):
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                    and node.func.id == "tr" and node.args
-                    and isinstance(node.args[0], ast.Constant)
-                    and isinstance(node.args[0].value, str)):
-                source_strings.add(node.args[0].value)
+                    and node.func.id == "tr" and node.args):
+                source_strings.update(constants(node.args[0]))
 
         call_pattern = re.compile(r"\b(?:t|tr)\(\s*(['\"])(.*?)\1", re.DOTALL)
+        # t(condition ? 'A' : 'B') selects between two static keys.
+        ternary_pattern = re.compile(
+            r"\bt\(\s*[^()'\"?]+\?\s*(['\"])(.*?)\1\s*:\s*(['\"])(.*?)\3", re.DOTALL,
+        )
         for relative_path in ("static/app.js", "templates/index.html"):
             text = (project_root / relative_path).read_text("utf-8")
             source_strings.update(match[1] for match in call_pattern.findall(text))
+            for match in ternary_pattern.findall(text):
+                source_strings.update((match[1], match[3]))
+        # Heading pairs that showView translates through a variable.
+        script = (project_root / "static/app.js").read_text("utf-8")
+        labels = re.search(r"const viewLabels = \{(.*?)\n\};", script, re.DOTALL)
+        self.assertIsNotNone(labels)
+        source_strings.update(match[1] for match in re.findall(r"(['\"])(.*?)\1", labels[1]))
 
         for locale, messages in i18n.CATALOGS.items():
             if locale == i18n.DEFAULT_LOCALE:

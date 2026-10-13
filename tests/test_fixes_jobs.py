@@ -403,10 +403,11 @@ def test_concurrent_workers_initialize_a_fresh_database(tmp_path):
     database_path = tmp_path / "fresh.db"
     go = tmp_path / "go"
     script = textwrap.dedent(f"""
-        import sys, time
+        import os, sys, time
         from pathlib import Path
         sys.path.insert(0, {str(PROJECT_ROOT)!r})
         from database import create_database_engine, initialize_database
+        Path({str(tmp_path)!r}, "ready-" + str(os.getpid())).write_text("1")
         go = Path({str(go)!r})
         while not go.exists():
             time.sleep(0.005)
@@ -419,7 +420,11 @@ def test_concurrent_workers_initialize_a_fresh_database(tmp_path):
         subprocess.Popen([sys.executable, "-c", script], stderr=subprocess.PIPE, text=True)
         for _ in range(6)
     ]
-    time.sleep(1.5)  # let every interpreter finish importing SQLAlchemy
+    # Release them together only once every interpreter has imported SQLAlchemy.
+    deadline = time.monotonic() + 60
+    while len(list(tmp_path.glob("ready-*"))) < len(processes):
+        assert time.monotonic() < deadline, "workers did not start"
+        time.sleep(0.01)
     go.write_text("1")
     errors = []
     for process in processes:

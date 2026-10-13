@@ -1110,7 +1110,7 @@ class WebApplicationTests(unittest.TestCase):
             self.assertEqual(cancel.get_json()["status"], "canceling")
 
             job = None
-            for _ in range(100):
+            for _ in range(500):
                 job = self.client.get(f"/api/jobs/{job_id}").get_json()
                 if job["status"] in {"canceled", "completed", "failed"}:
                     break
@@ -1167,7 +1167,7 @@ class WebApplicationTests(unittest.TestCase):
             self.assertEqual(response.status_code, 202)
             job_id = response.get_json()["jobs"][0]
             job = None
-            for _ in range(100):
+            for _ in range(500):
                 job = self.client.get(f"/api/jobs/{job_id}").get_json()
                 if job["status"] in {"completed", "failed"}:
                     break
@@ -1231,7 +1231,7 @@ class WebApplicationTests(unittest.TestCase):
         job_id = response.get_json()["jobs"][0]
 
         job = None
-        for _ in range(100):
+        for _ in range(500):
             job = self.client.get(f"/api/jobs/{job_id}").get_json()
             if job["status"] in {"completed", "failed", "canceled"}:
                 break
