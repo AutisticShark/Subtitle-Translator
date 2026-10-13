@@ -243,6 +243,7 @@
     "Authentication required": "需要登录",
     "Invalid authentication token": "身份验证令牌无效",
     "Authentication token expired": "身份验证令牌已过期",
+    "Your session has ended. Sign in again.": "您的会话已结束，请重新登录。",
     "Authentication token revoked": "身份验证令牌已撤销",
     "Administrator access required": "需要管理员权限",
     "Authentication request is too large": "身份验证请求过大",

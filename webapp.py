@@ -197,6 +197,12 @@ read_cache = RedisCache.from_environment(
 )
 password_hasher = PasswordHasher()
 DUMMY_PASSWORD_HASH = password_hasher.hash(secrets.token_urlsafe(32))
+# Absolute browser-session lifetime: cookie refresh keeps an active session
+# alive between sign-ins, but never longer than this after the sign-in.
+SESSION_MAX_HOURS = int(os.environ.get("SESSION_MAX_HOURS", "12"))
+if not 1 <= SESSION_MAX_HOURS <= 720:
+    raise RuntimeError("SESSION_MAX_HOURS must be between 1 and 720")
+SESSION_MAX_AGE = timedelta(hours=SESSION_MAX_HOURS)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 app.config.update(
@@ -365,21 +371,42 @@ def public_user(row: Any) -> dict[str, Any]:
     return result
 
 
-def issue_token(user_row: Any, session_id: str | None = None) -> str:
+def issue_token(user_row: Any, session_id: str | None = None,
+                session_started: int | None = None) -> str:
     """Issue an access JWT; a new sign-in starts a new session, refreshes keep theirs.
 
     The ``sid`` claim lets logout revoke every token of one session, including
     earlier refreshed tokens, without signing the account out on other devices.
+    ``sst`` records when the session began (Unix time) and bounds its lifetime.
     """
     values = user_row._mapping if hasattr(user_row, "_mapping") else user_row
+    timestamp = now_datetime()
+    started = session_started if session_started is not None else int(timestamp.timestamp())
+    # No token outlives its session's absolute deadline, refreshed or not.
+    remaining = datetime.fromtimestamp(started, timezone.utc) + SESSION_MAX_AGE - timestamp
     return create_access_token(
         identity=values["id"],
         additional_claims={
             "role": values["role"], "ver": values["token_version"],
-            "sid": session_id or uuid.uuid4().hex,
+            "sid": session_id or uuid.uuid4().hex, "sst": started,
         },
+        expires_delta=max(timedelta(seconds=1), min(app.config["JWT_ACCESS_TOKEN_EXPIRES"], remaining)),
         fresh=True,
     )
+
+
+def session_started(claims: dict) -> int | None:
+    """Unix time the token's session began.
+
+    Tokens issued before ``sst`` existed count from their own ``iat``, so the
+    first refresh after an upgrade starts bounding them instead of logging out
+    every existing session at once.
+    """
+    for name in ("sst", "iat"):
+        value = claims.get(name)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
 
 
 def revoked_session_key(session_id: str) -> str:
@@ -664,10 +691,19 @@ def refreshed_session_token(claims: dict) -> str | None:
     fresh read and keep the presented token version and session id: if a change
     commits after this read, the new token carries the old version or a revoked
     session and is rejected on its next use.
+
+    A refresh cannot extend a session past ``SESSION_MAX_HOURS`` from sign-in:
+    once a new token could not outlive the current one, the cookie is left to
+    expire and the user signs in again.
     """
+    started = session_started(claims)
+    if started is None or started + SESSION_MAX_AGE.total_seconds() <= claims.get("exp", 0):
+        return None
     with connection(engine) as db:
         user = current_token_user(db, claims)
-    return issue_token(user, token_session_id(claims)) if user is not None else None
+    if user is None:
+        return None
+    return issue_token(user, token_session_id(claims), started)
 
 
 def cached_rows(name: str, scope: str, statement) -> list[dict[str, Any]]:

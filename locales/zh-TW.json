@@ -243,6 +243,7 @@
     "Authentication required": "需要登入",
     "Invalid authentication token": "驗證權杖無效",
     "Authentication token expired": "驗證權杖已過期",
+    "Your session has ended. Sign in again.": "您的工作階段已結束，請重新登入。",
     "Authentication token revoked": "驗證權杖已撤銷",
     "Administrator access required": "需要管理員權限",
     "Authentication request is too large": "驗證請求過大",

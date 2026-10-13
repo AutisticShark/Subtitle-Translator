@@ -920,7 +920,11 @@ async function loadJobs() {
   } catch (error) {
     if (!current()) return; // Superseded, aborted, or from a previous session.
     if (error.status === 401) {
-      if (await sessionEnded(current)) return showAuth(false);
+      if (await sessionEnded(current)) {
+        // Expired (including the absolute session lifetime), revoked, or signed out elsewhere.
+        showAuth(false);
+        return toast(t('Your session has ended. Sign in again.'));
+      }
       if (current()) scheduleJobsPoll(POLL_ACTIVE_MS);
       return;
     }
