@@ -66,7 +66,7 @@ The Python test suite does not execute `static/app.js` in a browser and does not
 - Catalog coverage tests extract static `tr(...)`/`t(...)` calls from Python, JavaScript, and Jinja sources and require every non-English catalog to cover them. Keep this check generic when adding locales instead of hard-coding one catalog.
 - `/api/i18n` is intentionally public because the sign-in and one-time setup screens need dynamic browser messages before authentication. It must expose only static translations and target-language labels.
 - Job state is shared data and must not be stored in the submitting user's locale. Workers keep stable English stage values; `job_dict` localizes known stage patterns for each request, allowing different viewers to use different UI locales.
-- Technical provider and subtitle-parser failures remain in their original form so diagnostic details are not hidden by incomplete catalog coverage.
+- Technical provider and subtitle-parser failures are stored in their original form so diagnostic details are not hidden by incomplete catalog coverage. Since 2026-10-13 only administrators see provider failures verbatim; submitters see their own file problems (format and encoding errors) verbatim and a localized generic message otherwise (`visible_job_error`).
 
 ### Docker runtime manifest must include localization sources
 

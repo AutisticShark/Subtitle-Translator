@@ -95,7 +95,7 @@ Authenticated MFA endpoints are `GET /api/auth/mfa`, `POST /api/auth/mfa/setup` 
 
 The web interface supports English, Traditional Chinese, and Simplified Chinese. It chooses a language from an explicit `?lang=` selection, the saved `ui_locale` cookie, or the browser's `Accept-Language` header, in that order. `zh-Hant` variants select Traditional Chinese, while `zh`, `zh-Hans`, `zh-CN`, and `zh-SG` select Simplified Chinese. Use the language selector in the lower-right corner to save a preference. Unsupported or missing strings fall back to English.
 
-Localization catalogs live in `locales/*.json`. Each catalog declares its locale code, display name, aliases, and translated messages; adding a valid catalog makes that locale available automatically. Stored job states remain locale-neutral so the same job can be rendered in each viewer's selected language. Technical provider and subtitle-parser errors remain unchanged to preserve their diagnostic details.
+Localization catalogs live in `locales/*.json`. Each catalog declares its locale code, display name, aliases, and translated messages; adding a valid catalog makes that locale available automatically. Stored job states remain locale-neutral so the same job can be rendered in each viewer's selected language. Technical provider and subtitle-parser errors remain unchanged to preserve their diagnostic details. Only administrators see provider failure details, which can quote provider account information; other users see subtitle format and encoding errors verbatim and a generic "Translation failed" message otherwise.
 
 ### Appearance
 

@@ -163,6 +163,7 @@
     "Left untranslated: {count} of {total} segments": "有 {count} / {total} 个片段未能翻译，已保留原文",
     "Canceled": "已取消",
     "Translation failed": "翻译失败",
+    "Translation failed. An administrator can see the details in the translation history.": "翻译失败。管理员可以在翻译记录中查看详细信息。",
     "Cancel {filename}?": "要取消 {filename} 吗？",
     "Delete {filename}?": "要删除 {filename} 吗？",
     "Cancellation requested": "已请求取消",

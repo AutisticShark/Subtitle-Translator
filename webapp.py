@@ -809,13 +809,33 @@ def localized_job_warning(warning: str | None) -> str | None:
     return warning
 
 
-def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
+# Failures a submitter can act on themselves: problems with their own file.
+# Every other stored error may quote a provider response (account details, a
+# partially masked API key, text from a custom endpoint) and is shown to
+# administrators only.
+SUBMITTER_VISIBLE_ERRORS = frozenset({
+    "SubtitleFormatError", "UnicodeDecodeError", "UnicodeError", "LookupError",
+})
+
+
+def visible_job_error(error: str | None, viewer: Any) -> str | None:
+    """Return the stored ``"Type: message"`` error as ``viewer`` may see it."""
+    if not error or viewer.role == "admin":
+        return error
+    if error.partition(":")[0] in SUBMITTER_VISIBLE_ERRORS:
+        return error
+    return tr("Translation failed. An administrator can see the details in the translation history.")
+
+
+def job_dict(row: Any, viewer: Any, include_owner: bool = False) -> dict[str, Any]:
+    """Serialize a raw job row for ``viewer``: localized, and redacted for non-admins."""
     source = dict(row._mapping if hasattr(row, "_mapping") else row)
     result = {key: source.get(key) for key in jobs.c.keys()}
     result["options"] = json.loads(result["options"])
     result["outputs"] = json.loads(result["outputs"])
     result["stage"] = localized_job_stage(result.get("stage") or "")
     result["warning"] = localized_job_warning(result.get("warning"))
+    result["error"] = visible_job_error(result.get("error"), viewer)
     result.pop("stored_name", None)
     result.pop("user_id", None)
     if include_owner:
@@ -1744,7 +1764,7 @@ def list_jobs():
     }
     total = sum(counts.values())
     return jsonify(
-        jobs=[job_dict(row, include_owner=show_all) for row in rows],
+        jobs=[job_dict(row, user, include_owner=show_all) for row in rows],
         total=total, counts=counts, offset=offset, limit=limit,
         has_more=offset + len(rows) < total,
     )
@@ -1759,7 +1779,7 @@ def get_job(job_id: str):
         select(jobs).where(*job_scope(job_id, user)),
     )
     row = rows[0] if rows else None
-    return jsonify(job_dict(row)) if row else (jsonify(error=tr("Job not found")), 404)
+    return jsonify(job_dict(row, user)) if row else (jsonify(error=tr("Job not found")), 404)
 
 
 @app.post("/api/jobs/<job_id>/cancel")
@@ -1789,9 +1809,9 @@ def cancel_job(job_id: str):
         return jsonify(error=tr("Job not found")), 404
     if row.status == "canceling":
         signal_local_cancel(job_id)
-        return jsonify(job_dict(row)), 202
+        return jsonify(job_dict(row, user)), 202
     if changed and row.status == "canceled":
-        return jsonify(job_dict(row)), 202
+        return jsonify(job_dict(row, user)), 202
     return jsonify(error=tr("Only an active job can be canceled")), 409
 
 
