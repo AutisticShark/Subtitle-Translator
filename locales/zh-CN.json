@@ -267,6 +267,7 @@
     "Username already exists": "用户名已存在",
     "Unknown fields: {fields}": "未知字段：{fields}",
     "active must be a boolean": "active 必须是布尔值",
+    "unlock must be a boolean": "unlock 必须是布尔值",
     "You cannot deactivate or demote your own account": "您不能停用自己的账号或降低自己的权限",
     "At least one active administrator is required": "至少必须保留一位已启用的管理员",
     "You cannot delete your own account": "您不能删除自己的账号",

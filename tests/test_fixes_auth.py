@@ -351,8 +351,10 @@ def test_successful_login_cannot_clear_a_lock_set_while_it_verified(make_user, m
     thread.start()
     try:
         assert wait_until(lambda: hasher.blocked == 1)
+        # Concurrent wrong guesses: each reserves an attempt, the last one locks.
         for _ in range(webapp.LOGIN_FAILURE_LIMIT):
-            webapp.record_account_login_failure(user_id)
+            webapp.reserve_account_login_attempt(account_row(user_id))
+        webapp.lock_exhausted_account(user_id)
         assert account_row(user_id).locked_until is not None
     finally:
         hasher.release.set()

@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
@@ -32,6 +32,8 @@ from flask_jwt_extended import (
     get_jwt_request_location, set_access_cookies, unset_jwt_cookies,
     verify_jwt_in_request,
 )
+from flask_jwt_extended.exceptions import JWTExtendedException
+from jwt import PyJWTError
 from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -312,6 +314,23 @@ def normalize_username(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
+AUTH_BODY_LIMIT = 8192
+
+
+def limit_auth_body():
+    """Cap an unauthenticated auth request body, including chunked bodies.
+
+    Content-Length alone misses chunked requests, so also lower this request's
+    own read limit. Werkzeug then stops a chunked body at the limit without an
+    error, so a body that fills the limit was cut short and is rejected too.
+    """
+    request.max_content_length = AUTH_BODY_LIMIT
+    if ((request.content_length or 0) > AUTH_BODY_LIMIT
+            or len(request.get_data(cache=True)) >= AUTH_BODY_LIMIT):
+        return jsonify(error=tr("Authentication request is too large")), 413
+    return None
+
+
 def json_payload() -> dict[str, Any]:
     payload = request.get_json(silent=True)
     return payload if isinstance(payload, dict) else {}
@@ -392,28 +411,6 @@ def insert_user(db, user_id: str, username: str, password: str, role: str, times
     ))
 
 
-def record_account_login_failure(user_id: str) -> None:
-    """Count a failed password attempt atomically and lock the account at the limit.
-
-    The increment is a single SQL UPDATE, which takes the row write lock, so
-    parallel guesses cannot read the same old count and under-count failures.
-    """
-    with transaction(engine) as db:
-        db.execute(update(users).where(users.c.id == user_id).values(
-            failed_login_count=users.c.failed_login_count + 1, updated_at=now(),
-        ))
-        failures = db.scalar(select(users.c.failed_login_count).where(
-            users.c.id == user_id
-        ))
-        if failures is not None and failures >= LOGIN_FAILURE_LIMIT:
-            db.execute(update(users).where(users.c.id == user_id).values(
-                locked_until=(now_datetime() + timedelta(
-                    minutes=LOGIN_LOCK_MINUTES
-                )).isoformat(timespec="seconds"),
-                failed_login_count=0,
-            ))
-
-
 def observed_lock_condition(observed_locked_until: str | None):
     """Match the lock state read before verification, or a lock already cleared.
 
@@ -474,6 +471,8 @@ def bootstrap_admin() -> None:
             if db.scalar(select(func.count()).select_from(users)):
                 return
             user_id = uuid.uuid4().hex
+            # Never read: its primary key makes concurrent first-admin setups
+            # collide with IntegrityError instead of creating two administrators.
             db.execute(insert(settings_table).values(
                 name="_auth_setup_complete", value="1", updated_at=timestamp
             ))
@@ -531,6 +530,8 @@ def encrypt_existing_api_keys() -> None:
                 db.execute(update(settings_table).where(
                     settings_table.c.name == row.name
                 ).values(value=encrypt_secret(row.value), updated_at=now()))
+        # Deliberately unconditional: a restored database can repeat revision
+        # numbers that Redis still holds entries for (AGENTS.md rule 18).
         bump_cache_revision(db, "settings")
 
 
@@ -544,17 +545,32 @@ mfa = MFA(
 )
 
 
+def current_token_user(db, claims: dict) -> Any | None:
+    """Return the token's user row only while the token is still exactly current.
+
+    The one definition of validity shared by request authentication and cookie
+    refresh (AGENTS.md rule 22): the user is active, ``ver`` matches the current
+    token version, and neither the ``jti`` nor the session id is revoked.
+    """
+    if db.scalar(select(revoked_tokens.c.jti).where(
+        revoked_tokens.c.jti.in_(token_revocation_keys(claims))
+    ).limit(1)):
+        return None
+    user = db.execute(select(users).where(users.c.id == claims.get("sub"))).first()
+    if user is None or not user.active:
+        return None
+    try:
+        if int(claims.get("ver", -1)) != user.token_version:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return user
+
+
 @jwt.token_in_blocklist_loader
 def token_is_revoked(_header: dict, payload: dict) -> bool:
     with connection(engine) as db:
-        if db.scalar(select(revoked_tokens.c.jti).where(
-            revoked_tokens.c.jti.in_(token_revocation_keys(payload))
-        ).limit(1)):
-            return True
-        user = db.execute(select(users.c.active, users.c.token_version).where(
-            users.c.id == payload.get("sub")
-        )).first()
-    return user is None or not user.active or int(payload.get("ver", -1)) != user.token_version
+        return current_token_user(db, payload) is None
 
 
 @jwt.unauthorized_loader
@@ -626,8 +642,12 @@ def security_headers(response):
             token = refreshed_session_token(claims)
             if token:
                 set_access_cookies(response, token)
+    except (JWTExtendedException, PyJWTError):
+        pass  # No valid cookie session to refresh.
     except Exception:
-        pass
+        # Never turn an already-built response into an error, but do not hide
+        # database or programming failures either.
+        LOGGER.exception("Session cookie refresh failed")
     return response
 
 
@@ -646,19 +666,8 @@ def refreshed_session_token(claims: dict) -> str | None:
     session and is rejected on its next use.
     """
     with connection(engine) as db:
-        user = db.execute(select(users).where(users.c.id == claims.get("sub"))).first()
-        if user is None or not user.active:
-            return None
-        try:
-            if int(claims.get("ver", -1)) != user.token_version:
-                return None
-        except (TypeError, ValueError):
-            return None
-        if db.scalar(select(revoked_tokens.c.jti).where(
-            revoked_tokens.c.jti.in_(token_revocation_keys(claims))
-        ).limit(1)):
-            return None
-    return issue_token(user, token_session_id(claims))
+        user = current_token_user(db, claims)
+    return issue_token(user, token_session_id(claims)) if user is not None else None
 
 
 def cached_rows(name: str, scope: str, statement) -> list[dict[str, Any]]:
@@ -677,10 +686,20 @@ def cached_rows(name: str, scope: str, statement) -> list[dict[str, Any]]:
         return read_cache.remember(f"{name}:{revision}:{scope}", load)
 
 
-def read_settings(include_secrets: bool = False) -> dict[str, Any]:
-    values = {row["name"]: row["value"] for row in cached_rows(
+def read_settings(include_secrets: bool | Iterable[str] = False) -> dict[str, Any]:
+    """Return panel settings; ``include_secrets`` selects secrets to decrypt (``True``: all).
+
+    Decrypt only what the caller needs: one unreadable stored secret must not
+    break unrelated paths such as login CAPTCHA checks or another provider's jobs.
+    """
+    return settings_view({row["name"]: row["value"] for row in cached_rows(
         "settings", "all", select(settings_table.c.name, settings_table.c.value),
-    )}
+    )}, include_secrets)
+
+
+def settings_view(values: dict[str, str],
+                  include_secrets: bool | Iterable[str] = False) -> dict[str, Any]:
+    """Merge stored setting rows with defaults and environment-provided secrets."""
     result: dict[str, Any] = {key: values.get(key, default) for key, default in DEFAULTS.items()}
     providers = available_providers()
     if result["default_provider"] not in providers:
@@ -703,7 +722,7 @@ def read_settings(include_secrets: bool = False) -> dict[str, Any]:
         for provider in CAPTCHA_PROVIDERS
     }
     if include_secrets:
-        for key in SECRET_KEYS:
+        for key in SECRET_KEYS if include_secrets is True else SECRET_KEYS & set(include_secrets):
             stored = values.get(key, "")
             result[key] = decrypt_secret(stored) if stored else os.environ.get(key.upper(), "")
     return result
@@ -735,10 +754,11 @@ def captcha_required(action: str, settings: dict[str, Any]) -> bool:
 
 def verify_captcha(action: str, token: Any):
     """Return a Flask error response when a required CAPTCHA is not valid."""
-    settings = read_settings(include_secrets=True)
+    settings = read_settings()
     if not captcha_required(action, settings):
         return None
     provider = settings["captcha_provider"]
+    settings = read_settings(include_secrets={f"{provider}_secret_key"})
     failure = captcha.verify_token(
         provider=provider, action=action, token=token,
         site_key=settings.get(f"{provider}_site_key", ""),
@@ -803,26 +823,30 @@ def job_dict(row: Any, include_owner: bool = False) -> dict[str, Any]:
     return result
 
 
-def update_job(job_id: str, *, if_status: set[str] | None = None, **fields: Any) -> None:
-    """Update a job; with ``if_status`` only while it is still in one of those states."""
+def _write_job(job_id: str, statuses: set[str] | None, fields: dict[str, Any]) -> bool:
     fields["updated_at"] = now()
     with db_lock, transaction(engine) as db:
         statement = update(jobs).where(jobs.c.id == job_id)
-        if if_status is not None:
-            statement = statement.where(jobs.c.status.in_(if_status))
-        if db.execute(statement.values(**fields)).rowcount:
+        if statuses is not None:
+            statement = statement.where(jobs.c.status.in_(statuses))
+        changed = db.execute(statement.values(**fields)).rowcount == 1
+        if changed:
             bump_cache_revision(db, "jobs")
+        return changed
+
+
+def update_job(job_id: str, *, if_status: set[str] | None = None, **fields: Any) -> None:
+    """Update a job; with ``if_status`` only while it is still in one of those states.
+
+    Workers always pass ``if_status`` (AGENTS.md rule 5); the unconditional form
+    exists for test fixtures.
+    """
+    _write_job(job_id, if_status, fields)
 
 
 def update_job_if_status(job_id: str, statuses: set[str], **fields: Any) -> bool:
-    fields["updated_at"] = now()
-    with db_lock, transaction(engine) as db:
-        result = db.execute(update(jobs).where(
-            jobs.c.id == job_id, jobs.c.status.in_(statuses)
-        ).values(**fields))
-        if result.rowcount:
-            bump_cache_revision(db, "jobs")
-        return result.rowcount == 1
+    """Conditional status transition; return whether this call made it."""
+    return _write_job(job_id, statuses, fields)
 
 
 def cancel_event_for(job_id: str) -> threading.Event:
@@ -947,17 +971,15 @@ def run_job(job_id: str) -> None:
         check_canceled()
         report(progress=5, stage=f"Parsed {len(document.cues)} cues")
 
-        provider_settings = read_settings(include_secrets=True)
+        provider_settings = read_settings(include_secrets={f"{options['provider']}_api_key"})
         throttle = Throttle(float(options["rpm"]), stop_requested)
         provider = provider_for(
             options["provider"], provider_settings, throttle, options.get("model")
         )
         targets = options["target_languages"]
-        cache_path = folder / "translation-cache.json"
-        try:
-            cache = json.loads(cache_path.read_text("utf-8")) if cache_path.exists() else {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
+        # Jobs never resume (startup recovery fails interrupted ones), so the
+        # cache lives only for this run; see AGENTS.md rule 16 before persisting it.
+        cache: dict[str, str] = {}
         outputs = []
         untranslated = 0
         for index, language in enumerate(targets):
@@ -993,7 +1015,6 @@ def run_job(job_id: str) -> None:
             output_name = translated_filename(row.filename, LANGS[language]["suffix"])
             (folder / output_name).write_bytes(document.clone_with_cues(cues).to_bytes())
             outputs.append({"name": output_name, "language": language})
-            cache_path.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
             report(outputs=json.dumps(outputs),
                    progress=5 + round((index + 1) / len(targets) * 90))
         if not update_job_if_status(
@@ -1027,12 +1048,18 @@ def run_job(job_id: str) -> None:
                 cancel_events.pop(job_id, None)
 
 
-def owned_job(job_id: str, user: Any) -> Any | None:
-    statement = select(jobs).where(jobs.c.id == job_id)
+def job_scope(job_id: str, user: Any) -> list[Any]:
+    """WHERE clauses for one job visible to ``user``: administrators see every
+    owner's jobs, everyone else only their own (others read as not found)."""
+    scope = [jobs.c.id == job_id]
     if user.role != "admin":
-        statement = statement.where(jobs.c.user_id == user.id)
+        scope.append(jobs.c.user_id == user.id)
+    return scope
+
+
+def owned_job(job_id: str, user: Any) -> Any | None:
     with connection(engine) as db:
-        return db.execute(statement).first()
+        return db.execute(select(jobs).where(*job_scope(job_id, user))).first()
 
 
 @app.get("/")
@@ -1045,9 +1072,11 @@ def index():
             user = current_user_row()
             if user is not None and user.active and user.theme in ACCOUNT_THEMES:
                 theme = user.theme
-    except Exception:
+    except (JWTExtendedException, PyJWTError):
         # Invalid or expired browser credentials should still receive the public shell.
         pass
+    except Exception:
+        LOGGER.exception("Could not read the account theme for the initial page")
     languages = {
         code: {**language, "name": tr(language["name"])}
         for code, language in LANGS.items()
@@ -1087,8 +1116,9 @@ def setup_status():
 
 @app.post("/api/auth/setup")
 def setup_first_admin():
-    if request.content_length and request.content_length > 8192:
-        return jsonify(error=tr("Authentication request is too large")), 413
+    too_large = limit_auth_body()
+    if too_large:
+        return too_large
     payload = json_payload()
     username = normalize_username(payload.get("username"))
     password = payload.get("password")
@@ -1101,6 +1131,8 @@ def setup_first_admin():
         with transaction(engine) as db:
             if db.scalar(select(func.count()).select_from(users)):
                 return jsonify(error=tr("Initial setup is already complete")), 409
+            # Never read: its primary key makes concurrent first-admin setups
+            # collide with IntegrityError instead of creating two administrators.
             db.execute(insert(settings_table).values(
                 name="_auth_setup_complete", value="1", updated_at=timestamp
             ))
@@ -1118,8 +1150,9 @@ def setup_first_admin():
 
 @app.post("/api/auth/login")
 def login():
-    if request.content_length and request.content_length > 8192:
-        return jsonify(error=tr("Authentication request is too large")), 413
+    too_large = limit_auth_body()
+    if too_large:
+        return too_large
     remote_address = request.remote_addr or "unknown"
     too_many = (jsonify(error=tr("Too many login attempts; try again later")), 429)
     if login_limiter.limited(remote_address):
@@ -1181,8 +1214,9 @@ def login():
 
 @app.post("/api/auth/register")
 def register():
-    if request.content_length and request.content_length > 8192:
-        return jsonify(error=tr("Authentication request is too large")), 413
+    too_large = limit_auth_body()
+    if too_large:
+        return too_large
     remote_address = request.remote_addr or "unknown"
     if registration_limiter.reserve(remote_address) is None:
         return jsonify(error=tr("Too many registration attempts; try again later")), 429
@@ -1373,6 +1407,8 @@ def update_user(user_id: str):
             return jsonify(error=error), 400
         values["password_hash"] = password_hasher.hash(payload["password"])
         values["token_version"] = users.c.token_version + 1
+    if "unlock" in payload and not isinstance(payload["unlock"], bool):
+        return jsonify(error=tr("unlock must be a boolean")), 400
     unlock = payload.get("unlock") is True
     if unlock:
         values["failed_login_count"] = 0
@@ -1400,9 +1436,9 @@ def update_user(user_id: str):
             # MFA verification locks are separate from the password lock; an
             # administrator unlock clears all of them (MFA factors stay enrolled).
             mfa_locks = {
-                column: 0 for column in (
-                    "failures", "locked_until", "manage_failures", "manage_locked_until",
-                ) if column in mfa_accounts.c
+                column: 0
+                for failures, locked_until, _purposes in mfa.BUDGETS.values()
+                for column in (failures, locked_until)
             }
             db.execute(update(mfa_accounts).where(
                 mfa_accounts.c.user_id == user_id
@@ -1462,38 +1498,17 @@ def save_settings():
     if any(key in payload and str(payload[key]).strip() for key in SECRET_KEYS):
         if not configured_jwt_secret and not os.environ.get("API_KEY_ENCRYPTION_KEY"):
             return jsonify(error=tr("Configure JWT_SECRET_KEY before saving secrets")), 503
-    combined = read_settings()
-    combined.update({key: str(value).strip() for key, value in payload.items()})
-    captcha_provider = combined["captcha_provider"]
-    if captcha_provider in CAPTCHA_PROVIDERS and any(
-        combined[key] == "1" for key in CAPTCHA_ACTION_SETTINGS.values()
-    ):
-        site_key = combined.get(f"{captcha_provider}_site_key", "")
-        secret_name = f"{captcha_provider}_secret_key"
-        secret_configured = bool(
-            str(payload.get(secret_name, "")).strip()
-            or combined["captcha_configured"].get(captcha_provider)
-        )
-        if not site_key or not secret_configured:
-            return jsonify(error=tr(
-                "Configure the selected CAPTCHA site key and secret key before enabling protection"
-            )), 400
-    # Evaluated on the merged state because payloads are partial. Stored configurations
-    # that predate this rule keep working until an administrator saves settings again.
-    if captcha_provider != "none" and not combined.get("captcha_hostname"):
-        return jsonify(error=tr(
-            "Enter the expected CAPTCHA hostname before selecting a CAPTCHA provider"
-        )), 400
     error = validate_numeric_settings(payload)
     if error:
         return jsonify(error=error), 400
     timestamp = now()
     with db_lock, transaction(engine) as db:
+        lock_settings(db)
+        error = captcha_settings_error(stored_settings(db), payload)
+        if error:
+            return jsonify(error=error), 400
         changed_window = False
         if RATE_LIMIT_KEYS & payload.keys():
-            db.execute(update(settings_table).where(
-                settings_table.c.name == "panel_job_limit"
-            ).values(updated_at=settings_table.c.updated_at))
             previous = dict(db.execute(select(
                 settings_table.c.name, settings_table.c.value,
             ).where(settings_table.c.name.in_(WINDOW_LIMIT_KEYS))).all())
@@ -1527,6 +1542,48 @@ def save_settings():
     return jsonify(read_settings())
 
 
+def lock_settings(db) -> None:
+    """Serialize settings writes with each other and with job-quota accounting.
+
+    This is the same shared row ``quotas.consume_job_quota`` takes first, so a
+    check made after it (CAPTCHA consistency, rate windows) cannot be invalidated
+    by a concurrent write from another worker (AGENTS.md rule 21).
+    """
+    db.execute(update(settings_table).where(
+        settings_table.c.name == "panel_job_limit"
+    ).values(updated_at=settings_table.c.updated_at))
+
+
+def stored_settings(db) -> dict[str, Any]:
+    """Settings read inside ``db``'s transaction, bypassing the Redis read cache."""
+    return settings_view(dict(db.execute(select(
+        settings_table.c.name, settings_table.c.value,
+    )).all()))
+
+
+def captcha_settings_error(current: dict[str, Any], payload: dict[str, Any]) -> str | None:
+    """Reject a partial settings update that would leave CAPTCHA unusable."""
+    combined = {**current, **{key: str(value).strip() for key, value in payload.items()}}
+    captcha_provider = combined["captcha_provider"]
+    if captcha_provider in CAPTCHA_PROVIDERS and any(
+        combined[key] == "1" for key in CAPTCHA_ACTION_SETTINGS.values()
+    ):
+        site_key = combined.get(f"{captcha_provider}_site_key", "")
+        secret_configured = bool(
+            combined.get(f"{captcha_provider}_secret_key")
+            or current["captcha_configured"].get(captcha_provider)
+        )
+        if not site_key or not secret_configured:
+            return tr(
+                "Configure the selected CAPTCHA site key and secret key before enabling protection"
+            )
+    # Evaluated on the merged state because payloads are partial. Stored configurations
+    # that predate this rule keep working until an administrator saves settings again.
+    if captcha_provider != "none" and not combined.get("captcha_hostname"):
+        return tr("Enter the expected CAPTCHA hostname before selecting a CAPTCHA provider")
+    return None
+
+
 @app.delete("/api/settings/keys/<provider>")
 @admin_required
 def delete_key(provider: str):
@@ -1535,12 +1592,13 @@ def delete_key(provider: str):
            else f"{provider}_api_key")
     if key not in SECRET_KEYS:
         return jsonify(error=tr("Unknown provider")), 404
-    current = read_settings()
-    if (captcha_provider in CAPTCHA_PROVIDERS
-            and current["captcha_provider"] == captcha_provider
-            and any(current[name] == "1" for name in CAPTCHA_ACTION_SETTINGS.values())):
-        return jsonify(error=tr("Disable CAPTCHA before removing its active secret key")), 409
     with db_lock, transaction(engine) as db:
+        lock_settings(db)
+        current = stored_settings(db)
+        if (captcha_provider in CAPTCHA_PROVIDERS
+                and current["captcha_provider"] == captcha_provider
+                and any(current[name] == "1" for name in CAPTCHA_ACTION_SETTINGS.values())):
+            return jsonify(error=tr("Disable CAPTCHA before removing its active secret key")), 409
         db.execute(delete(settings_table).where(settings_table.c.name == key))
         bump_cache_revision(db, "settings")
     return jsonify(read_settings())
@@ -1696,10 +1754,10 @@ def list_jobs():
 @jwt_required()
 def get_job(job_id: str):
     user = current_user_row()
-    statement = select(jobs).where(jobs.c.id == job_id)
-    if user.role != "admin":
-        statement = statement.where(jobs.c.user_id == user.id)
-    rows = cached_rows("jobs", f"detail:{user.role}:{user.id}:{job_id}", statement)
+    rows = cached_rows(
+        "jobs", f"detail:{user.role}:{user.id}:{job_id}",
+        select(jobs).where(*job_scope(job_id, user)),
+    )
     row = rows[0] if rows else None
     return jsonify(job_dict(row)) if row else (jsonify(error=tr("Job not found")), 404)
 
@@ -1709,9 +1767,7 @@ def get_job(job_id: str):
 def cancel_job(job_id: str):
     user = current_user_row()
     with db_lock, transaction(engine) as db:
-        scope = [jobs.c.id == job_id]
-        if user.role != "admin":
-            scope.append(jobs.c.user_id == user.id)
+        scope = job_scope(job_id, user)
         if db.execute(select(jobs.c.id).where(*scope)).first() is None:
             return jsonify(error=tr("Job not found")), 404
         timestamp = now()
@@ -1744,10 +1800,7 @@ def cancel_job(job_id: str):
 def delete_job(job_id: str):
     user = current_user_row()
     with db_lock, transaction(engine) as db:
-        statement = select(jobs.c.status).where(jobs.c.id == job_id)
-        if user.role != "admin":
-            statement = statement.where(jobs.c.user_id == user.id)
-        row = db.execute(statement).first()
+        row = db.execute(select(jobs.c.status).where(*job_scope(job_id, user))).first()
         if row is None:
             return jsonify(error=tr("Job not found")), 404
         if row.status not in TERMINAL_STATUSES:
@@ -1776,9 +1829,10 @@ def download_output(job_id: str, name: str):
     if row is None:
         return jsonify(error=tr("Job not found")), 404
     allowed = {item["name"] for item in json.loads(row.outputs)}
-    if name not in allowed:
+    path = JOBS_DIR / job_id / name
+    if name not in allowed or not path.is_file():
         return jsonify(error=tr("Output not found")), 404
-    return send_file(JOBS_DIR / job_id / name, as_attachment=True, download_name=name)
+    return send_file(path, as_attachment=True, download_name=name)
 
 
 @app.get("/api/jobs/<job_id>/download")
@@ -1800,7 +1854,10 @@ def download_all(job_id: str):
     digest = hashlib.sha256(json.dumps(names).encode("utf-8")).hexdigest()[:24]
     archive = folder / f".translations-{digest}.zip"
     if not archive.exists():
-        build_archive(folder, names, archive)
+        try:
+            build_archive(folder, names, archive)
+        except FileNotFoundError:
+            return jsonify(error=tr("Output not found")), 404
     return send_file(archive, as_attachment=True,
                      download_name=Path(row.filename).stem + ".translations.zip",
                      mimetype="application/zip")
@@ -1834,6 +1891,8 @@ def build_archive(folder: Path, names: list[str], archive: Path) -> None:
 
 @app.errorhandler(413)
 def too_large(_error):
+    if request.max_content_length == AUTH_BODY_LIMIT:
+        return jsonify(error=tr("Authentication request is too large")), 413
     return jsonify(error=tr(
         "Upload exceeds the {max_upload_mb} MB limit", max_upload_mb=MAX_UPLOAD_MB,
     )), 413

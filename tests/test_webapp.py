@@ -1443,25 +1443,35 @@ class ProxyTrustAndLoginCounterTests(unittest.TestCase):
             "username": "race-target", "password": "race-target-password", "role": "user",
         })
         self.assertEqual(created.status_code, 201, created.get_json())
+        user_id = created.get_json()["user"]["id"]
         webapp.login_attempts.clear()
-
-        barrier = threading.Barrier(webapp.LOGIN_FAILURE_LIMIT)
+        # Exactly the budget, so the per-address limiter cannot be what rejects them.
+        guesses = webapp.LOGIN_FAILURE_LIMIT
+        barrier = threading.Barrier(guesses)
+        statuses = []
 
         def guess():
+            client = webapp.app.test_client()
             barrier.wait()
-            webapp.record_account_login_failure(created.get_json()["user"]["id"])
+            statuses.append(client.post("/api/auth/login", json={
+                "username": "race-target", "password": "a-wrong-password-guess",
+            }).status_code)
 
-        threads = [threading.Thread(target=guess) for _ in range(webapp.LOGIN_FAILURE_LIMIT)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
-
-        response = webapp.app.test_client().post("/api/auth/login", json={
-            "username": "race-target", "password": "race-target-password",
-        })
-        self.assertEqual(response.status_code, 401, "account should be locked")
-        webapp.login_attempts.clear()
+        try:
+            threads = [threading.Thread(target=guess) for _ in range(guesses)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+            self.assertEqual(statuses, [401] * guesses)
+            webapp.login_attempts.clear()
+            response = webapp.app.test_client().post("/api/auth/login", json={
+                "username": "race-target", "password": "race-target-password",
+            })
+            self.assertEqual(response.status_code, 401, "account should be locked")
+        finally:
+            webapp.login_attempts.clear()
+            self.assertEqual(admin.delete(f"/api/users/{user_id}").status_code, 200)
 
 
 if __name__ == "__main__":
