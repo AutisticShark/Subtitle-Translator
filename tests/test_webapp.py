@@ -981,8 +981,12 @@ class WebApplicationTests(unittest.TestCase):
             "user_daily_job_limit": 1, "admin_daily_job_limit": 2,
             "panel_monthly_job_limit": 4,
         })
+        # Mid-month: on a month's last day the daily and monthly windows reset
+        # together, and the tied retry_after would report the daily limit.
+        moment = webapp.datetime.fromisoformat("2026-10-14T12:00:00+00:00")
         def consume(user, amount):
-            with webapp.transaction(webapp.engine) as db:
+            with (patch.object(webapp, "now_datetime", return_value=moment),
+                  webapp.transaction(webapp.engine) as db):
                 return webapp.consume_job_quota(db, user, amount)
         self.assertIsNone(consume(regular, 1))
         self.assertEqual(consume(regular, 1)["scope"], "user")
