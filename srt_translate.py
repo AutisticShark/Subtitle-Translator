@@ -475,10 +475,16 @@ def wrap_latin(s: str, limit: int, max_lines: int = 2) -> list[str]:
     max_lines = max(1, max_lines)
     if len(lines) <= max_lines:
         return lines
-
     # The width is a preference, while max_lines is a hard subtitle-layout
     # constraint. Rebalance all words when the greedy pass needs too many lines.
-    # Long words can use up the words early; stop rather than emit empty lines.
+    return _balance_lines(words, max_lines)
+
+
+def _balance_lines(words: list[str], max_lines: int) -> list[str]:
+    """Spread ``words`` over at most ``max_lines`` lines of similar width.
+
+    Long words can use up the words early; stop rather than emit empty lines.
+    """
     remaining = list(words)
     balanced: list[str] = []
     while remaining and len(balanced) < max_lines - 1:
@@ -517,6 +523,9 @@ class RateLimitError(TranslationError):
 class TranslationCanceled(RuntimeError):
     """The caller requested that an in-progress translation stop."""
 
+    def __init__(self, msg: str = "Translation canceled"):
+        super().__init__(msg)
+
 
 class Throttle:
     """Shared pacing gate.
@@ -538,7 +547,7 @@ class Throttle:
     def wait(self) -> None:
         while True:
             if self._cancel_callback and self._cancel_callback():
-                raise TranslationCanceled("Translation canceled")
+                raise TranslationCanceled()
             with self._lock:
                 now = time.monotonic()
                 target = max(self._blocked_until, self._next_slot)
@@ -618,6 +627,36 @@ def _parse_rate_limit_reset(value: str | None) -> float | None:
     return max(0.0, (moment - now).total_seconds())
 
 
+def _http_error(e) -> TranslationError:
+    """Classify an HTTP error response as retryable, rate-limited, or fatal."""
+    try:
+        body = e.read().decode("utf-8", "replace")[:800]
+    except (OSError, http.client.HTTPException):
+        body = ""
+    hdrs = getattr(e, "headers", None)
+
+    # 429 = rate limited, 529 = provider overloaded. Both mean "come back
+    # later", and the response usually says how much later — use that
+    # rather than guessing at a backoff curve.
+    if e.code in (429, 529):
+        after = _parse_retry_after(hdrs.get("retry-after") if hdrs else None)
+        if after is None and hdrs:
+            for h in ("anthropic-ratelimit-input-tokens-reset",
+                      "anthropic-ratelimit-requests-reset",
+                      "x-ratelimit-reset-requests"):
+                after = _parse_rate_limit_reset(hdrs.get(h))
+                if after is not None:
+                    break
+        return RateLimitError(f"HTTP {e.code}: {body[:200]}", after)
+
+    # 401/403 = bad or unauthorised key, 400 = malformed request,
+    # 404 = wrong model id. Retrying any of these just wastes time and,
+    # on a 765-cue file, a lot of it.
+    if e.code in (400, 401, 403, 404):
+        return FatalTranslationError(f"HTTP {e.code}: {body}")
+    return TranslationError(f"HTTP {e.code}: {body}")
+
+
 def _post_json(url: str, headers: dict, payload: dict, timeout: float = 120,
                throttle: Throttle | None = None) -> dict:
     import urllib.error
@@ -632,32 +671,7 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: float = 120,
         with urllib.request.urlopen(req, timeout=timeout) as r:
             raw = r.read()
     except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", "replace")[:800]
-        except (OSError, http.client.HTTPException):
-            body = ""
-        hdrs = getattr(e, "headers", None)
-
-        # 429 = rate limited, 529 = provider overloaded. Both mean "come back
-        # later", and the response usually says how much later — use that
-        # rather than guessing at a backoff curve.
-        if e.code in (429, 529):
-            after = _parse_retry_after(hdrs.get("retry-after") if hdrs else None)
-            if after is None and hdrs:
-                for h in ("anthropic-ratelimit-input-tokens-reset",
-                          "anthropic-ratelimit-requests-reset",
-                          "x-ratelimit-reset-requests"):
-                    after = _parse_rate_limit_reset(hdrs.get(h))
-                    if after is not None:
-                        break
-            raise RateLimitError(f"HTTP {e.code}: {body[:200]}", after) from None
-
-        # 401/403 = bad or unauthorised key, 400 = malformed request,
-        # 404 = wrong model id. Retrying any of these just wastes time and,
-        # on a 765-cue file, a lot of it.
-        if e.code in (400, 401, 403, 404):
-            raise FatalTranslationError(f"HTTP {e.code}: {body}") from None
-        raise TranslationError(f"HTTP {e.code}: {body}") from None
+        raise _http_error(e) from None
     except urllib.error.URLError as e:
         raise TranslationError(f"network error: {e.reason}") from None
     except (OSError, http.client.HTTPException) as e:
@@ -670,7 +684,7 @@ def _post_json(url: str, headers: dict, payload: dict, timeout: float = 120,
 
     try:
         result = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except ValueError:  # Includes UnicodeDecodeError and JSONDecodeError.
         # Proxies and gateways sometimes answer 200 with an HTML error page.
         raise TranslationError("provider returned a response that is not JSON") from None
     if not isinstance(result, dict):
@@ -991,7 +1005,7 @@ def translate_segments(
 
     def check_canceled() -> None:
         if stopped.is_set() or (cancel_callback and cancel_callback()):
-            raise TranslationCanceled("Translation canceled")
+            raise TranslationCanceled()
 
     def interruptible_sleep(seconds: float) -> None:
         deadline = time.monotonic() + seconds

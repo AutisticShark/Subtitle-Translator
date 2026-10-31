@@ -996,7 +996,7 @@ def run_job(job_id: str) -> None:
 
     def check_canceled() -> None:
         if stop_requested():
-            raise TranslationCanceled("Translation canceled")
+            raise TranslationCanceled()
 
     def report(**fields: Any) -> None:
         # Never overwrite the "Canceling" stage, or a state written by another
@@ -1011,7 +1011,7 @@ def run_job(job_id: str) -> None:
         if row.status == "canceling":
             cancel_event.set()
         if cancel_event.is_set():
-            raise TranslationCanceled("Translation canceled")
+            raise TranslationCanceled()
         options = json.loads(row.options)
         folder = JOBS_DIR / job_id
         source = folder / row.stored_name
@@ -1081,7 +1081,7 @@ def run_job(job_id: str) -> None:
                 f"{len(segments) * len(targets)} segments"
             ) if untranslated else None,
         ):
-            raise TranslationCanceled("Translation canceled")
+            raise TranslationCanceled()
     except TranslationCanceled:
         update_job_if_status(
             job_id, {"queued", "processing", "canceling"}, status="canceled",
