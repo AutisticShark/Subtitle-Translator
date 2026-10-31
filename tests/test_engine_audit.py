@@ -217,10 +217,10 @@ class RateLimitWaitTests(unittest.TestCase):
                 calls.append(texts)
                 raise RateLimitError("429", retry_after=retry_after)
 
+            segments = [Segment(0, "Hello", [], False)]
             with self.subTest(retry_after=retry_after):
                 with self.assertRaises(RateLimitError):
-                    run_translation([Segment(0, "Hello", [], False)], provider,
-                                    rate_retries=5, throttle=throttle)
+                    run_translation(segments, provider, rate_retries=5, throttle=throttle)
                 self.assertEqual(len(calls), 1)
                 self.assertEqual(throttle.penalise(0), 0)
 

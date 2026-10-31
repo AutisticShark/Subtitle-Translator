@@ -68,7 +68,8 @@ def test_login_during_email_cooldown_keeps_the_emailed_code_valid(account, monke
     # A password holder logs in again while the 60-second cooldown is active.
     _, second = base.login_challenge(payload)
     assert len(sent) == sends
-    assert second["email_sent"] is False and second["warning"]
+    assert second["email_sent"] is False
+    assert second["warning"]
     assert "recovery code" in second["warning"]
     assert 0 < second["expires_in"] <= first["expires_in"]
     assert webapp.mfa.decode_challenge(second)["cid"] == webapp.mfa.decode_challenge(first)["cid"]
@@ -96,7 +97,8 @@ def test_hourly_email_limit_cannot_be_used_to_replace_the_emailed_code(account, 
         rows = db.execute(select(mfa_challenges).where(
             mfa_challenges.c.user_id == user_id, mfa_challenges.c.purpose == "login",
         )).all()
-    assert len(rows) == 1 and rows[0].code_hash
+    assert len(rows) == 1
+    assert rows[0].code_hash
     assert base.verify(owner, first, emailed).status_code == 200
 
 
@@ -165,7 +167,8 @@ def test_management_lockout_does_not_lock_mfa_login(account):
         assert response.status_code == 400
         assert response.json["error"] == "Invalid password"
     response = client.post("/api/auth/mfa/disable", json={"password": PASSWORD, "code": recovery[0]})
-    assert response.status_code == 429 and int(response.headers["Retry-After"]) > 0
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
     guest, challenge = base.login_challenge(payload)
     assert base.verify(guest, challenge, recovery[0]).status_code == 200
     assert account_row(user_id).manage_locked_until > 0
@@ -193,7 +196,8 @@ def test_login_lockout_still_applies_to_enrolled_accounts(account):
         guest, challenge = base.login_challenge(payload)
         assert base.verify(guest, challenge, "invalid").status_code == 400
     response = login(payload)
-    assert response.status_code == 429 and int(response.headers["Retry-After"]) > 0
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
 
 
 def test_existing_databases_gain_the_management_budget_columns(tmp_path):
@@ -219,7 +223,8 @@ def test_existing_databases_gain_the_management_budget_columns(tmp_path):
         initialize_database(engine, {}, "2026-01-01T00:00:00+00:00")  # idempotent
         with engine.connect() as db:
             row = db.execute(select(mfa_accounts)).first()
-        assert row.manage_failures == 0 and row.manage_locked_until == 0
+        assert row.manage_failures == 0
+        assert row.manage_locked_until == 0
     finally:
         engine.dispose()
 
@@ -315,7 +320,8 @@ def test_captcha_transport_errors_fail_closed_with_503(error, monkeypatch):
 def test_captcha_malformed_bodies_fail_closed(body):
     with patch.object(urllib.request, "urlopen", return_value=io.BytesIO(body)):
         failure = verify_token()
-    assert failure is not None and failure[1] in (400, 503)
+    assert failure is not None
+    assert failure[1] in (400, 503)
 
 
 def test_captcha_transport_error_returns_localized_503_response(monkeypatch):

@@ -93,7 +93,8 @@ def test_unreadable_totp_secret_spends_the_login_budget_and_keeps_recovery(accou
     guest, challenge = base.login_challenge(payload)
     for attempt in (1, 2):
         response = base.verify(guest, challenge, "123456")
-        assert response.status_code == 503 and response.is_json
+        assert response.status_code == 503
+        assert response.is_json
         assert response.json["error"] == UNREADABLE
         # The failure is committed, not rolled back with an exception.
         assert account_row(user_id).failures == attempt
@@ -126,9 +127,11 @@ def test_unreadable_secret_during_management_uses_the_management_budget(account)
     _, recovery, _ = base.enroll_totp(client)
     corrupt_account_secret(user_id)
     response = client.post("/api/auth/mfa/disable", json={"password": PASSWORD, "code": "123456"})
-    assert response.status_code == 503 and response.json["error"] == UNREADABLE
+    assert response.status_code == 503
+    assert response.json["error"] == UNREADABLE
     row = account_row(user_id)
-    assert row.manage_failures == 1 and row.failures == 0
+    assert row.manage_failures == 1
+    assert row.failures == 0
     assert client.post("/api/auth/mfa/disable", json={
         "password": PASSWORD, "code": recovery[0],
     }).status_code == 200
@@ -144,7 +147,8 @@ def test_unreadable_pending_enrollment_secret_is_rejected_cleanly(account):
     response = client.post("/api/auth/mfa/confirm", json={
         "challenge_token": setup["challenge_token"], "code": "123456",
     })
-    assert response.status_code == 503 and response.json["error"] == UNREADABLE
+    assert response.status_code == 503
+    assert response.json["error"] == UNREADABLE
     assert account_row(user_id).manage_failures == 1
     assert account_row(user_id).method == ""
 
@@ -158,11 +162,13 @@ def test_suppressed_login_email_stores_no_code_and_reissue_says_so(account, monk
     sends = len(sent)
     # Enrollment left the cooldown active, so the first sign-in sends nothing.
     _, first = base.login_challenge(payload)
-    assert first["email_sent"] is False and first["warning"] == UNSENT
+    assert first["email_sent"] is False
+    assert first["warning"] == UNSENT
     assert [row.code_hash for row in challenge_rows(user_id)] == [""]
     guest, second = base.login_challenge(payload)
     assert len(sent) == sends
-    assert second["email_sent"] is False and second["warning"] == UNSENT
+    assert second["email_sent"] is False
+    assert second["warning"] == UNSENT
     assert base.verify(guest, second, recovery[0]).status_code == 200
 
 
@@ -174,7 +180,8 @@ def test_failed_login_email_forgets_its_code(account, monkeypatch):
     monkeypatch.setattr(mfa_module, "send_email_code",
                         Mock(side_effect=email_delivery.EmailDeliveryError("offline")))
     _, first = base.login_challenge(payload)
-    assert first["email_sent"] is False and first["warning"] == UNSENT
+    assert first["email_sent"] is False
+    assert first["warning"] == UNSENT
     assert "challenge_id" not in first
     assert [row.code_hash for row in challenge_rows(user_id)] == [""]
     # Still in the cooldown: the reissued challenge must not claim a code arrived.
@@ -189,7 +196,8 @@ def test_delivered_login_code_is_still_reissued(account, monkeypatch):
     base.enroll_email(client, sent)
     base.clear_cooldown(user_id)
     _, first = base.login_challenge(payload)
-    assert first["email_sent"] is True and "challenge_id" not in first
+    assert first["email_sent"] is True
+    assert "challenge_id" not in first
     assert challenge_rows(user_id)[0].code_hash
     _, second = base.login_challenge(payload)
     assert "requested recently" in second["warning"]
@@ -235,9 +243,11 @@ def test_challenge_creation_purges_only_the_current_accounts_expired_rows(accoun
             base.login_challenge(payload)
         finally:
             event.remove(webapp.engine, "before_cursor_execute", record)
-        assert statements and all("user_id" in statement for statement in statements)
+        assert statements
+        assert all("user_id" in statement for statement in statements)
         assert not challenge_exists(own_expired)
-        assert challenge_exists(other_expired) and challenge_exists(other_live)
+        assert challenge_exists(other_expired)
+        assert challenge_exists(other_live)
 
         monkeypatch.setattr(webapp.mfa, "next_purge", 0)
         webapp.mfa.purge_expired_challenges()
@@ -288,7 +298,8 @@ def test_postgres_tls_files_without_sslmode_infer_libpq_semantics(tls_calls, que
     assert not {key.lower() for key in url.query} & {"sslrootcert", "sslcert", "sslkey"}
     assert "ssl_context" in connect_args
     [call] = tls_calls
-    assert call["verify_certificate"] is verify and call["verify_hostname"] is False
+    assert call["verify_certificate"] is verify
+    assert call["verify_hostname"] is False
     assert (call["ca_file"], call["cert_file"], call["key_file"]) == files
 
 
@@ -310,19 +321,23 @@ def test_postgres_tls_files_without_sslmode_reach_pg8000_without_type_error(tls_
 ], ids=["hyphen-ca", "mixed"])
 def test_mysql_tls_files_without_ssl_mode_use_pymysql_ssl_options(tls_calls, query, expected):
     url, connect_args = options("mysql://u:p@db.example/app?charset=utf8mb4&" + query)
-    assert connect_args == {} and not tls_calls
+    assert connect_args == {}
+    assert not tls_calls
     assert not {key for key in url.query if "-" in key}
     engine = create_engine(url)
     _, arguments = engine.dialect.create_connect_args(engine.url)
-    assert arguments["ssl"] == expected and arguments["charset"] == "utf8mb4"
+    assert arguments["ssl"] == expected
+    assert arguments["charset"] == "utf8mb4"
     assert not {key for key in arguments if key.startswith("ssl") and key != "ssl"}
 
 
 def test_tls_files_with_a_mode_still_translate(tls_calls):
     _, connect_args = options("mysql://u:p@db.example/app?ssl-ca=/ca.pem&ssl-mode=VERIFY_CA")
-    assert tls_calls[-1]["ca_file"] == "/ca.pem" and tls_calls[-1]["verify_hostname"] is False
+    assert tls_calls[-1]["ca_file"] == "/ca.pem"
+    assert tls_calls[-1]["verify_hostname"] is False
     url, connect_args = options("postgres://u:p@db.example/app?sslmode=disable&sslrootcert=/ca.pem")
-    assert connect_args == {} and "sslrootcert" not in url.query
+    assert connect_args == {}
+    assert "sslrootcert" not in url.query
 
 
 # Finding 5: numeric settings never return raw Python conversion errors.
@@ -408,8 +423,8 @@ class StatusHandler(BaseHTTPRequestHandler):
         pass
 
 
-def test_post_json_opener_rejects_every_non_2xx_status():
-    StatusHandler.requests = []
+def test_post_json_opener_rejects_every_non_2xx_status(monkeypatch):
+    monkeypatch.setattr(StatusHandler, "requests", [])
     server = ThreadingHTTPServer(("127.0.0.1", 0), StatusHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

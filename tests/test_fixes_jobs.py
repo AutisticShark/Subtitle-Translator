@@ -477,7 +477,8 @@ def test_text_columns_have_no_literal_server_default_on_mysql():
         for column in table.columns:
             if isinstance(column.type, Text) and column.server_default is not None:
                 clause = str(column.server_default.arg)
-                assert clause.startswith("(") and clause.endswith(")"), (table.name, clause)
+                assert clause.startswith("("), (table.name, clause)
+                assert clause.endswith(")"), (table.name, clause)
 
 
 def test_text_expression_defaults_apply_to_raw_inserts(tmp_path):
@@ -535,9 +536,11 @@ def test_mysql_ssl_mode_becomes_a_pymysql_ssl_context(raw, verify, hostname):
 
 def test_disabled_tls_and_unsupported_modes():
     url, connect_args = _options("postgres://u:p@db.example/app?sslmode=disable")
-    assert connect_args == {} and "sslmode" not in url.query
+    assert connect_args == {}
+    assert "sslmode" not in url.query
     url, connect_args = _options("mysql://u:p@db.example/app?ssl-mode=DISABLED")
-    assert connect_args == {} and "ssl-mode" not in url.query
+    assert connect_args == {}
+    assert "ssl-mode" not in url.query
     for raw in ("postgres://u:p@db.example/app?sslmode=prefer",
                 "postgres://u:p@db.example/app?sslmode=bogus",
                 "mysql://u:p@db.example/app?ssl-mode=PREFERRED"):
@@ -545,7 +548,8 @@ def test_disabled_tls_and_unsupported_modes():
             _options(raw)
     # Other drivers understand their own parameters; leave them untouched.
     url, connect_args = _options("postgresql+psycopg://u:p@db.example/app?sslmode=require")
-    assert url.query["sslmode"] == "require" and connect_args == {}
+    assert url.query["sslmode"] == "require"
+    assert connect_args == {}
 
 
 @pytest.mark.parametrize("raw", [

@@ -90,7 +90,8 @@ def test_user_list_pages_through_every_job_with_scoped_aggregates(accounts):
         page = client.get(f"/api/jobs?limit=3&offset={offset}").json
         assert page["total"] == 7
         assert page["counts"] == expected_counts(accounts["owner_statuses"])
-        assert page["offset"] == offset and page["limit"] == 3
+        assert page["offset"] == offset
+        assert page["limit"] == 3
         seen.extend(job["id"] for job in page["jobs"])
         assert page["has_more"] == (len(seen) < 7)
         if not page["has_more"]:
@@ -116,7 +117,9 @@ def test_list_parameters_are_validated_and_bounded(accounts):
     assert client.get("/api/jobs?limit=0").json["limit"] == 1
     beyond = client.get("/api/jobs?offset=99999999999").json
     assert beyond["offset"] == webapp.JOB_LIST_MAX_OFFSET
-    assert beyond["jobs"] == [] and beyond["has_more"] is False and beyond["total"] == 7
+    assert beyond["jobs"] == []
+    assert beyond["has_more"] is False
+    assert beyond["total"] == 7
 
 
 def test_admin_panel_view_reports_panel_wide_aggregates(accounts):
@@ -130,7 +133,8 @@ def test_admin_panel_view_reports_panel_wide_aggregates(accounts):
     panel = client.get("/api/jobs?all=1&limit=2").json
     assert panel["counts"] == expected
     assert panel["total"] == sum(expected.values())
-    assert len(panel["jobs"]) == 2 and panel["has_more"] is True
+    assert len(panel["jobs"]) == 2
+    assert panel["has_more"] is True
     assert "owner" in panel["jobs"][0]
     # Without ?all=1 an administrator sees only their own (here: no) jobs.
     own = client.get("/api/jobs").json
