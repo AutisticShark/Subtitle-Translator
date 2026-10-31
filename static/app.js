@@ -209,7 +209,7 @@ async function renderCaptcha(slot, action) {
     return;
   }
   const existing = state.captchaWidgets[slot];
-  if (existing && existing.provider === provider && existing.siteKey === siteKey
+  if (existing?.provider === provider && existing.siteKey === siteKey
       && existing.theme === theme && (provider !== 'turnstile' || existing.action === action)) {
     resetCaptcha(slot);
     return;
@@ -859,14 +859,14 @@ function scheduleJobsPoll(delay) {
     // Every authenticated request may refresh the session cookie, so an
     // unattended background tab must not poll; resume when it is shown again.
     if (document.hidden) state.pollDeferred = true;
-    else loadJobs();
+    else void loadJobs();
   }, delay);
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.hidden || !state.pollDeferred) return;
   state.pollDeferred = false;
-  loadJobs();
+  void loadJobs();
 });
 
 // A request sent with a cookie that an MFA change just rotated fails with 401
@@ -938,7 +938,7 @@ async function loadJobs() {
 
 function showJobsPage(offset) {
   state.jobsOffset = Math.max(0, offset);
-  loadJobs();
+  void loadJobs();
 }
 
 async function jobAction(event) {
