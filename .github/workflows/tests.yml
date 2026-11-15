@@ -13,69 +13,113 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  python:
-    name: Python ${{ matrix.python-version }}
+  backend:
+    name: Go tests and race detector
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.10-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -coverprofile=coverage.out ./...
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379/0
+
+  postgres:
+    name: PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.7-alpine@sha256:75dcac3dfb1cd01ca3536910bbc84128759362f8b118bf8c55b38a94f68f3b73
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: subtitle_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d subtitle_test"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/app
+        env:
+          TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/subtitle_test?sslmode=disable
+
+  mysql:
+    name: ${{ matrix.name }} integration
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version:
-          - "3.11"
-          - "3.12"
-          - "3.13"
-          - "3.14"
-          - "3.15"
-
+        include:
+          - name: MariaDB
+            scheme: mariadb
+            image: mariadb:13.0.2@sha256:54f493ea0d60b621a5bff84e5b20100f8b86b6efa6b79158e04756c5194a5e4d
+            health: healthcheck.sh --connect --innodb_initialized
+          - name: MySQL
+            scheme: mysql
+            image: mysql:9.7.4@sha256:df90258da46f6e7ff8574ff84f17618aba0765cac749928299c69fd4e7cb8ad8
+            health: mysqladmin ping -h 127.0.0.1 --silent
+    services:
+      database:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "1"
+          MYSQL_DATABASE: subtitle_test
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "${{ matrix.health }}"
+          --health-interval 5s --health-timeout 5s --health-retries 30
     steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
-
-      - name: Run offline test suite
-        run: python -m pytest -q
-
-  lint:
-    name: Ruff
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        with:
-          python-version: "3.15"
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Install lint dependency
-        run: python -m pip install "$(grep '^ruff==' requirements-dev.txt)"
-
-      - name: Run Ruff
-        run: python -m ruff check .
+          go-version-file: go.mod
+      - run: go test -race ./internal/app
+        env:
+          TEST_DATABASE_URL: ${{ matrix.scheme }}://root@127.0.0.1:3306/subtitle_test
 
   frontend:
-    name: Frontend syntax
+    name: Svelte, TypeScript 7 and browser tests
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          node-version: "26"
-
-      - name: Check JavaScript syntax
-        run: node --check static/app.js
+          go-version-file: go.mod
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "26.13.1"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run check && npm run build
+        working-directory: web
+      - run: go build -trimpath -o bin/subtitle-translator ./cmd/subtitle-translator
+      - run: npx playwright install --with-deps chromium
+        working-directory: web
+      - run: npm test
+        working-directory: web
+        env:
+          TEST_BINARY: ../bin/subtitle-translator
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: browser-test-results
+          path: web/test-results/
+          retention-days: 7

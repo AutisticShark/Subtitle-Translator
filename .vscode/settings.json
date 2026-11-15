@@ -1,0 +1,9 @@
+{
+    "claudeCode.lockEditorGroups": false,
+    "workbench.editor.autoLockGroups": {
+        "terminalEditor": false,
+        "workbench.editor.processExplorer": false,
+        "mainThreadWebview-simpleBrowser.view": false,
+        "mainThreadWebview-browserPreview": false
+    }
+}

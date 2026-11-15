@@ -6,6 +6,7 @@ services:
     ports:
       - "${PORT:-8000}:8000"
     environment:
+      LISTEN_ADDR: ":8000"
       DATABASE_URL: "${DATABASE_URL:-}"
       # An explicitly blank REDIS_URL disables caching. Unset uses this stack's Redis.
       REDIS_URL: "${REDIS_URL-redis://redis:6379/0}"
@@ -15,6 +16,7 @@ services:
       API_KEY_ENCRYPTION_KEY: "${API_KEY_ENCRYPTION_KEY:-}"
       JWT_COOKIE_SECURE: "${JWT_COOKIE_SECURE:-0}"
       SESSION_MAX_HOURS: "${SESSION_MAX_HOURS:-12}"
+      JWT_ACCESS_MINUTES: "${JWT_ACCESS_MINUTES:-30}"
       TRUSTED_PROXY_COUNT: "${TRUSTED_PROXY_COUNT:-0}"
       EMAIL_PROVIDER: "${EMAIL_PROVIDER:-}"
       EMAIL_FROM: "${EMAIL_FROM:-}"
@@ -52,6 +54,7 @@ services:
       HCAPTCHA_SECRET_KEY: "${HCAPTCHA_SECRET_KEY:-}"
       # Backward-compatible one-time bootstrap; prefer ADMIN_PASSWORD.
       APP_PASSWORD: "${APP_PASSWORD:-}"
+      APP_DEBUG: "${APP_DEBUG:-0}"
       FLASK_DEBUG: "${FLASK_DEBUG:-0}"
       JOB_WORKERS: "${JOB_WORKERS:-2}"
       MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-200}"
@@ -67,7 +70,7 @@ services:
       - cache
 
   redis:
-    image: redis:8.10-alpine
+    image: redis:8.10-alpine@sha256:7958cfbb9d152f87dadfbc89f1b0b15938f0b81ff8982feb327476f4911935c3
     restart: unless-stopped
     command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
     mem_limit: 192m
@@ -84,8 +87,10 @@ services:
 
 networks:
   default:
+    enable_ipv6: true
   cache:
     internal: true
+    enable_ipv6: true
 
 volumes:
   subtitle_data:

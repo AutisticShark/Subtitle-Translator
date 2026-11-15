@@ -1,12 +1,12 @@
 # Email delivery
 
-Subtitle Translator includes a shared transactional email service in `email_delivery.py`. MFA enrollment, login codes, resends, and account management codes all use this service. Other application features can reuse it without depending on MFA or Flask.
+Subtitle Translator includes a shared transactional email service in `internal/email`. MFA enrollment, login codes, resends, and account management codes all use its `Sender` interface. Other application features can reuse it without depending on authentication or HTTP handlers.
 
 Configuration belongs to the deployment environment, as in the previous SMTP implementation. It is not saved in SQL, Redis, or the administrator settings API. Only email availability is exposed to the account security screen.
 
 ## Choose a provider
 
-Set `EMAIL_PROVIDER` and `EMAIL_FROM`, then the selected provider's variables. With Compose, edit `.env` and recreate the application service. Install the updated `requirements.txt` for a direct Python deployment. The Dockerfile automatically includes the new root Python module and installs the AWS SDK.
+Set `EMAIL_PROVIDER` and `EMAIL_FROM`, then the selected provider's variables. With Compose, edit `.env` and recreate the application service. For a direct deployment, export the variables before starting the Go binary. The AWS SDK is compiled into the server; no additional runtime packages are needed.
 
 `EMAIL_FROM` accepts a single address or a display name and address, such as `Subtitle Translator <noreply@example.com>`. Aliyun restricts the display name to 15 characters; use `Subtitles <noreply@example.com>` or a bare address there.
 
@@ -40,9 +40,9 @@ AWS_SECRET_ACCESS_KEY=your-secret-access-key
 AWS_SESSION_TOKEN=
 ```
 
-SES uses the official Boto3 client for the [SES v2 SendEmail API](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html). Verify the sender identity in the selected region and grant the sending identity `ses:SendEmail`. If the account is in the [SES sandbox](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html), recipients must also be verified, except for the mailbox simulator. `AWS_SES_CONFIGURATION_SET` is optional and must name a configuration set in that region.
+SES uses the official AWS SDK for Go v2 for the [SES v2 SendEmail API](https://docs.aws.amazon.com/ses/latest/APIReference-V2/API_SendEmail.html). Verify the sender identity in the selected region and grant the sending identity `ses:SendEmail`. If the account is in the [SES sandbox](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html), recipients must also be verified, except for the mailbox simulator. `AWS_SES_CONFIGURATION_SET` is optional and must name a configuration set in that region.
 
-Region selection is `AWS_SES_REGION`, then `AWS_REGION`, then `AWS_DEFAULT_REGION`. A region is required. Leave access-key fields blank to use the [AWS SDK credential chain](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html), including IAM roles. Temporary environment credentials also require `AWS_SESSION_TOKEN`. Host credential files and role settings are not automatically mounted or forwarded into Compose containers; supply those deployment-specific mounts or environment settings when using them.
+Region selection is `AWS_SES_REGION`, then `AWS_REGION`, then `AWS_DEFAULT_REGION`. A region is required. Leave access-key fields blank to use the [AWS SDK credential chain](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-gosdk.html), including IAM roles. Temporary environment credentials also require `AWS_SESSION_TOKEN`. Host credential files and role settings are not automatically mounted or forwarded into Compose containers; supply those deployment-specific mounts or environment settings when using them.
 
 ### Aliyun DirectMail
 
@@ -82,41 +82,28 @@ Configure a verified sending domain and a sending API key. The adapter calls the
 
 The service supports one recipient, a subject of up to 256 characters, a required plain text body, and optional HTML. It validates addresses and rejects header control characters before calling any provider. Bulk recipients, attachments, custom headers, and bounce processing are outside this interface.
 
-Network operations use 10-second connection/socket timeouts with certificate validation. HTTP adapters reject redirects and bound response reads. SES uses the SDK's service endpoint resolution and ignores custom endpoint URL configuration. The service makes one send attempt; it does not automatically retry or switch providers after a failure. A timeout can happen after provider acceptance, so an automatic retry could send duplicate codes. MFA retains its existing SQL send reservations, cooldowns, challenge expiry, and explicit resend flow.
+Network operations use bounded connection/socket timeouts with certificate validation and a 30-second overall send deadline. HTTP adapters reject redirects and bound response reads. SES uses the SDK's service endpoint resolution and ignores custom endpoint URL configuration. The service makes one send attempt; it does not automatically retry or switch providers after a failure. A timeout can happen after provider acceptance, so an automatic retry could send duplicate codes. MFA retains its existing SQL send reservations, cooldowns, challenge expiry, and explicit resend flow.
 
 Success indicates acceptance by the provider or SMTP relay; it does not confirm arrival in the inbox. Provider exceptions and response bodies are replaced with a generic error before reaching MFA. Do not enable SMTP or AWS SDK wire/debug logging in a deployment handling real credentials or verification messages.
 
-To validate local configuration without sending mail, run this inside the application's environment:
+The server validates local provider configuration at startup without sending mail. The Account screen exposes whether email enrollment is available, not the provider's credentials. Local validation does not probe account permissions, sender verification, quotas, or connectivity. Test delivery through an email enrollment with a mailbox you control. Keep recovery codes available before testing an existing MFA account or changing providers.
 
-```console
-python -c "from email_delivery import configured_provider; print(type(configured_provider()).__name__)"
-```
-
-This checks local configuration only. It does not probe credentials, account permissions, sender verification, quotas, or connectivity. Test delivery through an email MFA enrollment with a mailbox you control. Keep recovery codes available before testing an existing MFA account or changing providers.
-
-The automated suite uses mocked SMTP/HTTP transports, the real AWS SDK with its offline Stubber, and Alibaba's published signature vector. It also checks MFA failures and recovery. These checks do not establish real provider delivery or deployed container operation.
+The automated suite uses an in-process TLS SMTP server, mocked HTTP transports, the real AWS SDK with offline request checks, and Alibaba's published signature vector. It also checks MFA failures and recovery. These checks do not establish real provider delivery or deployed container operation.
 
 ## Add another provider
 
-Implement a factory accepting `(environment, sender)` and returning an object with `send(message: OutboundEmail) -> None`. Validate configuration in the factory without doing network I/O. Raise `EmailConfigurationError` with a fixed, secret-free configuration message when necessary. Submit once in `send`, and raise on rejection or ambiguous failure. The common service sanitizes transport exceptions.
+Implement `email.Sender`:
 
-Register trusted code at application startup, before requests are served, in every worker:
-
-```python
-from email_delivery import register_provider
-from my_mail_adapter import MyMailProvider
-
-register_provider("my_provider", MyMailProvider)
+```go
+type Sender interface {
+    Send(ctx context.Context, to, subject, text, html string) error
+}
 ```
 
-Then select `EMAIL_PROVIDER=my_provider`. For an in-tree provider, add its factory to `_PROVIDERS` in `email_delivery.py`. Provider names cannot replace existing registrations, and environment values never cause dynamic imports. Keep mail-provider secrets deployment-only. Add its environment variables to `.env.example` and `compose.yaml`, document setup, and add offline request and failure tests.
+Validate deployment configuration in the constructor without network I/O. Return a secret-free error wrapping `email.ErrConfiguration` for invalid configuration. Send once; return `email.ErrDelivery` for rejection or an ambiguous failure without including provider response bodies, recipient addresses, or credentials. Honor context cancellation, require verified TLS, reject redirects, and bound response bodies.
 
-Application callers use the same function for all providers:
+For an in-tree provider, add its constructor to the explicit provider switch in `internal/email/email.go`. Environment values must never load code dynamically. Add its variables to `.env.example` and `compose.yaml`, document setup, and add offline request, timeout, redirect, and acceptance tests. Applications embedding this server can also inject a trusted `Sender` through `app.Config.Email`.
 
-```python
-from email_delivery import send_email
+Application callers can construct a sender with `email.FromEnv()` or `email.New(environment)`. A disabled provider returns `(nil, nil)`, so check for nil before calling `sender.Send(ctx, recipient, subject, text, html)`.
 
-send_email(recipient, "Notification", "Plain text message", html="<p>Message</p>")
-```
-
-Callers must enforce their own authorization and send limits before calling this function. Escape user content when building HTML. Keep authentication challenges and their secrets in the MFA layer; mail adapters only deliver already-composed messages.
+Callers enforce authorization and send limits before invoking the transport. Escape user content when building HTML. Keep challenges and secrets in the MFA layer; mail adapters deliver already-composed messages.

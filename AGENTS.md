@@ -1,100 +1,100 @@
 # Subtitle Translator agent guide
 
-This file applies to the entire repository. Read `MEMORY.md` before making changes; it contains the evidence-based retrospective from earlier work. Keep both files updated when a session reveals a reusable project-specific lesson.
+This file applies to the entire repository. Use Git history for retired source and record reusable project-specific lessons here. Keep personal agent memory out of this repository.
 
 ## Project map
 
-- `srt_translate.py` contains the translation pipeline, provider clients (including Google Cloud Translation - Basic v2), retry/throttling behavior, segmentation, tag masking, cue rebuilding, and wrapping. It is a library for the web app; there is no CLI.
-- `subtitle_formats.py` adapts SRT, VTT, ASS, and SSA files to and from the shared cue model. Preserve format-specific headers, timings, settings, dialogue fields, newline style, BOM state, and inline tags.
-- `webapp.py` is the Flask API, authentication/authorization layer, upload/download boundary, and background job runner. `DATA_DIR` is resolved at import time. Logic that does not need Flask or module-level state lives beside it: `settings_schema.py` (declarative setting bounds and validation), `quotas.py` (transactional job-quota accounting; clock and defaults injected), `captcha.py` (Siteverify protocol), and `timeutil.py`. Tests patch `webapp.now_datetime`, `webapp.read_cache`, `webapp.update_job`, `webapp.provider_for`, and similar module globals, so keep those orchestration functions in `webapp.py` and inject their dependencies into extracted modules.
-- `email_delivery.py` owns the shared email provider registry and SMTP, SES, Aliyun DirectMail, and Resend transports. `mfa.py` composes verification messages and owns their authorization, SQL challenges, and send limits.
-- `database.py` defines the portable SQLAlchemy schema, SQLite legacy migration, URL normalization (including `sslmode`/`ssl-mode` translation for pg8000 and PyMySQL) for SQLite, PostgreSQL, MariaDB, and MySQL, and the one-time pre-fork initialization called from `gunicorn.conf.py`.
-- `static/app.js` and `templates/index.html` implement the browser UI.
-- `i18n.py` and `locales/*.json` provide request-locale negotiation and web/API message catalogs. English source strings are the fallback.
-- `tests/` currently covers subtitle-format preservation and an Echo-provider web job. Echo is the preferred offline end-to-end provider.
-- `.github/workflows/docker-publish.yml` publishes to GHCR unconditionally and to Docker Hub only when all three Docker Hub settings are present.
+- `cmd/subtitle-translator/` is the HTTP server entrypoint and container health probe. This is a web application, not a subtitle translation CLI.
+- `internal/app/` owns the API, authentication, MFA, settings, portable SQL schema/migrations, quotas, CAPTCHA, optional Redis cache, and background jobs. `Config` injects the clock, translator, email sender, and test HTTP client. `New` initializes storage and recovers interrupted jobs; `Close` cancels and finalizes workers.
+- `internal/engine/` owns SRT/VTT/ASS/SSA parsing/rendering, encodings, masking, segmentation, batching, wrapping, retries, throttling, and Anthropic/OpenAI-compatible/DeepL/Google/Echo providers. It has no HTTP-server or database dependency.
+- `internal/email/` owns SMTP, AWS SES v2, Aliyun DirectMail, and Resend behind `Sender`. Deployment secrets never enter SQL or the settings API.
+- `web/src/` is Svelte 5 with TypeScript 7 and plain CSS. `lib/appState.svelte.ts` owns session-scoped UI state; `lib/api.ts` owns requests and CSRF. Components divide translation, job history, settings, users, accounts, authentication, and CAPTCHA.
+- `assets.go` embeds the Vite build and `locales/*.json` in the Go binary. `web/dist/.gitkeep` lets Go-only tests compile in a clean checkout before the frontend is built. Production builds must build the frontend first.
+- `locales/` contains English fallback, 正體中文, and 简体中文 catalogs. `assets_test.go` checks frontend/backend catalog coverage, placeholder preservation, packaging, and publishing branches.
+- `internal/engine/testdata/python_golden.json.gz` preserves 4,950 cases from the Python engine. Its optional generator uses a separate pre-migration checkout; ordinary tests need no Python.
+- `Dockerfile` builds Svelte assets, embeds them in a static Go binary, and runs on Alpine. `docker-entrypoint.sh` repairs ownership of the default legacy volume without following symlinks, then drops to UID/GID 1000.
 
 ## Required invariants
 
-- Never expose saved API-key values through `GET /api/settings`; the UI may receive only configured/not-configured state.
-- Keep provider settings and API-key mutation administrator-only. Saved API keys use `enc:v1:` Fernet encryption; never silently replace an unreadable key or log its value.
-- Keep all application data APIs JWT-protected. Browser JWTs stay in HttpOnly `SameSite=Strict` cookies with CSRF enabled; `/healthz`, `/api/i18n`, the setup-status/setup/login/registration endpoints, and the initial HTML page are the intentional public boundaries. `/api/i18n` may expose only static catalog and language-label data; setup-status may additionally expose only registration state and the active CAPTCHA provider's public widget configuration.
-- Scope every non-admin job read, mutation, and download by `user_id`. Use a not-found response for another user's job so its existence is not disclosed.
-- Store job errors verbatim, but serialize them through `job_dict(row, viewer)`: provider responses can quote account details or partially masked API keys, so only administrators see them. Non-admins see their own file problems (`SUBMITTER_VISIBLE_ERRORS`) and otherwise a localized generic message.
-- User deactivation, password changes, and role changes must invalidate existing tokens. Never allow deletion, deactivation, or demotion of the final active administrator.
-- MFA challenge JWTs must never authorize application APIs. Keep challenge purpose, user, token version, expiry, failure budgets, email send limits, and single-use OTP/recovery consumption in SQL. Lock the user row before MFA reads/mutations across all backends; a process-local lock cannot prevent replay across workers. Require password plus an existing factor to disable MFA or replace recovery codes, and never remove MFA as a side effect of an administrator password reset.
-- Keep `/healthz` unauthenticated so Docker and reverse proxies can probe it.
-- Sanitize uploaded filenames, isolate files under random job IDs, and only serve outputs registered to the requested job.
-- Preserve subtitle structure and formatting while translating text. Add or change format behavior with focused round-trip tests.
-- The project is web-app only; the command-line interface was removed. Do not reintroduce a CLI entry point without an explicit request.
-- Treat `data/` as persistent runtime state. Tests must set `DATA_DIR` before importing `webapp` and must not use the repository's real data directory.
-- Do not commit secrets, real API keys, job data, translated media, or generated caches.
+### Authentication and authorization
 
-## Regression-prevention rules from prior work
+1. Never expose saved provider or CAPTCHA secrets through settings responses. Return configured/not-configured state only. Administrators alone may mutate panel/provider settings or keys.
+2. Preserve `enc:v1:` Fernet compatibility. The derived key is SHA-256 of `subtitle-api-keys\0` followed by `JWT_SECRET_KEY`; `API_KEY_ENCRYPTION_KEY` may override it. Never silently replace unreadable secrets or log their values. Decrypt only the secrets needed by the current provider/action.
+3. Preserve existing Argon2id PHC hashes, JWT signing/claims, cookies, and MFA data. Password length is counted in Unicode code points, not bytes. Validate untrusted hash parameters before allocating Argon2 memory.
+4. All application data APIs require access authentication. `/healthz`, `/api/i18n`, setup-status/setup/login/register, narrowly scoped MFA verify/resend, and the initial HTML/assets are intentional public boundaries. Public localization and bootstrap data must contain only static catalogs, labels, and public configuration.
+5. Browser access JWTs stay in HttpOnly `SameSite=Strict` cookies. Mutating cookie-authenticated requests require the JWT-bound `X-CSRF-TOKEN` header. Header bearer transport is for API clients; never store access JWTs in browser storage.
+6. Every authenticated request checks SQL user activity, token version, JWT revocation, and session revocation. Deactivation, password changes, role changes, and MFA changes invalidate existing tokens. Logout revokes both the token and `sid:<id>`.
+7. Refresh only an otherwise valid cookie session, preserving `ver`, `sid`, and `sst`. Never extend expiry past `sst + SESSION_MAX_HOURS`; pre-upgrade tokens use `iat`. Do not refresh login/setup/register/logout/MFA responses or overwrite a newly issued access cookie.
+8. First-administrator setup and final-active-administrator protection must be safe under concurrent requests and independent processes. Administrators cannot delete, deactivate, or demote themselves. Recheck the actor inside the serializing transaction.
+9. Login guesses reserve a SQL attempt before password hashing. Use conditional updates, not read-modify-write counters. Proxy address extraction trusts exactly `TRUSTED_PROXY_COUNT` hops and supports IPv4 and IPv6.
 
-1. In an async DOM event handler, capture `event.currentTarget` synchronously before the first `await`, then use the captured element afterward. `event.currentTarget` can be `null` after control returns to the event loop. This previously broke translation-form cleanup and settings-form cleanup (commit `df532a4`).
-2. Do not pass a blank optional image name to `docker/metadata-action`, even with an `enable=false` fragment. Build the image list so it contains only complete, non-empty names. This previously broke GHCR-only publishing when Docker Hub variables were absent (commit `3237715`).
-3. `pytest` alone does not exercise browser event lifetime or GitHub Actions expression/action parsing. For frontend async-handler changes, inspect every post-`await` event access and perform a browser smoke test when available. For publishing changes, reason through both GHCR-only and GHCR-plus-Docker-Hub branches and validate the workflow when tooling is available.
-4. Translation progress must be reported from completed translation batches, not only from target-language boundaries. Map each target's batch fraction into its share of the overall job range so multi-language jobs remain monotonic.
-5. Job cancellation is cooperative and race-safe. A `queued` job has no worker, so cancel it straight to `canceled`; move a `processing` job to `canceling` and let only its worker finalize it. Both transitions are conditional `UPDATE ... WHERE status = ...` statements with a rowcount check. The in-memory event reaches only the same process, so running jobs also poll their own SQL status (throttled by `CANCEL_POLL_SECONDS`). Completion, failure, and progress updates must be conditional on the current status so they cannot overwrite a concurrent cancellation; a failure after a recorded cancellation finalizes as `canceled`.
-6. Google Cloud Translation - Basic v2 accepts at most 128 strings per request and returns HTML-escaped `translatedText` values. Keep batches within that limit, unescape each value, and reject any response whose translation count differs from the input count so subtitle segments cannot be misaligned.
-7. When writing explicitly assembled CRLF subtitle text, disable Python's platform newline translation (`newline=""`). Otherwise Windows converts each `\n` inside `\r\n` again and emits malformed `\r\r\n` line endings.
-8. Echo is a development provider: expose and accept it in the web app only when Flask debug mode is enabled. Enforce this on the server as well as filtering the UI; Echo remains available to offline tests.
-9. JWT cookie authentication requires a CSRF header on `POST`, `PUT`, `PATCH`, and `DELETE`. Browser code reads `csrf_access_token` only for the double-submit header; it must never copy the HttpOnly access JWT into JavaScript storage.
-10. Database portability requires SQLAlchemy expressions, not backend-specific placeholders or upsert syntax. Ordinary `postgresql://`, `mariadb://`, and `mysql://` URLs are normalized to installed drivers; compile schema tests for all supported dialects when changing tables.
-11. Translation submission limits count jobs, not HTTP requests: every uploaded subtitle consumes one unit. Enforce the per-account role limit and the panel-wide limit in the same database transaction as all job inserts, serialize submissions through the shared settings row, and reject a multi-file upload atomically with HTTP 429 and `Retry-After`.
-12. Keep stored job statuses and stages locale-neutral. Localize them while serializing the response so shared jobs can be viewed in different interface languages. Locale selection order is explicit `?lang=`, the non-sensitive `ui_locale` cookie, browser `Accept-Language`, then English fallback.
-13. Keep the Docker runtime manifest synchronized with application imports and non-Python runtime assets. Top-level Python modules are copied with `COPY *.py ./`; asset directories such as `locales/`, `templates/`, and `static/` require explicit copies. A missing `i18n.py` previously made Gunicorn workers fail at boot, and omitting `locales/` would fail catalog loading next.
-14. CAPTCHA is a server-side security boundary, not a trusted browser flag. Keep CAPTCHA secret keys write-only and encrypted, expose only the active provider's public site key, verify every required token against the provider's fixed Siteverify endpoint, and fail closed on missing configuration or provider errors. Validate the returned hostname and the Turnstile action. Never derive the expected hostname from `Host`, `X-Forwarded-Host`, or `request.url_root`, which the client controls: compare against the configured `captcha_hostname`. Saving settings that enable a provider without a hostname is rejected; legacy configurations without one skip only the hostname comparison and log a warning. In the browser, wait until the provider's `render` function exists, not just its global (reCAPTCHA creates a stub first). Retain rate limits because CAPTCHA does not replace request throttling.
-15. Appearance is an account preference, not a global panel setting. Preserve `system`, `light`, and `dark` as the accepted values, render the authenticated preference on the initial HTML response to avoid a theme flash, and recreate theme-sensitive CAPTCHA widgets when the resolved scheme changes.
-16. Translation caches are keyed by 24-character lowercase hexadecimal content hashes with string values. If a file-backed cache is ever reintroduced, treat it as untrusted input: load it through a file handle, validate keys and values, and stream JSON to the already-selected file handle rather than passing serialized content to `Path.write_text` (Sonar rule `pythonsecurity:S2083`).
-17. Keep the direct `python webapp.py` development server bound to a loopback address. Network-facing container access belongs to the production Gunicorn command in `Dockerfile`; do not expose Flask's development server on every interface.
-18. Redis is a disposable read cache. Every settings or job mutation must bump its `cache_revisions` marker in the same SQL transaction, including ownership changes and startup recovery. Cache raw locale-neutral rows, scope job keys by account/admin view, and keep authentication, quotas, mutations, and download authorization in SQL. Never make Redis invalidation or availability a prerequisite for correctness.
-19. Send transactional email through `email_delivery.send_email`, keeping credentials deployment-only and provider responses private. Preserve legacy SMTP selection when `EMAIL_PROVIDER` is blank, require TLS, and never automatically retry or switch providers after an ambiguous send failure. Provider additions need offline transport tests plus `.env.example`, Compose, and documentation updates. Keep MFA limits and challenge consumption in SQL regardless of the selected transport.
-20. Per-address limits and CAPTCHA `remoteip` use `request.remote_addr`. Behind a reverse proxy that is the proxy's address unless `TRUSTED_PROXY_COUNT` is set to the exact proxy count (Werkzeug `ProxyFix`). Increment failed-login counters with a single SQL UPDATE, never read-modify-write, so parallel guesses cannot under-count.
-21. `db_lock` is a `threading.Lock` and protects nothing across Gunicorn workers, and SQLite's deferred transactions take no lock until the first write. Every check-then-act on shared state (final-admin count, login attempt budget, job status transitions) must either be one conditional `UPDATE` whose rowcount is checked, or run after a serializing write such as the shared settings-row update used by quotas and user administration. Reserve a login attempt atomically before the slow password hash, and make the success reset conditional on the lock state observed before verification.
-22. The cookie-refresh hook in `security_headers` may re-issue a token only when the user is active, the presented `ver` equals the current `token_version`, and neither the `jti` nor the session id (`sid`) is revoked. Re-issued tokens keep their `ver`, `sid`, and session start `sst`, and no token may expire after `sst + SESSION_MAX_HOURS` (tokens without `sst` count from their `iat`). Logout revokes the `sid` (stored as `sid:<id>` in `revoked_tokens`) so earlier refreshed tokens of that session die too. Skip refresh on login, registration, setup, and any response that already sets the access cookie.
-23. Schema creation, migrations, and interrupted-job recovery run once in the Gunicorn master through the `gunicorn.conf.py` `on_starting` hook, before workers fork; workers inherit `SUBTITLE_TRANSLATOR_STARTUP_RECOVERED=1` and skip recovery. Recovery in a worker would fail jobs that sibling workers are still running. Startup steps must still be idempotent under concurrent boots (`retry_database_race`).
-24. Translate masked text, not raw markup: wrap lines while tags are still single zero-width sentinel tokens, detect speaker dashes after leading sentinels, never send segments with no text besides tags, and reject replies whose placeholder multiset differs from the source so the existing retry and fallback path handles them. Provider transport errors (timeouts, `http.client.HTTPException`, non-JSON bodies) and malformed replies (`null` or list `content`, a refusal, an empty translation of a line that has text) must become retryable `TranslationError`; only `RateLimitError` and `FatalTranslationError` may escape the per-line fallback. Server-supplied rate-limit delays are untrusted: reject non-finite values and give up rather than wait beyond `MAX_RATE_LIMIT_WAIT`.
-25. Validate an upload's extension on the original filename and build its display name with `upload_display_name`, which keeps Unicode. `secure_filename` strips all non-ASCII characters and rejected CJK and Cyrillic names. Files on disk keep the fixed `source.<ext>` name.
-26. MySQL rejects literal defaults on `TEXT`/`BLOB`/`JSON` columns; use parenthesized expression defaults such as `text("('')")` or Python-side defaults. A schema test enforces this for the MySQL dialect.
-27. Decrypt only the secrets a code path needs: `read_settings(include_secrets={...})` with the selected provider's key, never `True` on login, registration, upload, or job paths. One unreadable stored secret previously returned 500 for every login and failed every job, whatever the provider. An unreadable MFA secret must still spend the failure budget and return a JSON error, not roll back.
-28. WebVTT cue text is HTML-escaped. Decode character references only in the text between tags before translation, and escape `&`, `<`, `>` only in translated text (never in restored tags) when rendering; untouched cues must round-trip byte-for-byte. SRT/ASS text is not entity-decoded.
-29. Inside a transaction that holds one user's row lock, touch only that user's rows. A range `DELETE` across all users (for example purging expired MFA challenges) takes gap locks on MySQL/MariaDB that the user lock does not order, which deadlocks; purge afterward in a separate best-effort transaction by primary key. A stored email `code_hash` must mean that a send was attempted and not known to have failed.
-30. Tests must not patch `time.sleep` globally (it busy-spins `interruptible_sleep` and disables sleeps in every worker thread); patch `srt_translate._retry_delay` instead. `tests/conftest.py` restores `webapp.app.config` after every test, so a test may change `DEBUG`/CSRF settings without leaking into later modules.
+### MFA and email
+
+1. MFA challenge JWTs use a separate key/audience and must never authorize application APIs. Bind purpose, account, version, transport, expiration, and challenge identity to SQL state. Lock that account before reading or consuming factor state.
+2. TOTP steps, email OTPs, and recovery codes are single-use. Enrollment, verification, management failure budgets, cooldowns, and send reservations persist in SQL. An unreadable factor still spends its failure budget and returns a safe error.
+3. Disabling MFA or replacing recovery codes requires the password plus an existing factor. Administrative password reset never disables MFA. Login and management failure budgets are separate.
+4. While holding one user's row lock, touch only that user's MFA rows. Purge expired challenges afterward in a separate best-effort transaction by primary key; cross-user range deletes can deadlock on MySQL/MariaDB.
+5. A stored email `code_hash` means sending was attempted and is not known to have failed. Do not retry or fail over after an ambiguous delivery failure. Treat SMTP DATA acceptance as success even if QUIT fails.
+6. Transactional email goes through `email.Sender`, with TLS, fixed provider endpoints, no redirects, bounded reads, and sanitized errors. Preserve blank-provider SMTP fallback. Bad email configuration disables email enrollment, not the whole application or recovery access. Adapter additions need offline tests, `.env.example`, Compose, and documentation updates.
+
+### Jobs, storage, and databases
+
+1. Scope every non-admin job list/read/cancel/delete/download by `user_id`. Another user's job returns 404, never an existence-revealing authorization error. Administrator cross-owner history is explicit.
+2. Validate extensions on original upload names; preserve sanitized Unicode display names. Store sources under random job IDs with the fixed `source.<ext>` name. Authorize downloads against registered output names, not arbitrary paths. Keep path and symlink guards.
+3. Store errors verbatim for diagnosis, but serialize provider errors to administrators only. Submitters may see their own format/encoding problems; other failures get a localized generic error. Provider errors can contain account or key fragments.
+4. Job progress originates in completed translation batches and maps monotonically across target languages. Store statuses/stages locale-neutral; localize on serialization.
+5. Cancellation is cooperative and race-safe. Queued jobs go directly to canceled; processing jobs move to canceling and only their worker finalizes them. Completion, failure, and progress updates are conditional on current status. Never delete active job files. Cancellation must interrupt request contexts and retry/throttle waits.
+6. Recover interrupted jobs once when the server starts, not on an individual worker's restart. Jobs do not resume. Stop the old application before starting another process against the same storage. Call HTTP `Shutdown` before application `Close`.
+7. Job quotas count files, not HTTP requests or targets. Enforce per-role, per-account, and panel limits in the same transaction as all job inserts, serialized through the settings row. A multi-file rejection is atomic and returns 429 plus `Retry-After`. Calendar periods are UTC; changing window settings does not erase calendar usage.
+8. SQLite, PostgreSQL, MySQL, and MariaDB share the legacy schema and string timestamp formats. Migrations are additive and idempotent. Keep MySQL TEXT defaults as parenthesized expressions. Retry known transaction serialization/deadlock conflicts, including MariaDB 13's error 1020; do not retry external side effects.
+9. Preserve documented database TLS semantics, including encrypt-only `require`/`REQUIRED`, certificate-only `verify-ca`/`VERIFY_CA`, and hostname-verifying modes. Reject opportunistic plaintext fallback. Never leak credentials from a database URL in returned or logged errors.
+10. Redis is disposable. Every relevant mutation changes its revision in the same SQL transaction. Cache raw locale-neutral data, scope entries to account/admin view, encrypt and bind payloads to keys, and fall back to SQL on outages. Authentication, authorization, quotas, and mutations always use SQL. Keep the Go cache namespace distinct from Python's old cache entries.
+11. Publish ZIPs without replacing an archive another request has open; concurrent downloads must work on Windows as well as Linux.
+
+### Subtitle engine
+
+1. Preserve format-specific headers, timing/cue settings, ASS/SSA fields, BOM, newline style, drawings, inline tags, and speaker structure. Output is UTF-8. Add focused round-trip tests for every format change, and retain the Python golden corpus.
+2. Translate masked text, not raw markup. Keep tags as zero-width sentinel tokens while wrapping, recognize speaker dashes after leading tags, skip markup-only segments, and validate the placeholder multiset in every reply. VTT entities are decoded only between tags; escape translated text, never restored tags. SRT/ASS do not entity-decode.
+3. Malformed replies, empty text translations, count mismatches, and transport/non-JSON failures are retryable translation errors. Fatal errors and exhausted rate limits abort rather than fan out to per-line fallback. Never cache pass-through segments. Stop sibling workers after fatal failure or cancellation.
+4. Google v2 requests contain at most 128 texts and decode its returned escaped strings. DeepL requests contain at most 50 texts; split larger configured batches in order. Reject non-finite or over-five-minute rate-limit waits. Provider requests must not follow credential-bearing redirects.
+5. Echo is always available to offline engine tests, but the web API and UI expose it only in debug mode. Tests must never call paid providers without explicit authorization and credentials through a safe channel.
+
+### Frontend
+
+1. Keep the interface file-first and restrained: no decorative dashboard metrics, redundant eyebrows, marketing copy, secondary labels, or external fonts/CDNs. Add explanatory text only when it prevents a real mistake.
+2. Use Svelte 5 runes. Do not import or declare a binding named `state` in a component using `$state`; it conflicts with Svelte store-subscription syntax. Use `appState`.
+3. Literal regex quantifiers in Svelte attributes need a string expression: `pattern={'[0-9]{6}'}`. `pattern="[0-9]{6}"` interpolates the braces into `[0-9]6` and silently blocks valid form submission. Browser tests must inspect the actual pattern and submit the form.
+4. Capture `event.currentTarget` and `event.submitter` synchronously before an `await`. Guard all asynchronous account/session responses against session-generation changes; a late theme response must not restore a signed-out user. Stop polling in hidden tabs and after unmount/sign-out. Confirm polling 401s against `/api/auth/me` because MFA can rotate cookies mid-flight.
+5. Preserve system/light/dark account preferences in initial HTML to avoid theme flash. Recreate CAPTCHA widgets when the resolved scheme changes. Wait for the provider's actual `render` function, not just its global stub.
+6. Use semantic controls, visible keyboard focus, native dialogs, labeled inputs, reduced-motion support, and usable touch targets. Test mobile widths and long Unicode filenames. No JWTs, factor secrets, recovery codes, or typed provider keys persist in browser storage.
+7. `npm run check` must use TypeScript 7's native compiler (`@typescript/native` alias and `svelte-check --tsgo`). TypeScript 6 is only Svelte's required AST bridge. Do not silently downgrade the application checker.
 
 ## Validation
 
-Run the narrowest relevant checks while iterating, then run the full offline suite before handoff:
+Build in this order:
 
-```text
-python -m pytest -q
+```sh
+cd web
+npm ci
+npm run check
+npm run build
+cd ..
+go vet ./...
+go test -race ./...
+go build -trimpath -o bin/subtitle-translator ./cmd/subtitle-translator
+cd web
+npx playwright install chromium
+TEST_BINARY=../bin/subtitle-translator npm test
 ```
 
-CI also runs `python -m ruff check .` (configuration in `pyproject.toml`, version pinned in `requirements-dev.txt`); run it before handoff.
+The browser suite creates isolated temporary data and uses Echo. Never initialize a server or test against the real `data/` directory. `TEST_DATABASE_URL` must point to a disposable private database: tests drop and recreate application tables. Run SQLite plus PostgreSQL, MariaDB, and MySQL integration on the shared Linux dev VM before handoff. Set `TEST_REDIS_URL` to exercise the encrypted read cache against a private Redis. Keep VM tools/caches within `/srv/subtitle-translator`, register ports, and clean up all processes/artifacts started by the session.
 
-Use the module form in this Windows workspace. The standalone `pytest` launcher has resolved imports through the stale sibling path `D:\Dev\SRT-Translate` and produced false `ModuleNotFoundError` collection failures. The global Python's site-packages drift from the pins (in 2026-10 it still had SQLAlchemy 2.0 against a 2.1 pin), so validate in the ignored `.venv` built from the exact pins: `python -m venv .venv && .venv/Scripts/python -m pip install -r requirements-dev.txt`, then `.venv/Scripts/python -m pytest -q` and `.venv/Scripts/python -m ruff check .`. After bumping pins, reinstall into `.venv` before testing.
+For authentication, quotas, jobs, or startup changes, include concurrent HTTP requests through the real handler. A local Windows run cannot replace the Linux race detector. Frontend changes require real-browser tests and visual inspection in light/dark modes and a narrow viewport; type checking alone misses browser validation and event timing.
 
-Race conditions are invisible to the single-process test client. For changes to job transitions, authentication counters, or startup, also reproduce with concurrent requests against a multi-worker Gunicorn (`--workers 4`, bound to loopback) on a fresh SQLite `DATA_DIR`.
-
-For web-job tests, wait for a terminal job state and include `job["error"]` in failure output. For CI edits, verify these cases separately:
-
-- no Docker Hub configuration: the metadata image list contains only `ghcr.io/<owner>/<repo>`;
-- all Docker Hub settings configured: the list contains the normalized Docker Hub name and GHCR name;
-- partially configured Docker Hub: publishing is disabled with a warning, without emitting an empty image entry;
-- an invalid configured Docker Hub repository name fails early with a useful error.
-
-Do not make live paid-provider calls as routine validation. Use Echo unless the user explicitly requests an integration test and supplies authorization and credentials through a safe channel.
-
-Do not import `webapp` merely as a smoke test without first assigning `DATA_DIR` to a temporary writable directory: importing the module initializes SQLite immediately. The actual web tests already set this environment variable before import.
+Publishing tests must cover GHCR-only, complete Docker Hub configuration, partial configuration, and invalid repository names. Never pass an empty image name to `docker/metadata-action`, even with `enable=false`. Run actionlint when workflows change. Test the production container's health probe, non-root process, default volume ownership upgrade, and both IP stacks.
 
 ## Commits
 
-Split work into commits by kind, never one mixed commit (owner's decision, 2026-10-13). Use Conventional Commits, `type(scope): summary` in the imperative, with a body that explains why:
+Commit directly on `main`, never a feature branch; push only when the user asks. Use Conventional Commits with an imperative summary and a body explaining why. Split independent work by kind: dependency-only refreshes in `chore(deps)`, fixes per area with their tests/locales, features with their tests/configuration/documentation, and retrospectives/agent rules in a docs commit. An atomic runtime migration must keep its new source, dependency manifests, frontend, container, and CI together so every commit is usable.
 
-- `chore(deps)`: dependency pins, Docker base image and digest, GitHub Action versions, Compose service images. Nothing else.
-- `fix(<area>)`: bug fixes, one commit per area (`engine`, `api`, `ui`, `mfa,db,settings`, ...), including that area's regression tests and the locale entries its messages need.
-- `feat(<area>)`: one commit per feature, with its tests, configuration (`.env.example`, `compose.yaml`) and the documentation describing it.
-- `refactor`: behavior-neutral restructuring; `test`: test-only hardening; `docs`: documentation-only changes and retrospectives (`MEMORY.md`, new `AGENTS.md` rules).
-
-Order commits so that each one passes `pytest` and `ruff` on its own: check every commit in a separate worktree (`git worktree add <tmp> <commit>`), not only the final tree. When one file holds changes for several commits, stage each part separately; interactive `git add -p` is unavailable to agents here, so build the intermediate file content and stage it with `git hash-object -w` plus `git update-index --cacheinfo` (a replaced line must be staged as both its deletion and its insertion). Commit directly on `main`, never on a feature branch, and push only when the user asks.
+Stage explicit paths and only this task's changes, including the user's repository editor configuration. Validate each commit in a separate temporary worktree, not only the final working tree. Clean up temporary worktrees and build artifacts before reporting.
