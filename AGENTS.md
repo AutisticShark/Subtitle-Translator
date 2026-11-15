@@ -61,7 +61,7 @@ This file applies to the entire repository. Use Git history for retired source a
 
 ### Frontend
 
-1. Keep the interface file-first and restrained: no decorative dashboard metrics, redundant eyebrows, marketing copy, secondary labels, or external fonts/CDNs. Add explanatory text only when it prevents a real mistake.
+1. Preserve the established interface during stack migrations: Dashboard, New translation, Translation history, Account security, Administration, and the panel-settings dialog are existing workflows, not disposable decoration. Keep the original layout, navigation, visual identity, and interactions; a framework rewrite is not permission to redesign or remove screens. Do not add new decorative metrics, redundant labels, marketing copy, or external fonts/CDNs.
 2. Use Svelte 5 runes. Do not import or declare a binding named `state` in a component using `$state`; it conflicts with Svelte store-subscription syntax. Use `appState`.
 3. Literal regex quantifiers in Svelte attributes need a string expression: `pattern={'[0-9]{6}'}`. `pattern="[0-9]{6}"` interpolates the braces into `[0-9]6` and silently blocks valid form submission. Browser tests must inspect the actual pattern and submit the form.
 4. Capture `event.currentTarget` and `event.submitter` synchronously before an `await`. Guard all asynchronous account/session responses against session-generation changes; a late theme response must not restore a signed-out user. Stop polling in hidden tabs and after unmount/sign-out. Confirm polling 401s against `/api/auth/me` because MFA can rotate cookies mid-flight.
