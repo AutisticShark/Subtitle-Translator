@@ -6,10 +6,14 @@
     action,
     onToken,
     generation = 0,
+    id,
+    wide = false,
   }: {
     action: string;
     onToken: (token: string) => void;
     generation?: number;
+    id?: string;
+    wide?: boolean;
   } = $props();
   let container = $state<HTMLDivElement>();
   let error = $state('');
@@ -117,8 +121,8 @@
 </script>
 
 {#if required}
-  <div class="captcha-slot">
+  <div class="captcha-slot" class:wide {id}>
     <div bind:this={container!}></div>
-    {#if error}<p class="form-error" role="alert">{error}</p>{/if}
+    {#if error}<p class="auth-error" role="alert">{error}</p>{/if}
   </div>
 {/if}

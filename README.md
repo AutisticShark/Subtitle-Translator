@@ -1,6 +1,6 @@
 # Subtitle Translator
 
-A self-hosted subtitle translation workspace. Go serves the API, runs translation jobs, and embeds the Svelte 5 frontend, built with Vite 8 and TypeScript 7. Python and Node.js are not needed in the production container.
+A self-hosted subtitle translation workspace. Go serves the API, runs translation jobs, and embeds the Svelte 5 frontend, built with Vite 8 and TypeScript 7. The original dashboard, translation workspace, history, account security, and administration interface are preserved on the new stack. Python and Node.js are not needed in the production container.
 
 Upload SRT, WebVTT, ASS, or SSA files, choose languages, and download the translated subtitles or a ZIP bundle. Timings, cue settings, speaker dialogue, inline tags, ASS styles, and format-specific metadata stay intact.
 
@@ -12,7 +12,7 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-Open <http://localhost:8000>. Create the first administrator, then open **Settings** to configure a translation provider. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` before the first start for unattended setup. Complete setup before exposing the service to untrusted users.
+Open <http://localhost:8000>. Create the first administrator, then open **Administration → Configure panel** to configure a translation provider. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` before the first start for unattended setup. Complete setup before exposing the service to untrusted users.
 
 The `subtitle_data` volume contains the database, uploads, and outputs. `docker compose down` keeps it; **`docker compose down -v` permanently deletes it**.
 
@@ -42,11 +42,11 @@ The container entrypoint adjusts ownership of the default `/app/data` volume for
 | Google Cloud Translation | API key | Basic v2; enable Cloud Translation API in the key's project |
 | Echo | None | Offline development provider; rejected by the API unless debug is enabled |
 
-Provider keys can be entered in **Settings** or bootstrapped through `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPL_API_KEY`, and `GOOGLE_API_KEY`. Saved settings take precedence over environment values. Keys are write-only: settings responses expose configured/not-configured state, never their values.
+Provider keys can be entered in **Administration → Configure panel** or bootstrapped through `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPL_API_KEY`, and `GOOGLE_API_KEY`. Saved settings take precedence over environment values. Keys are write-only: settings responses expose configured/not-configured state, never their values.
 
 Batch-level progress updates while translation runs. A shared throttle coordinates request pacing and rate-limit backoff; transient failures are retried, while authentication failures abort. Provider redirects are not followed. A malformed translation, missing line, or altered tag placeholder is retried; exhausted recoverable failures preserve the source segment and produce a warning. Rate-limit delays above five minutes or non-finite values fail rather than parking workers indefinitely.
 
-Input defaults to UTF-8, with selectable UTF-16, GBK, Big5, Shift JIS, Windows-1252, and ISO-8859-1. Legacy single-byte and supported multibyte codecs use Python-compatible mappings and strict invalid-byte checks. Stateful codecs such as UTF-7, HZ, ISO-2022, Johab, and JIS X 0213 are not supported; convert those files to UTF-8 first. The original UTF-8 BOM and newline style are preserved; output is always UTF-8. The interface and API preserve Unicode filenames.
+The interface accepts UTF-8 subtitles. API clients can also specify supported encodings such as UTF-16, GBK, Big5, Shift JIS, Windows-1252, and ISO-8859-1. Legacy single-byte and supported multibyte codecs use Python-compatible mappings and strict invalid-byte checks. Stateful codecs such as UTF-7, HZ, ISO-2022, Johab, and JIS X 0213 are not supported; convert those files to UTF-8 first. The original UTF-8 BOM and newline style are preserved; output is always UTF-8. The interface and API preserve Unicode filenames.
 
 ## Accounts and security
 

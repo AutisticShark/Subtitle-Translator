@@ -1,54 +1,48 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
+  import Admin from './components/Admin.svelte';
   import Auth from './components/Auth.svelte';
   import Brand from './components/Brand.svelte';
-  import Icon from './components/Icon.svelte';
+  import Dashboard from './components/Dashboard.svelte';
+  import History from './components/History.svelte';
+  import Security from './components/Security.svelte';
   import Translate from './components/Translate.svelte';
-  import JobList from './components/JobList.svelte';
-  import SettingsView from './components/Settings.svelte';
-  import Users from './components/Users.svelte';
-  import Account from './components/Account.svelte';
   import { api, ApiError, errorMessage, json } from './lib/api';
-  import { applyTheme, clearSession, navigate, notify, appState, t } from './lib/appState.svelte';
+  import { readBoot } from './lib/boot';
+  import {
+    applyTheme,
+    appState,
+    clearSession,
+    navigate,
+    notify,
+    showView,
+    t,
+  } from './lib/appState.svelte';
   import type { Catalog, Settings, SetupStatus, Theme, User, View } from './lib/types';
+  import { startWorkspace, stopWorkspace } from './lib/workspace.svelte';
 
   let loading = $state(true);
   let startupError = $state('');
-  let signingOut = $state(false);
   let themeBusy = $state(false);
-  function availableLocales(): Record<string, string> {
-    try {
-      const boot = JSON.parse(document.getElementById('app-boot')?.textContent || '{}') as {
-        locales?: { code: string; label: string }[];
-      };
-      if (Array.isArray(boot.locales) && boot.locales.length) {
-        return Object.fromEntries(
-          boot.locales
-            .filter((locale) => typeof locale.code === 'string' && typeof locale.label === 'string')
-            .map((locale) => [locale.code, locale.label]),
-        );
-      }
-    } catch {
-      /* Vite serves the shell without server bootstrap data. */
-    }
-    return { en: 'English', 'zh-TW': '正體中文', 'zh-CN': '简体中文' };
-  }
-  const locales = availableLocales();
-  const navigation: { view: View; label: string; icon: string; admin?: boolean }[] = [
-    { view: 'translate', label: 'Translate', icon: 'translate' },
-    { view: 'history', label: 'History', icon: 'history' },
-    { view: 'settings', label: 'Settings', icon: 'settings', admin: true },
-    { view: 'users', label: 'Users', icon: 'users', admin: true },
-    { view: 'account', label: 'Account', icon: 'shield' },
+  const locales = readBoot().locales;
+  const navigation: { view: View; icon: string; label: string; admin?: boolean }[] = [
+    { view: 'dashboard', icon: '⌂', label: 'Dashboard' },
+    { view: 'translate', icon: '＋', label: 'New translation' },
+    { view: 'jobs', icon: '≡', label: 'Translation history' },
+    { view: 'security', icon: '◇', label: 'Account security' },
+    { view: 'admin', icon: '⚙', label: 'Administration', admin: true },
   ];
-  function syncHash() {
-    const requested = window.location.hash.slice(1);
-    const match = navigation.find(
-      (item) => item.view === requested && (!item.admin || appState.user?.role === 'admin'),
-    );
-    appState.view = match?.view || 'translate';
-  }
-  async function signedIn(user: User) {
+  const viewLabels: Record<View, [string, string]> = {
+    security: ['Account preferences', 'Account security'],
+    dashboard: ['Workspace overview', 'Dashboard'],
+    translate: ['Translation workspace', 'New translation'],
+    jobs: ['Activity', 'Translation history'],
+    admin: ['Panel management', 'Administration'],
+  };
+  const admin = $derived(appState.user?.role === 'admin');
+  const signedIn = $derived(appState.user !== null);
+
+  async function enter(user: User) {
     const [auth, settings] = await Promise.all([
       api<SetupStatus>('/api/auth/setup-status'),
       api<Settings>('/api/settings'),
@@ -58,23 +52,24 @@
     appState.settings = settings;
     applyTheme(user.theme);
     appState.user = user;
-    syncHash();
+    showView(window.location.hash.slice(1) || 'dashboard', false);
   }
   async function initialize() {
     startupError = '';
     loading = true;
     try {
-      const [catalog, auth] = await Promise.all([
-        api<Catalog>('/api/i18n'),
-        api<SetupStatus>('/api/auth/setup-status'),
-      ]);
-      appState.catalog = catalog;
+      // English source strings are better than no sign-in screen at all.
+      const catalog = await api<Catalog>('/api/i18n').catch(() => null);
+      if (catalog) {
+        appState.catalog = catalog;
+        document.documentElement.lang = catalog.locale;
+      }
+      const auth = await api<SetupStatus>('/api/auth/setup-status');
       appState.auth = auth;
-      document.documentElement.lang = catalog.locale;
       if (auth.configured) {
         try {
           const data = await api<{ user: User }>('/api/auth/me');
-          await signedIn(data.user);
+          await enter(data.user);
         } catch (cause) {
           if (!(cause instanceof ApiError && cause.status === 401)) throw cause;
           clearSession();
@@ -86,36 +81,47 @@
       loading = false;
     }
   }
+  async function expired() {
+    clearSession();
+    appState.auth = await api<SetupStatus>('/api/auth/setup-status').catch(() => appState.auth);
+    notify(t('Your session has ended. Sign in again.'));
+  }
   async function logout() {
-    signingOut = true;
+    stopWorkspace(); // Stop polling before the token is revoked.
     try {
-      try {
-        await api('/api/auth/logout', { method: 'POST' });
-      } catch (cause) {
-        if (!(cause instanceof ApiError && cause.status === 401)) throw cause;
+      await api('/api/auth/logout', { method: 'POST' });
+    } catch (cause) {
+      if (!(cause instanceof ApiError && cause.status === 401)) {
+        // The session cookie is still valid; showing the sign-in screen would only
+        // hide a live session from the next person at this browser.
+        notify(errorMessage(cause));
+        startWorkspace(expired);
+        return;
       }
-      clearSession();
-      window.location.hash = '';
+    }
+    clearSession();
+    try {
       appState.auth = await api<SetupStatus>('/api/auth/setup-status');
     } catch (cause) {
       notify(errorMessage(cause));
-    } finally {
-      signingOut = false;
     }
   }
   async function saveTheme(event: Event) {
-    const selected = (event.currentTarget as HTMLSelectElement).value as Theme;
+    const selector = event.currentTarget as HTMLSelectElement;
     const previous = appState.user?.theme || 'system';
-    themeBusy = true;
     const generation = appState.session;
-    applyTheme(selected);
+    themeBusy = true;
+    applyTheme(selector.value as Theme);
     try {
-      const data = await json<{ user: User }>('/api/auth/me', { theme: selected }, 'PATCH');
+      const data = await json<{ user: User }>('/api/auth/me', { theme: selector.value }, 'PATCH');
       if (generation !== appState.session) return;
       appState.user = data.user;
       applyTheme(data.user.theme);
+      notify(t('Theme updated'));
     } catch (cause) {
       if (generation === appState.session) {
+        // appState.user.theme did not change, so the bound value would not reset the control.
+        selector.value = previous;
         applyTheme(previous);
         notify(errorMessage(cause));
       }
@@ -128,136 +134,147 @@
     url.searchParams.set('lang', (event.currentTarget as HTMLSelectElement).value);
     window.location.assign(url);
   }
-  async function expired() {
-    clearSession();
-    appState.auth = await api<SetupStatus>('/api/auth/setup-status').catch(() => appState.auth);
-    notify(t('Your session has expired. Sign in again.'));
-  }
+
   onMount(() => {
     void initialize();
-    window.addEventListener('hashchange', syncHash);
+    const hashChanged = () => showView(window.location.hash.slice(1), false);
+    window.addEventListener('hashchange', hashChanged);
     const system = window.matchMedia('(prefers-color-scheme: dark)');
     const schemeChanged = () => applyTheme(appState.user?.theme || 'system');
     system.addEventListener('change', schemeChanged);
     return () => {
       appState.session++;
-      window.removeEventListener('hashchange', syncHash);
+      window.removeEventListener('hashchange', hashChanged);
       system.removeEventListener('change', schemeChanged);
     };
   });
+  // Poll only while an account is signed in; stop on sign-out, session change and unmount.
   $effect(() => {
-    const page = navigation.find((item) => item.view === appState.view);
-    document.title = appState.user
-      ? `${t(page?.label || 'Translate')} · Subtitle Translator`
-      : 'Subtitle Translator';
+    void appState.session;
+    if (!signedIn) return;
+    untrack(() => startWorkspace(expired));
+    return stopWorkspace;
   });
 </script>
 
+<label class="locale-picker">
+  <span>{t('Interface language')}</span>
+  <select id="localeSelect" aria-label={t('Interface language')} onchange={changeLocale}>
+    {#each Object.entries(locales) as [code, label] (code)}
+      <option value={code} selected={code === appState.catalog.locale}>{label}</option>
+    {/each}
+  </select>
+</label>
+
 {#if loading}
-  <main class="startup">
-    <Brand /><span class="loading-line" aria-label={t('Loading…')}></span>
-  </main>
+  <main class="auth-view" aria-busy="true"></main>
 {:else if startupError}
-  <main class="startup">
-    <Brand />
-    <p class="form-error" role="alert">{startupError}</p>
-    <button class="button" onclick={initialize}>{t('Try again')}</button>
+  <main class="auth-view">
+    <section class="panel auth-panel">
+      <Brand />
+      <div class="auth-error" role="alert">{startupError}</div>
+      <button class="ghost" type="button" onclick={initialize}>{t('Try again')}</button>
+    </section>
   </main>
 {:else if !appState.user}
-  <Auth onSignedIn={signedIn} />
-  <div class="signed-out-locale">
-    <Icon name="globe" size={15} /><select
-      aria-label={t('Interface language')}
-      value={appState.catalog.locale}
-      onchange={changeLocale}
-      >{#each Object.entries(locales) as [code, label]}<option value={code}>{label}</option
-        >{/each}</select
-    >
-  </div>
+  <Auth onSignedIn={enter} />
 {:else}
-  <div class="app-shell">
+  <div class="app-shell" id="appShell">
     <aside class="sidebar">
-      <div class="sidebar-brand">
-        <Brand /><button
-          class="icon-button mobile-logout"
-          aria-label={t('Sign out')}
-          onclick={logout}
-          disabled={signingOut}><Icon name="logout" /></button
-        >
-      </div>
-      <nav aria-label={t('Main navigation')}>
-        {#each navigation.filter((item) => !item.admin || appState.user?.role === 'admin') as item}
-          <a
+      <Brand href="#dashboard" />
+      <nav class="primary-nav" aria-label={t('Main navigation')}>
+        {#each navigation.filter((item) => !item.admin || admin) as item (item.view)}
+          <button
             class="nav-item"
             class:active={appState.view === item.view}
-            class:nav-separator={item.view === 'settings' ||
-              (item.view === 'account' && appState.user?.role !== 'admin')}
-            href={`#${item.view}`}
-            aria-current={appState.view === item.view ? 'page' : undefined}
-            ><Icon name={item.icon} size={19} /><span>{t(item.label)}</span></a
+            type="button"
+            data-view-button={item.view}
+            id={item.view === 'admin' ? 'adminNavButton' : undefined}
+            aria-current={appState.view === item.view ? 'page' : 'false'}
+            onclick={() => navigate(item.view)}
           >
+            <span class="nav-icon" aria-hidden="true">{item.icon}</span>{t(item.label)}
+          </button>
         {/each}
       </nav>
-      <div class="sidebar-bottom">
-        <div class="preference-row">
-          <Icon name="globe" size={16} /><select
-            aria-label={t('Interface language')}
-            value={appState.catalog.locale}
-            onchange={changeLocale}
-            >{#each Object.entries(locales) as [code, label]}<option value={code}>{label}</option
-              >{/each}</select
+      <div class="sidebar-footer">
+        <div class="account-chip">
+          <span class="account-avatar" id="userInitial" aria-hidden="true"
+            >{appState.user.username.slice(0, 1)}</span
+          >
+          <span
+            ><strong id="userName">{appState.user.username}</strong><small id="userRole"
+              >{t(admin ? 'Administrator' : 'User')}</small
+            ></span
           >
         </div>
-        <div class="preference-row">
-          <Icon name={appState.scheme === 'dark' ? 'moon' : 'sun'} size={16} /><select
-            aria-label={t('Appearance')}
-            value={appState.user.theme}
-            onchange={saveTheme}
-            disabled={themeBusy}
-            ><option value="system">{t('System theme')}</option><option value="light"
-              >{t('Light')}</option
-            ><option value="dark">{t('Dark')}</option></select
-          >
-        </div>
-        <div class="account-row">
-          <button class="account-link" onclick={() => navigate('account')}
-            ><span class="avatar">{appState.user.username.slice(0, 1).toUpperCase()}</span><span
-              class="truncate">{appState.user.username}</span
-            ></button
-          ><button
-            class="icon-button"
-            aria-label={t('Sign out')}
-            title={t('Sign out')}
-            disabled={signingOut}
-            onclick={logout}><Icon name="logout" size={17} /></button
-          >
-        </div>
+        <button class="sign-out" id="logoutButton" type="button" onclick={logout}
+          >{t('Sign out')}</button
+        >
       </div>
     </aside>
-    <main class="workspace" id="main-content">
-      {#key appState.session}
-        {#if appState.view === 'translate'}
-          <Translate onExpired={expired} />
-        {:else if appState.view === 'history'}
-          <header class="page-header"><h1>{t('History')}</h1></header>
-          <JobList full onExpired={expired} />
-        {:else if appState.view === 'settings' && appState.user.role === 'admin'}
-          <SettingsView />
-        {:else if appState.view === 'users' && appState.user.role === 'admin'}
-          <Users />
-        {:else if appState.view === 'account'}
-          <Account />
-        {/if}
-      {/key}
-    </main>
+
+    <div class="app-main">
+      <header class="topbar">
+        <div>
+          <span class="eyebrow" id="viewEyebrow">{t(viewLabels[appState.view][0])}</span>
+          <h1 id="viewTitle">{t(viewLabels[appState.view][1])}</h1>
+        </div>
+        <div class="topbar-actions">
+          <label class="theme-picker">
+            <span>{t('Appearance')}</span>
+            <select
+              id="themeSelect"
+              aria-label={t('Appearance')}
+              value={appState.user.theme}
+              disabled={themeBusy}
+              onchange={saveTheme}
+            >
+              <option value="system">{t('System theme')}</option>
+              <option value="light">{t('Light')}</option>
+              <option value="dark">{t('Dark')}</option>
+            </select>
+          </label>
+          <button
+            class="primary topbar-action"
+            type="button"
+            hidden={appState.view === 'translate'}
+            onclick={() => navigate('translate')}>{t('New translation')} <span>→</span></button
+          >
+        </div>
+      </header>
+
+      <main class="content">
+        {#key appState.session}
+          <section class="app-view" data-view="dashboard" hidden={appState.view !== 'dashboard'}>
+            <Dashboard />
+          </section>
+          <section class="app-view" data-view="translate" hidden={appState.view !== 'translate'}>
+            <Translate />
+          </section>
+          <section class="app-view" data-view="jobs" hidden={appState.view !== 'jobs'}>
+            <History />
+          </section>
+          {#if appState.view === 'security'}
+            <section class="app-view" data-view="security">
+              <Security />
+            </section>
+          {/if}
+          {#if admin}
+            <section
+              class="app-view"
+              data-view="admin"
+              id="adminView"
+              hidden={appState.view !== 'admin'}
+            >
+              <Admin />
+            </section>
+          {/if}
+        {/key}
+      </main>
+    </div>
   </div>
 {/if}
-{#if appState.notice}<div class="toast" role="status">
-    <Icon name="check" size={17} /><span>{appState.notice}</span><button
-      class="icon-button"
-      aria-label={t('Dismiss')}
-      onclick={() => {
-        appState.notice = '';
-      }}><Icon name="close" size={15} /></button
-    >
-  </div>{/if}
+<div class="toast" id="toast" class:show={appState.noticeShown} role="status">
+  {appState.notice}
+</div>

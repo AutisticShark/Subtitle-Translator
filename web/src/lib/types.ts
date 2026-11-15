@@ -1,5 +1,5 @@
 export type Theme = 'system' | 'light' | 'dark';
-export type View = 'translate' | 'history' | 'settings' | 'users' | 'account';
+export type View = 'dashboard' | 'translate' | 'jobs' | 'security' | 'admin';
 export interface User {
   id: string;
   username: string;

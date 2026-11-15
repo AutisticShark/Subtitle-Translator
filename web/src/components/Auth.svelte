@@ -1,7 +1,7 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Brand from './Brand.svelte';
   import Captcha from './Captcha.svelte';
-  import Icon from './Icon.svelte';
   import { errorMessage, json } from '../lib/api';
   import { appState, t } from '../lib/appState.svelte';
   import type { AuthResponse, Challenge, User } from '../lib/types';
@@ -15,52 +15,51 @@
   let challenge = $state<Challenge | null>(null);
   let busy = $state(false);
   let error = $state('');
+  let mfaError = $state('');
   let captchaToken = $state('');
   let captchaGeneration = $state(0);
   const setup = $derived(!appState.auth?.configured);
-  const title = $derived(
-    challenge
-      ? t('Two-step verification')
-      : setup
-        ? t('Create administrator')
-        : mode === 'register'
-          ? t('Create account')
-          : t('Sign in'),
-  );
+  const registering = $derived(!setup && mode === 'register');
   const captchaRequired = $derived(
     !setup &&
       appState.auth?.captcha.provider !== 'none' &&
       Boolean(appState.auth?.captcha.protected_actions.includes(mode)),
   );
 
-  function switchMode() {
-    mode = mode === 'login' ? 'register' : 'login';
+  onDestroy(() => {
     password = '';
     confirmPassword = '';
+    code = '';
+    challenge = null;
+  });
+  function switchMode() {
+    username = '';
+    password = '';
+    confirmPassword = '';
+    mode = mode === 'login' ? 'register' : 'login';
     error = '';
     captchaGeneration++;
   }
   async function submit(event: SubmitEvent) {
     event.preventDefault();
     error = '';
-    if ((setup || mode === 'register') && password !== confirmPassword) {
-      error = t('Passwords do not match');
-      return;
-    }
-    busy = true;
     try {
-      const endpoint = setup ? 'setup' : mode;
-      const result = await json<AuthResponse>(`/api/auth/${endpoint}`, {
-        username,
-        password,
-        confirm_password: confirmPassword,
-        captcha_token: captchaToken,
-      });
+      if (registering && password !== confirmPassword) throw new Error(t('Passwords do not match'));
+      if (captchaRequired && !captchaToken) throw new Error(t('Complete the CAPTCHA challenge'));
+      busy = true;
+      const payload: Record<string, string> = { username, password };
+      if (registering) payload.confirm_password = confirmPassword;
+      payload.captcha_token = captchaToken;
+      const result = await json<AuthResponse>(
+        `/api/auth/${setup ? 'setup' : registering ? 'register' : 'login'}`,
+        payload,
+      );
+      username = '';
       password = '';
       confirmPassword = '';
       if (result.mfa_required && result.challenge_token && result.method) {
         challenge = result as Challenge;
-        error = result.warning || '';
+        mfaError = result.warning || '';
       } else if (result.user) await onSignedIn(result.user);
     } catch (cause) {
       error = errorMessage(cause);
@@ -72,50 +71,77 @@
   async function verify(event: SubmitEvent) {
     event.preventDefault();
     busy = true;
-    error = '';
+    mfaError = '';
     try {
       const data = await json<AuthResponse>('/api/auth/mfa/verify', {
         challenge_token: challenge?.challenge_token,
         code,
       });
+      challenge = null;
       code = '';
       if (data.user) await onSignedIn(data.user);
     } catch (cause) {
-      error = errorMessage(cause);
+      mfaError = errorMessage(cause);
     } finally {
       busy = false;
     }
   }
   async function resend() {
     busy = true;
-    error = '';
     try {
       challenge = await json<Challenge>('/api/auth/mfa/resend', {
         challenge_token: challenge?.challenge_token,
       });
-      error = challenge.warning || t('Verification email sent');
+      mfaError = challenge.warning || t('Verification email sent');
     } catch (cause) {
-      error = errorMessage(cause);
+      mfaError = errorMessage(cause);
     } finally {
       busy = false;
     }
   }
+  function back() {
+    challenge = null;
+    code = '';
+    mfaError = '';
+    error = '';
+    captchaGeneration++;
+  }
 </script>
 
-<main class="auth-page">
-  <div class="auth-brand"><Brand /></div>
-  <section class="auth-form" aria-labelledby="auth-title">
-    <div class="auth-symbol"><Icon name={challenge ? 'shield' : 'lock'} size={22} /></div>
-    <h1 id="auth-title">{title}</h1>
-    {#if challenge}
-      <p class="muted auth-hint">
-        {challenge.method === 'email'
-          ? t('Enter the code sent to your email, or a recovery code.')
-          : t('Enter a code from your authenticator app, or a recovery code.')}
+<main class="auth-view" id="authView">
+  <section class="panel auth-panel">
+    <Brand />
+    <div class="auth-copy">
+      <span class="eyebrow" id="authEyebrow"
+        >{setup ? t('Initial setup') : t('Authentication')}</span
+      >
+      <h1 id="authTitle">
+        {challenge
+          ? t('Multi-factor authentication')
+          : setup
+            ? t('Create the first administrator')
+            : registering
+              ? t('Create your account')
+              : t('Sign in')}
+      </h1>
+      <p id="authDescription">
+        {setup
+          ? t('This one-time account will manage users, provider keys, and all jobs.')
+          : registering
+            ? t('Choose a username and a strong password to join this workspace.')
+            : t('Use your Subtitle Translator account.')}
       </p>
-      <form onsubmit={verify} class="stack">
+    </div>
+    {#if challenge}
+      <form id="mfaLoginForm" onsubmit={verify}>
+        <p id="mfaLoginDescription">
+          {challenge.method === 'email'
+            ? t('Enter the code sent to your email, or a recovery code.')
+            : t('Enter a new code from your authenticator app, or a recovery code.')}
+        </p>
         <label
           >{t('Verification or recovery code')}<input
+            name="code"
             bind:value={code}
             autocomplete="one-time-code"
             required
@@ -123,54 +149,47 @@
             spellcheck="false"
           /></label
         >
-        {#if error}<p class="form-error" role="alert">{error}</p>{/if}
-        <button class="primary full-width" type="submit" disabled={busy}
-          >{busy ? t('Verifying…') : t('Verify and sign in')}<Icon name="arrow" size={16} /></button
-        >
+        <p id="mfaLoginError" role="alert">{mfaError}</p>
+        <button class="primary" type="submit" disabled={busy}>{t('Verify and sign in')}</button>
         {#if challenge.method === 'email'}<button
+            class="ghost"
+            id="mfaLoginResend"
             type="button"
-            class="button quiet"
-            onclick={resend}
-            disabled={busy}>{t('Resend email code')}</button
+            disabled={busy}
+            onclick={resend}>{t('Resend email code')}</button
           >{/if}
-        <button
-          type="button"
-          class="text-button"
-          disabled={busy}
-          onclick={() => {
-            challenge = null;
-            code = '';
-            error = '';
-          }}>{t('Back to sign in')}</button
+        <button class="text-button" id="mfaLoginBack" type="button" onclick={back}
+          >{t('Back to sign in')}</button
         >
       </form>
     {:else}
-      <form onsubmit={submit} class="stack">
+      <form id="authForm" onsubmit={submit}>
         <label
           >{t('Username')}<input
+            name="username"
             bind:value={username}
             autocomplete="username"
             required
             minlength="3"
             maxlength="64"
-            autocapitalize="none"
-            spellcheck="false"
           /></label
         >
         <label
           >{t('Password')}<input
-            bind:value={password}
+            name="password"
             type="password"
-            autocomplete={setup || mode === 'register' ? 'new-password' : 'current-password'}
+            bind:value={password}
+            autocomplete={setup || registering ? 'new-password' : 'current-password'}
             required
-            minlength={setup || mode === 'register' ? 12 : undefined}
+            minlength="12"
             maxlength="256"
           /></label
         >
-        {#if setup || mode === 'register'}<label
+        {#if registering}<label id="confirmPasswordField"
             >{t('Confirm password')}<input
-              bind:value={confirmPassword}
+              name="confirm_password"
               type="password"
+              bind:value={confirmPassword}
               autocomplete="new-password"
               required
               minlength="12"
@@ -178,39 +197,36 @@
             /></label
           >{/if}
         {#if !setup}<Captcha
+            id="authCaptcha"
             action={mode}
             onToken={(value) => {
               captchaToken = value;
             }}
             generation={captchaGeneration}
           />{/if}
-        {#if error}<p class="form-error" role="alert">{error}</p>{/if}
-        <button
-          type="submit"
-          class="primary full-width"
-          disabled={busy || (captchaRequired && !captchaToken)}
+        <div class="auth-error" id="authError" role="alert">{error}</div>
+        <button class="primary" id="authSubmit" type="submit" disabled={busy}
+          >{setup
+            ? t('Create administrator')
+            : registering
+              ? t('Create account')
+              : t('Sign in')}</button
         >
-          {busy
-            ? t('Please wait…')
-            : setup
-              ? t('Create administrator')
-              : mode === 'register'
-                ? t('Create account')
-                : t('Sign in')}<Icon name="arrow" size={16} />
-        </button>
       </form>
       {#if !setup && appState.auth?.registration_enabled}
-        <div class="auth-switch">
-          <span class="muted"
-            >{mode === 'login' ? t('Need an account?') : t('Already have an account?')}</span
-          ><button class="text-button" type="button" onclick={switchMode} disabled={busy}
-            >{mode === 'login' ? t('Create one') : t('Sign in')}</button
+        <p class="auth-switch" id="authSwitch">
+          <span id="authSwitchPrompt"
+            >{registering ? t('Already have an account?') : t('Need an account?')}</span
           >
-        </div>
+          <button
+            class="text-button"
+            id="authSwitchButton"
+            type="button"
+            onclick={switchMode}
+            disabled={busy}>{registering ? t('Sign in') : t('Create one')}</button
+          >
+        </p>
       {/if}
     {/if}
   </section>
-  <div class="auth-formats" aria-hidden="true">
-    SRT<span>·</span>WebVTT<span>·</span>ASS<span>·</span>SSA
-  </div>
 </main>
